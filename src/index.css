@@ -1,0 +1,300 @@
+@import 'katex/dist/katex.min.css';
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: 'Inter', system-ui, sans-serif;
+  line-height: 1.6;
+  font-weight: 400;
+}
+
+body {
+  margin: 0;
+  background-color: #0F172A;
+  color: #F8FAFC;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1E293B;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+.katex {
+  font-size: 1.1em;
+}
+
+.code-editor {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.latex-preview {
+  font-family: 'Inter', serif;
+}
+
+.latex-preview h1 {
+  font-size: 1.8rem;
+  font-weight: 700;
+  margin-bottom: 1rem;
+  color: #F8FAFC;
+}
+
+.latex-preview h2 {
+  font-size: 1.4rem;
+  font-weight: 600;
+  margin-top: 1.5rem;
+  margin-bottom: 0.8rem;
+  color: #F1F5F9;
+}
+
+.latex-preview h3 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-top: 1.2rem;
+  margin-bottom: 0.6rem;
+  color: #E2E8F0;
+}
+
+.latex-preview p {
+  margin-bottom: 0.8rem;
+  color: #CBD5E1;
+}
+
+.latex-preview ul, .latex-preview ol {
+  margin-left: 1.5rem;
+  margin-bottom: 0.8rem;
+}
+
+.latex-preview li {
+  margin-bottom: 0.4rem;
+  color: #CBD5E1;
+}
+
+.latex-preview blockquote {
+  border-left: 3px solid #3B82F6;
+  padding-left: 1rem;
+  margin: 1rem 0;
+  color: #94A3B8;
+  font-style: italic;
+}
+
+.latex-preview code {
+  background: #1E293B;
+  padding: 0.2em 0.4em;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.9em;
+  color: #F8FAFC;
+}
+
+.latex-preview pre {
+  background: #1E293B;
+  padding: 1rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin-bottom: 1rem;
+}
+
+.latex-preview pre code {
+  background: none;
+  padding: 0;
+}
+
+/* ---------- RAG 回答的 Markdown 渲染 ---------- */
+.assistant-markdown > *:first-child {
+  margin-top: 0 !important;
+}
+
+.assistant-markdown > *:last-child {
+  margin-bottom: 0 !important;
+}
+
+.assistant-markdown pre code {
+  display: block;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+.assistant-markdown :not(pre) > code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+}
+
+.assistant-markdown a {
+  color: #38BDF8;
+  text-decoration: underline;
+}
+
+.graph-container {
+  width: 100%;
+  height: 100%;
+}
+
+.animate-pulse-slow {
+  animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(-20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in {
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-out;
+}
+
+@keyframes typing {
+  from {
+    width: 0;
+  }
+  to {
+    width: 100%;
+  }
+}
+
+.animate-typing {
+  overflow: hidden;
+  white-space: nowrap;
+  animation: typing 2s steps(40, end);
+}
+
+/* ---------- PDF.js TextLayer（文字可选/可高亮） ---------- */
+.pdf-page-wrap {
+  --user-unit: 1;
+  --total-scale-factor: calc(var(--scale-factor) * var(--user-unit));
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+
+  position: relative;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+  border-radius: 2px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.pdf-text-layer {
+  color-scheme: only light;
+  position: absolute;
+  inset: 0;
+  text-align: initial;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 2;
+
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.pdf-text-layer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.pdf-text-layer > :not(.markedContent),
+.pdf-text-layer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.pdf-text-layer ::selection {
+  background: rgba(59, 130, 246, 0.35);
+}
+
+/* 高亮标记：文字仍透明，只显示背景色 */
+.pdf-highlight {
+  background-color: rgba(250, 204, 21, 0.35);
+  border-radius: 2px;
+}
+
+.pdf-highlight::selection {
+  background: rgba(59, 130, 246, 0.35);
+}
+
+/* 引用跳转定位：目标文本闪亮高亮便于用户一眼定位 */
+.pdf-jump-flash {
+  animation: pdfJumpFlash 2s ease-out;
+}
+
+@keyframes pdfJumpFlash {
+  0%   { background-color: rgba(34, 211, 238, 0.9); box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.6); }
+  60%  { background-color: rgba(34, 211, 238, 0.35); box-shadow: 0 0 0 0 rgba(34, 211, 238, 0); }
+  100% { background-color: transparent; box-shadow: 0 0 0 0 rgba(34, 211, 238, 0); }
+}
+
+/* 引用定位命中范围：闪亮动画结束后保持浅青色底色，直到下一次定位 */
+.pdf-locate {
+  background-color: rgba(34, 211, 238, 0.28);
+  border-radius: 2px;
+}
+
+.pdf-text-layer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: -1;
+  cursor: default;
+  user-select: none;
+}

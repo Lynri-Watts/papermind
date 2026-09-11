@@ -1,0 +1,344 @@
+.papermind-sidebar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 350px;
+  height: 100vh;
+  background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
+  box-shadow: -4px 0 20px rgba(0, 0, 0, 0.3);
+  z-index: 99999;
+  transform: translateX(100%);
+  transition: transform 0.3s ease-out;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid #334155;
+}
+
+.papermind-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid #334155;
+  background: rgba(59, 130, 246, 0.1);
+}
+
+.papermind-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.papermind-icon {
+  font-size: 24px;
+}
+
+.papermind-title {
+  font-size: 18px;
+  font-weight: 700;
+  background: linear-gradient(90deg, #3B82F6, #8B5CF6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.papermind-close-btn {
+  background: none;
+  border: none;
+  color: #94A3B8;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: all 0.2s;
+}
+
+.papermind-close-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #F8FAFC;
+}
+
+.papermind-sidebar-tabs {
+  display: flex;
+  border-bottom: 1px solid #334155;
+}
+
+.papermind-tab {
+  flex: 1;
+  padding: 12px;
+  background: none;
+  border: none;
+  color: #94A3B8;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  border-bottom: 2px solid transparent;
+}
+
+.papermind-tab:hover {
+  color: #F8FAFC;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.papermind-tab.active {
+  color: #3B82F6;
+  border-bottom-color: #3B82F6;
+  background: rgba(59, 130, 246, 0.1);
+}
+
+.papermind-sidebar-content {
+  flex: 1;
+  overflow: hidden;
+}
+
+.papermind-tab-content {
+  display: none;
+  height: 100%;
+  flex-direction: column;
+}
+
+.papermind-tab-content.active {
+  display: flex;
+}
+
+.papermind-note-input {
+  padding: 16px;
+  border-bottom: 1px solid #334155;
+}
+
+.papermind-note-input textarea {
+  width: 100%;
+  height: 80px;
+  padding: 12px;
+  background: #0F172A;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  color: #F8FAFC;
+  font-size: 14px;
+  resize: none;
+  box-sizing: border-box;
+  transition: border-color 0.2s;
+}
+
+.papermind-note-input textarea:focus {
+  outline: none;
+  border-color: #3B82F6;
+}
+
+.papermind-note-input textarea::placeholder {
+  color: #64748B;
+}
+
+.papermind-add-note-btn {
+  margin-top: 12px;
+  width: 100%;
+  padding: 10px;
+  background: linear-gradient(135deg, #3B82F6, #8B5CF6);
+  border: none;
+  border-radius: 8px;
+  color: #FFFFFF;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.papermind-add-note-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+}
+
+.papermind-notes-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.papermind-note-item {
+  padding: 12px;
+  background: #0F172A;
+  border-radius: 8px;
+  margin-bottom: 10px;
+  border: 1px solid #334155;
+}
+
+.papermind-note-item p {
+  color: #CBD5E1;
+  font-size: 14px;
+  margin: 0;
+  line-height: 1.6;
+}
+
+.papermind-note-date {
+  display: block;
+  margin-top: 8px;
+  color: #64748B;
+  font-size: 12px;
+}
+
+.papermind-chat-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.papermind-chat-message {
+  max-width: 100%;
+  padding: 12px;
+  border-radius: 12px;
+}
+
+.papermind-chat-message.user {
+  background: linear-gradient(135deg, #3B82F6, #8B5CF6);
+  align-self: flex-end;
+  border-bottom-right-radius: 4px;
+}
+
+.papermind-chat-message.assistant {
+  background: #0F172A;
+  border: 1px solid #334155;
+  align-self: flex-start;
+  border-bottom-left-radius: 4px;
+}
+
+.papermind-chat-message p {
+  color: #F8FAFC;
+  font-size: 14px;
+  margin: 0;
+  line-height: 1.6;
+}
+
+.papermind-chat-message.assistant p {
+  color: #CBD5E1;
+}
+
+.papermind-loading {
+  display: flex;
+  gap: 6px;
+  padding: 8px 0;
+}
+
+.papermind-loading span {
+  width: 6px;
+  height: 6px;
+  background: #3B82F6;
+  border-radius: 50%;
+  animation: bounce 1.4s infinite ease-in-out;
+}
+
+.papermind-loading span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.papermind-loading span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes bounce {
+  0%, 80%, 100% {
+    transform: scale(0);
+  }
+  40% {
+    transform: scale(1);
+  }
+}
+
+.papermind-chat-input {
+  display: flex;
+  gap: 10px;
+  padding: 16px;
+  border-top: 1px solid #334155;
+}
+
+.papermind-chat-input input {
+  flex: 1;
+  padding: 12px;
+  background: #0F172A;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  color: #F8FAFC;
+  font-size: 14px;
+  transition: border-color 0.2s;
+}
+
+.papermind-chat-input input:focus {
+  outline: none;
+  border-color: #3B82F6;
+}
+
+.papermind-chat-input input::placeholder {
+  color: #64748B;
+}
+
+.papermind-send-btn {
+  padding: 12px 20px;
+  background: linear-gradient(135deg, #3B82F6, #8B5CF6);
+  border: none;
+  border-radius: 8px;
+  color: #FFFFFF;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.papermind-send-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+}
+
+.papermind-highlights-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.papermind-highlight-item {
+  padding: 12px;
+  background: #0F172A;
+  border-radius: 8px;
+  margin-bottom: 10px;
+  border-left: 4px solid #3B82F6;
+}
+
+.papermind-highlight-item p {
+  color: #CBD5E1;
+  font-size: 14px;
+  margin: 0;
+  line-height: 1.6;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.papermind-highlight-date {
+  display: block;
+  margin-top: 8px;
+  color: #64748B;
+  font-size: 12px;
+}
+
+.papermind-empty {
+  color: #64748B;
+  font-size: 14px;
+  text-align: center;
+  padding: 40px 20px;
+}
+
+.papermind-highlight {
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.papermind-highlight:hover {
+  transform: scale(1.02);
+}
+
+@media (max-width: 768px) {
+  .papermind-sidebar {
+    width: 100%;
+  }
+}
