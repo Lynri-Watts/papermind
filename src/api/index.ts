@@ -585,7 +585,7 @@ export const getSettings = async (): Promise<SettingsSnapshot> => {
   return request<SettingsSnapshot>('/settings');
 };
 
-/** 保存设置（写入 backend/.env 并立即生效，无需重启后端） */
+/** 保存设置（写入后端本地数据库 app_settings 并立即生效，无需重启后端） */
 export const updateSettings = async (payload: SettingsUpdate): Promise<SettingsSnapshot> => {
   return request<SettingsSnapshot>('/settings', {
     method: 'PUT',

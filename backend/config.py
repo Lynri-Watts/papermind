@@ -1,15 +1,16 @@
 """应用配置：目录与进程级常量。
 
-注意：**LLM 与数据源的凭据**不在此处固化，而是由 :mod:`settings_store`
-在请求时读取 ``.env``（支持界面在线修改后立即生效）。本模块只负责
-路径、服务监听与超时等启动期常量。
+注意：**LLM 与数据源的凭据**不在 .env 也不在此处固化，而是由 :mod:`settings_store`
+在请求时读取数据库表 ``app_settings``（前端「设置」页维护，保存后立即热加载）。
+本模块只负责路径与 HOST/PORT/DEBUG 等启动期服务配置（来自 ``backend/.env``，
+该文件已不含任何密钥，可以随仓库提交）。
 """
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# 加载 backend/.env（若存在）；key 由用户手动填写，绝不提交到仓库
+# 加载 backend/.env（若存在）；仅含 HOST/PORT/DEBUG 等非敏感服务配置
 _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)

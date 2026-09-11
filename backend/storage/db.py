@@ -121,6 +121,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
             error      TEXT,                      -- 最近一次失败原因（面向用户）
             checked_at TEXT NOT NULL
         );
+
+        -- 应用设置（LLM 服务配置、数据源凭据、数据源启用顺序）。
+        -- 由前端「设置」页维护；密钥仅存本表（随被忽略的 data/ 目录留在本机），
+        -- backend/.env 只保留 HOST/PORT/DEBUG 等非敏感服务配置。
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     _migrate(conn)
@@ -294,6 +303,33 @@ def get_pdf_status_map(paper_ids) -> dict[str, dict]:
     ).fetchall()
     conn.close()
     return {r["paper_id"]: dict(r) for r in rows}
+
+
+# ---------- app_settings：LLM/数据源等界面可维护设置 ----------
+def get_settings() -> dict[str, str]:
+    """全部应用设置 ``{key: value}``；从未保存过时返回空 dict（首次启动迁移判据）。"""
+    conn = _connect()
+    rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    conn.close()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def set_settings(updates: dict[str, str]) -> None:
+    """批量 UPSERT 应用设置（界面保存时调用）。空值也写入（语义=清除）。"""
+    if not updates:
+        return
+    conn = _connect()
+    now = _now()
+    conn.executemany(
+        """
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """,
+        [(key, str(value), now) for key, value in updates.items()],
+    )
+    conn.commit()
+    conn.close()
 
 
 # ---------- notes ----------

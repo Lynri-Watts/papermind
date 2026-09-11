@@ -2,14 +2,18 @@
 
 设计要点
 --------
-1. **唯一持久化载体是 ``backend/.env``**。用户既可直接编辑该文件，也可通过前端
-   「设置」页写入；写入后立即 :func:`reload`，provider / LLM 客户端在**不重启服务**
-   的情况下即取到新配置（它们都在请求时经本模块读取，而非在 import 时固化）。
-2. **key 只存在于后端**。:func:`snapshot` 只回传"是否已配置"与掩码，绝不回传明文密钥，
-   因此前端与仓库都不会出现 key。
-3. ``SOURCE_PRIORITY`` 是「数据源启用状态 + 聚合优先级」的**唯一真相**：
+1. **唯一持久化载体是数据库表 ``app_settings``**（``backend/data/papermind.db``，
+   该目录被 .gitignore 忽略）。用户通过前端「设置」页写入；保存后立即 :func:`reload`，
+   provider / LLM 客户端在**不重启服务**的情况下即取到新配置（它们都在请求时经本模块
+   读取，而非在 import 时固化）。
+2. **key 只存在于后端数据库**。:func:`snapshot` 只回传"是否已配置"与掩码，绝不回传明文
+   密钥，因此前端与仓库都不会出现 key。
+3. ``source_priority`` 是「数据源启用状态 + 聚合优先级」的**唯一真相**：
    出现在该有序列表中的源即为启用，顺序即优先级；未出现即禁用。避免
    "启用集合"与"优先级列表"两份数据互相矛盾。
+4. ``backend/.env`` 只保留 HOST/PORT/DEBUG 等**非敏感服务配置**。首次启动时若发现
+   ``app_settings`` 为空（老版本升级），会把 .env 中的受管键一次性迁移进数据库，
+   并从 .env 中移除这些键（见 :func:`_migrate_from_env`）。
 """
 from __future__ import annotations
 
@@ -19,17 +23,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import storage.db as db
 from i18n import tr
 
 logger = logging.getLogger(__name__)
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 
-# 由界面写入、但 .env 中原本不存在的键，统一追加到该分节标题之下（保持文件可读）
-MANAGED_SECTION = "# ============ 由界面「设置」写入 ============"
-
 # ---------- 数据源目录（前端「设置」页据此渲染；新增数据源只需在此登记） ----------
-# credential_env: 凭据所在的 .env 键；None 表示该源无需任何配置
+# credential_key: 凭据在 app_settings 表中的键；None 表示该源无需任何配置
 # secret: True=密钥（界面/接口只回掩码）；False=可明文回显（如邮箱）
 # required: 该凭据是否为"该源可用"的必要条件
 # credential_label / description: i18n 文案键（在 snapshot() 内按当前语言经 tr() 解析）；
@@ -38,6 +40,7 @@ SOURCE_CATALOG: list[dict] = [
     {
         "id": "semantic_scholar",
         "label": "Semantic Scholar",
+        "credential_key": "credential.semantic_scholar",
         "credential_env": "SEMANTIC_SCHOLAR_API_KEY",
         "credential_label": "settings.source.semantic_scholar.credential_label",
         "secret": True,
@@ -48,6 +51,7 @@ SOURCE_CATALOG: list[dict] = [
     {
         "id": "openalex",
         "label": "OpenAlex",
+        "credential_key": "credential.openalex",
         "credential_env": "OPENALEX_MAILTO",
         "credential_label": "settings.source.openalex.credential_label",
         "secret": False,
@@ -58,6 +62,7 @@ SOURCE_CATALOG: list[dict] = [
     {
         "id": "arxiv",
         "label": "arXiv",
+        "credential_key": None,
         "credential_env": None,
         "credential_label": None,
         "secret": False,
@@ -68,6 +73,7 @@ SOURCE_CATALOG: list[dict] = [
     {
         "id": "core",
         "label": "CORE",
+        "credential_key": "credential.core",
         "credential_env": "CORE_API_KEY",
         "credential_label": "settings.source.core.credential_label",
         "secret": True,
@@ -83,10 +89,16 @@ SOURCE_LABELS: dict[str, str] = {entry["id"]: entry["label"] for entry in SOURCE
 # 默认聚合优先级（引用数据最全者优先）
 DEFAULT_SOURCE_PRIORITY: list[str] = ["semantic_scholar", "openalex", "arxiv", "core"]
 
-# LLM 默认值（.env 未填写时生效）
+# LLM 默认值（数据库未填写时生效）
 DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
 DEFAULT_LLM_TIMEOUT = 120
+
+# app_settings 中的逻辑键名
+KEY_LLM_BASE_URL = "llm_base_url"
+KEY_LLM_MODEL = "llm_model"
+KEY_LLM_API_KEY = "llm_api_key"
+KEY_SOURCE_PRIORITY = "source_priority"
 
 _cache: dict = {}
 
@@ -101,10 +113,10 @@ def _clean_api_key(key: str) -> str:
 
 
 def _parse_source_priority(raw: str) -> list[str]:
-    """把 ``SOURCE_PRIORITY`` 解析为已知数据源的有序列表（去重、保持顺序）。
+    """把存储的 ``source_priority`` 字符串解析为已知数据源的有序列表（去重、保持顺序）。
 
-    - 键缺失：视为未配置，返回默认优先级（新装环境）；
-    - 键存在但没有任何已知数据源：属于配置错误，明确抛错而非静默兜底。
+    - 空值：视为未配置，返回默认优先级（新装环境）；
+    - 含未知数据源：属于配置错误，明确抛错而非静默兜底。
     """
     if not raw.strip():
         return list(DEFAULT_SOURCE_PRIORITY)
@@ -124,28 +136,94 @@ def _parse_source_priority(raw: str) -> list[str]:
     return seen
 
 
-def reload() -> None:
-    """从 ``.env`` 重新加载全部运行时配置（界面写入后立即调用）。
+def _migrate_from_env() -> dict[str, str]:
+    """首次启动的一次性迁移：把 .env 中的受管键读入数据库，并从 .env 移除。
 
-    使用 ``override=True``：以文件为准覆盖进程环境，保证界面改动能立即生效。
+    迁移判据是 ``app_settings`` 表为空（老版本没有该表数据）。迁移完成后 .env
+    只保留 HOST/PORT/DEBUG 等服务配置；.env 不存在或没有受管键时（全新安装），
+    则以代码默认值初始化数据库设置。
     """
     if ENV_PATH.exists():
-        load_dotenv(ENV_PATH, override=True)
+        load_dotenv(ENV_PATH, override=False)
+
+    priority = _parse_source_priority(os.getenv("SOURCE_PRIORITY", ""))
+    migrated: dict[str, str] = {
+        KEY_LLM_BASE_URL: (os.getenv("LLM_BASE_URL", "") or "").strip() or DEFAULT_LLM_BASE_URL,
+        KEY_LLM_MODEL: (os.getenv("LLM_MODEL", "") or "").strip() or DEFAULT_LLM_MODEL,
+        KEY_LLM_API_KEY: _clean_api_key(os.getenv("LLM_API_KEY", "")),
+        KEY_SOURCE_PRIORITY: ",".join(priority),
+    }
+    for entry in SOURCE_CATALOG:
+        if entry["credential_key"] and entry["credential_env"]:
+            migrated[entry["credential_key"]] = (os.getenv(entry["credential_env"], "") or "").strip()
+
+    db.set_settings(migrated)
+
+    # 从 .env 移除已迁移的受管键（保留服务配置、注释与空行的可读性）
+    managed_env_keys = {"LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "SOURCE_PRIORITY"}
+    managed_env_keys.update(
+        entry["credential_env"] for entry in SOURCE_CATALOG if entry["credential_env"]
+    )
+    _strip_env_keys(managed_env_keys)
+
+    logger.info("已将 .env 中的受管设置一次性迁移到数据库 app_settings 表")
+    return migrated
+
+
+def _strip_env_keys(keys: set[str]) -> None:
+    """从 .env 删除指定键的赋值行（含界面写入分节标题），原子落盘。
+
+    服务配置（HOST/PORT/DEBUG）与其它注释原样保留；清理多余连续空行。
+    """
+    if not ENV_PATH.exists():
+        return
+    kept: list[str] = []
+    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("# =") and "由界面「设置」写入" in stripped:
+            continue
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in keys:
+                continue
+        kept.append(line)
+    # 去掉首尾空行，并把连续空行压缩为一行
+    cleaned: list[str] = []
+    prev_blank = True
+    for line in kept:
+        blank = not line.strip()
+        if blank and prev_blank:
+            continue
+        cleaned.append(line)
+        prev_blank = blank
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    tmp_path = ENV_PATH.with_name(ENV_PATH.name + ".tmp")
+    tmp_path.write_text("\n".join(cleaned) + ("\n" if cleaned else ""), encoding="utf-8")
+    tmp_path.replace(ENV_PATH)
+
+
+def reload() -> None:
+    """从数据库重新加载全部运行时配置（界面写入后立即调用，热加载）。"""
+    db.init_db()
+    stored = db.get_settings()
+    if not stored:
+        # 全新安装或老版本升级：一次性从 .env 迁移（或落默认值）
+        stored = _migrate_from_env()
 
     credentials: dict[str, str] = {}
     for entry in SOURCE_CATALOG:
-        env_key = entry["credential_env"]
-        if env_key:
-            credentials[entry["id"]] = (os.getenv(env_key, "") or "").strip()
+        if entry["credential_key"]:
+            credentials[entry["id"]] = (stored.get(entry["credential_key"], "") or "").strip()
 
     _cache.clear()
     _cache.update({
-        "llm_base_url": (os.getenv("LLM_BASE_URL", "") or "").strip() or DEFAULT_LLM_BASE_URL,
-        "llm_model": (os.getenv("LLM_MODEL", "") or "").strip() or DEFAULT_LLM_MODEL,
-        "llm_api_key": _clean_api_key(os.getenv("LLM_API_KEY", "")),
-        "llm_timeout": int(os.getenv("LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT))),
+        "llm_base_url": (stored.get(KEY_LLM_BASE_URL, "") or "").strip() or DEFAULT_LLM_BASE_URL,
+        "llm_model": (stored.get(KEY_LLM_MODEL, "") or "").strip() or DEFAULT_LLM_MODEL,
+        "llm_api_key": _clean_api_key(stored.get(KEY_LLM_API_KEY, "")),
+        "llm_timeout": DEFAULT_LLM_TIMEOUT,
         "credentials": credentials,
-        "source_priority": _parse_source_priority(os.getenv("SOURCE_PRIORITY", "")),
+        "source_priority": _parse_source_priority(stored.get(KEY_SOURCE_PRIORITY, "")),
     })
     logger.info("设置已加载：启用数据源=%s，LLM=%s",
                 ",".join(_cache["source_priority"]), _cache["llm_model"])
@@ -203,7 +281,7 @@ def snapshot() -> dict:
             "enabled": entry["id"] in priority,
             "priority": priority.index(entry["id"]) if entry["id"] in priority else -1,
         }
-        if entry["credential_env"]:
+        if entry["credential_key"]:
             item["value"] = _mask(raw) if entry["secret"] else raw
         sources.append(item)
     # 启用者按优先级在前，禁用者随后（保持目录顺序），便于界面直接渲染
@@ -219,22 +297,22 @@ def snapshot() -> dict:
     }
 
 
-def _validate_llm(payload: dict) -> dict:
-    """校验并抽取 LLM 字段的 .env 更新项。"""
+def _validate_llm(payload: dict) -> dict[str, str]:
+    """校验并抽取 LLM 字段的数据库更新项。"""
     updates: dict[str, str] = {}
     if "base_url" in payload:
         base_url = str(payload["base_url"] or "").strip()
         if not base_url.startswith(("http://", "https://")):
             raise ValueError(tr("settings.invalid_base_url"))
-        updates["LLM_BASE_URL"] = base_url
+        updates[KEY_LLM_BASE_URL] = base_url
     if "model" in payload:
         model = str(payload["model"] or "").strip()
         if not model:
             raise ValueError(tr("settings.empty_model"))
-        updates["LLM_MODEL"] = model
+        updates[KEY_LLM_MODEL] = model
     if "api_key" in payload:
         # 空串表示清除，交给使用侧报"未配置"
-        updates["LLM_API_KEY"] = str(payload["api_key"] or "").strip()
+        updates[KEY_LLM_API_KEY] = str(payload["api_key"] or "").strip()
     return updates
 
 
@@ -252,39 +330,6 @@ def _validate_source_order(order) -> list[str]:
     if not result:
         raise ValueError(tr("settings.source_order_empty"))
     return result
-
-
-def _write_env(updates: dict[str, str]) -> None:
-    """按 key 更新 ``.env``：保留注释、空行与其它配置的行序，原子落盘。
-
-    文件中已存在的键就地替换；新键追加到「由界面写入」分节之下。
-    """
-    lines: list[str] = []
-    if ENV_PATH.exists():
-        lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
-
-    remaining = dict(updates)
-    out: list[str] = []
-    for line in lines:
-        stripped = line.lstrip()
-        if stripped and not stripped.startswith("#") and "=" in stripped:
-            key = stripped.split("=", 1)[0].strip()
-            if key in remaining:
-                out.append(f"{key}={remaining.pop(key)}")
-                continue
-        out.append(line)
-
-    if remaining:
-        if out and out[-1].strip():
-            out.append("")
-        if MANAGED_SECTION not in out:
-            out.append(MANAGED_SECTION)
-        for key, value in remaining.items():
-            out.append(f"{key}={value}")
-
-    tmp_path = ENV_PATH.with_name(ENV_PATH.name + ".tmp")
-    tmp_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-    tmp_path.replace(ENV_PATH)
 
 
 def update(payload: dict) -> dict:
@@ -311,19 +356,19 @@ def update(payload: dict) -> dict:
         if unknown:
             raise ValueError(tr("settings.credentials_unknown", sources=", ".join(unknown)))
         for entry in SOURCE_CATALOG:
-            env_key = entry["credential_env"]
-            if not env_key or entry["id"] not in credentials:
+            db_key = entry["credential_key"]
+            if not db_key or entry["id"] not in credentials:
                 continue
-            updates[env_key] = str(credentials[entry["id"]] or "").strip()
+            updates[db_key] = str(credentials[entry["id"]] or "").strip()
 
     order = payload.get("source_order")
     if order is not None:
-        updates["SOURCE_PRIORITY"] = ",".join(_validate_source_order(order))
+        updates[KEY_SOURCE_PRIORITY] = ",".join(_validate_source_order(order))
 
     if not updates:
         raise ValueError(tr("settings.nothing_to_save"))
 
-    _write_env(updates)
+    db.set_settings(updates)
     reload()
     return snapshot()
 

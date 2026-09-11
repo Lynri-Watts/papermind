@@ -10,7 +10,7 @@ from __future__ import annotations
 MESSAGES: dict[str, dict[str, str]] = {
     "zh": {
         # LLM 客户端
-        "rag.llm_not_configured": "LLM_API_KEY 未配置。请在「设置」页或 backend/.env 中填写后重试。",
+        "rag.llm_not_configured": "LLM API Key 未配置。请在「设置」页填写大模型服务后重试。",
         # RAG 引擎
         "rag.no_readable_passages": "可用的材料中没有可阅读的正文段落，无法作答。",
         # 工具注册表
@@ -45,7 +45,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "en": {
         # LLM client
-        "rag.llm_not_configured": "LLM_API_KEY is not configured. Set it in the Settings page or backend/.env, then retry.",
+        "rag.llm_not_configured": "The LLM API key is not configured. Please configure the LLM service in the Settings page, then retry.",
         # RAG engine
         "rag.no_readable_passages": "The available material has no readable body passages, so no answer can be produced.",
         # Tool registry

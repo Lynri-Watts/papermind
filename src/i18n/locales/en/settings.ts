@@ -1,8 +1,7 @@
 /** Settings page: interface language, paper data sources and LLM service copy */
 export default {
   title: 'Settings',
-  /** `.env` is wrapped in <env> to keep its monospace styling (Trans named component) */
-  subtitle: 'Manage paper data sources and LLM services; credentials are stored in the backend <env>.env</env> and take effect immediately',
+  subtitle: 'Manage paper data sources and LLM services; credentials are stored only in the local backend database and take effect immediately',
   loading: 'Loading settings...',
   /** Fallback when loading fails; the backend error message is shown as-is when present */
   loadError: 'Unable to read settings — please make sure the backend service is running',
@@ -47,7 +46,7 @@ export default {
   },
 
   save: {
-    success: 'Saved to the backend .env and applied immediately (no restart needed)',
+    success: 'Saved to the local backend database and applied immediately (no restart needed)',
     failed: 'Failed to save',
   },
 

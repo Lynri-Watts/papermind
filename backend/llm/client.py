@@ -3,7 +3,8 @@
 仅依赖 OpenAI 格式（base_url + api_key + chat.completions），
 因此任何兼容服务（OpenAI / DeepSeek / 智谱 / Moonshot 等）均可接入。
 
-key 由用户填入 backend/.env 或前端「设置」页，绝不进入前端存储或代码仓库。
+key 由用户经前端「设置」页填写（持久化在后端本地数据库 app_settings 表），
+绝不进入前端存储或代码仓库。
 配置在**每次新建客户端时**从 settings_store 读取，因此界面改完即生效。
 """
 from __future__ import annotations
@@ -22,7 +23,7 @@ class LLMNotConfiguredError(RuntimeError):
 class LLMClient:
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None,
                  model: Optional[str] = None) -> None:
-        """未显式传入的参数取当前设置（.env / 「设置」页）的值。"""
+        """未显式传入的参数取「设置」页保存的当前值（app_settings 表）。"""
         cfg = settings_store.llm_config()
         base_url = base_url or cfg["base_url"]
         api_key = cfg["api_key"] if api_key is None else api_key

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Trans, useTranslation } from 'react-i18next';
+import { useTranslation } from 'react-i18next';
 import {
   Settings as SettingsIcon, Database, Server, Loader2, CheckCircle2, XCircle, ArrowUp, ArrowDown,
   ExternalLink, Eye, EyeOff, Save, AlertCircle, KeyRound, Mail, Plug, Languages,
@@ -23,9 +23,9 @@ const hasCredential = (s: SettingsSource): boolean => s.credential_label !== nul
  *
  * 设计要点
  * --------
- * 1. 凭据只写后端 ``backend/.env``（保存后立即生效，无需重启），前端不持久化任何 key；
+ * 1. 凭据只写后端本地数据库（app_settings 表，保存后立即热加载，无需重启），前端不持久化任何 key；
  *    密钥字段永不回显明文，只显示掩码与"是否已配置"。
- * 2. 测试按钮使用**已保存**的配置（后端按当前 .env 发起真实请求），因此当该项存在
+ * 2. 测试按钮使用**已保存**的配置（后端按当前数据库设置发起真实请求），因此当该项存在
  *    未保存改动时禁用测试并提示先保存，避免"测的是旧配置"的误导。
  * 3. 界面语言由 i18next-browser-languagedetector 缓存进 localStorage（跨重启保留），
  *    无需写入后端设置。
@@ -395,9 +395,7 @@ const SettingsPage: React.FC = () => {
           </div>
           <div>
             <h1 className="text-xl font-bold text-text">{t('title')}</h1>
-            <p className="text-sm text-textSecondary">
-              <Trans ns="settings" i18nKey="subtitle" components={{ env: <span className="font-mono" /> }} />
-            </p>
+            <p className="text-sm text-textSecondary">{t('subtitle')}</p>
           </div>
         </div>
 

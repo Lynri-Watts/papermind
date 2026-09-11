@@ -1,7 +1,7 @@
 """设置 API：数据源凭据 / 启用顺序 与 LLM 服务配置的读写与连通性测试。
 
 - ``GET  /api/settings``      当前设置（密钥只回掩码与"是否已配置"，绝不回明文）
-- ``PUT  /api/settings``      保存设置（写入 ``backend/.env`` 并立即生效，无需重启）
+- ``PUT  /api/settings``      保存设置（写入后端数据库 app_settings 并立即生效，无需重启）
 - ``POST /api/settings/test`` 对 LLM 或某个数据源发起一次真实请求，验证配置可用
 
 连通性测试的失败是**被测试对象的结果**而非接口错误，因此统一以 HTTP 200 +
