@@ -1,4 +1,4 @@
-/** 探索（检索 + 知识图谱）文案 */
+/** 探索（检索 + 当前思维导图）文案 */
 export default {
   search: {
     title: '论文搜索',
@@ -48,25 +48,6 @@ export default {
     adding: '加入中...',
     addedAction: '已在上下文',
     alreadyInContext: '该论文已在上下文库',
-  },
-  graph: {
-    title: '知识图谱',
-    nodesCount: '（{{count}} 个节点）',
-    zoomOut: '缩小',
-    zoomIn: '放大',
-    loading: '正在加载图谱…',
-    unavailable: '知识图谱暂不可用',
-    unavailableHint: '该功能开发中，请先使用左侧面板搜索论文。',
-    legend: {
-      paper: '论文',
-      author: '作者',
-      topic: '主题',
-      cites: '引用',
-    },
-  },
-  node: {
-    related: '相关',
-    searchInPapers: '在论文中搜索',
   },
   detail: {
     title: '论文详情',

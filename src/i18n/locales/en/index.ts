@@ -14,6 +14,7 @@ import pdf from './pdf';
 import store from './store';
 import api from './api';
 import writing from './writing';
+import mindmap from './mindmap';
 
 /** English resources: namespaces mirror the functional domains under src */
 const en = {
@@ -33,6 +34,7 @@ const en = {
   store,
   api,
   writing,
+  mindmap,
 };
 
 export default en;

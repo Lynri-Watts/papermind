@@ -1,4 +1,4 @@
-import { Paper, SearchResponse, SearchSourceStatus, RagQueryRequest, RagQueryResponse, RagSource, GraphResponse, Note, ContextItem, ReactActionEvent, ReactObservationEvent, ToolPaper, WorkspaceInfo, WorkspaceFile, SettingsSnapshot, SettingsUpdate, SettingsTestResult } from '../types';
+import { Paper, SearchResponse, SearchSourceStatus, RagQueryRequest, RagQueryResponse, RagSource, Note, ContextItem, ReactActionEvent, ReactObservationEvent, ToolPaper, WorkspaceInfo, WorkspaceFile, SettingsSnapshot, SettingsUpdate, SettingsTestResult, MindmapMeta, MindmapInfo, MindmapAction, MindmapActionsResult, MindmapDiffEvent, MindmapUndoResult } from '../types';
 import i18n, { normalizeLanguage } from '../i18n';
 
 // 后端 API 网关地址（Flask，见 backend/app.py）
@@ -8,6 +8,33 @@ export const API_BASE = 'http://127.0.0.1:5001/api';
  * 后端据此决定错误提示、设置保存/测试等文案的语言（见 backend/i18n.py）。 */
 function currentLanguage(): string {
   return normalizeLanguage(i18n.resolvedLanguage ?? i18n.language);
+}
+
+/** HTTP 错误：保留状态码与解析后的响应体（乐观锁 409 等场景需读取 body 字段）。 */
+export class ApiRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly body: unknown
+  ) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+}
+
+/**
+ * 导图动作提交的版本冲突（HTTP 409）：服务端版本已被 AI/其他标签页推进。
+ * 调用方应改用 currentMindmap 刷新画布后，再决定是否重试。
+ */
+export class MindmapConflictError extends Error {
+  constructor(
+    readonly currentVersion: number,
+    readonly currentMindmap: MindmapInfo,
+    message: string
+  ) {
+    super(message);
+    this.name = 'MindmapConflictError';
+  }
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -21,13 +48,16 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   });
   if (!resp.ok) {
     let message = `HTTP ${resp.status}`;
+    let body: unknown = null;
     try {
-      const body = await resp.json();
-      if (body?.error) message = body.error;
+      body = await resp.json();
+      if ((body as { error?: string } | null)?.error) {
+        message = (body as { error: string }).error;
+      }
     } catch {
       // 非 JSON 错误体，保留默认消息
     }
-    throw new Error(message);
+    throw new ApiRequestError(resp.status, message, body);
   }
   return resp.json() as Promise<T>;
 }
@@ -151,11 +181,6 @@ export const searchPapersStructured = async (
   };
 };
 
-export const getGraphData = async (): Promise<GraphResponse> => {
-  // 知识图谱后端暂未实现（待开发），不返回 mock 数据
-  return { nodes: [], edges: [] };
-};
-
 /** 论文 PDF 二进制流的 URL（供 PDF.js 渲染；需先调用 pdfReady 确保后端已缓存） */
 export const getPdfUrl = (paperId: string): string =>
   `${API_BASE}/paper/${encodeURIComponent(paperId)}/pdf`;
@@ -197,7 +222,13 @@ export interface RagStreamHandlers {
   onAction?: (action: ReactActionEvent) => void;
   /** ReAct 观察（Observation）：工具执行结果（自动执行，无需确认） */
   onObservation?: (obs: ReactObservationEvent) => void;
-  /** 回答文本增量（逐段追加显示） */
+  /** AI 编辑思维导图成功：增量差异（打开的画布实时落图；一问一事务可整组撤销） */
+  onMindmapDiff?: (event: MindmapDiffEvent) => void;
+  /** 非阻断提示：如本次问答没有可引用材料、已降级为通用知识回答（不替代回答正文） */
+  onNotice?: (message: string) => void;
+  /** 出处分块（先于回答增量到达）：生成中即可拿到来源名/可定位目标，渲染行内引用卡片 */
+  onSources?: (sources: RagSource[]) => void;
+  /** 回答文本增量（逐段追加显示，可能内联 [Q:N]...[/Q:N] 引用块标签） */
   onDelta?: (delta: string) => void;
   /** 生成完成（携带最终回答与出处） */
   onDone?: (result: RagQueryResponse) => void;
@@ -253,8 +284,28 @@ function parseRagSseFrame(frame: string, handlers: RagStreamHandlers): void {
         toolMessage: str(payload.tool_message),
       });
       break;
+    case 'mindmap_diff':
+      if (typeof payload.mapId === 'string' && typeof payload.version === 'number'
+        && Array.isArray(payload.actions)) {
+        handlers.onMindmapDiff?.({
+          mapId: payload.mapId,
+          version: payload.version,
+          actions: payload.actions as MindmapAction[],
+          idMap: asRecord(payload.idMap) as Record<string, string>,
+          transactionId: str(payload.transactionId),
+        });
+      }
+      break;
     case 'delta':
       if (typeof payload.delta === 'string' && payload.delta) handlers.onDelta?.(payload.delta);
+      break;
+    case 'sources': {
+      const sources = (Array.isArray(payload.sources) ? payload.sources : []) as RagSource[];
+      handlers.onSources?.(sources);
+      break;
+    }
+    case 'notice':
+      handlers.onNotice?.(str(payload.message));
       break;
     case 'done': {
       const sources = (Array.isArray(payload.sources) ? payload.sources : []) as RagSource[];
@@ -396,6 +447,16 @@ export const saveState = async (state: Record<string, unknown>, project?: string
     method: 'PUT',
     body: JSON.stringify({ state, project }),
   });
+};
+
+// ---------- 问答会话 ----------
+/** 用首条提问生成短会话标题（后端 LLM，同语言；未配置 Key/失败由调用方保留占位标题） */
+export const generateChatTitle = async (firstQuestion: string): Promise<string> => {
+  const data = await request<{ title: string }>('/chat/title', {
+    method: 'POST',
+    body: JSON.stringify({ query: firstQuestion.slice(0, 1000) }),
+  });
+  return data.title ?? '';
 };
 
 // ---------- 上下文库 ----------
@@ -599,4 +660,157 @@ export const testSettingConnection = async (target: string): Promise<SettingsTes
     method: 'POST',
     body: JSON.stringify({ target }),
   });
+};
+
+// ---------- 思维导图（mindmaps，见 backend/routes/mindmaps.py） ----------
+// 作用域约定与上下文库一致：workspaceId 缺省/空 = 全局（scope=''），
+// 非空由后端归一化为 'ws:<id>'；跨作用域访问导图返回 404（不泄露存在性）。
+function mindmapWsQuery(workspaceId?: string | null): string {
+  return workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : '';
+}
+
+/** 列出某作用域导图（轻量元信息，按 updated_at 倒序） */
+export const listMindmaps = async (workspaceId?: string | null): Promise<MindmapMeta[]> => {
+  const data = await request<{ mindmaps: MindmapMeta[] }>(
+    `/mindmaps${mindmapWsQuery(workspaceId)}`
+  );
+  return data.mindmaps;
+};
+
+/** 创建空白导图（仅根节点）；title 缺省时后端用 rootText，两者皆空报 400 */
+export const createMindmap = async (input: {
+  title?: string;
+  rootText?: string;
+  workspaceId?: string | null;
+}): Promise<MindmapInfo> => {
+  const data = await request<{ mindmap: MindmapInfo }>('/mindmaps', {
+    method: 'POST',
+    body: JSON.stringify({
+      title: input.title ?? undefined,
+      rootText: input.rootText ?? undefined,
+      workspace_id: input.workspaceId ?? undefined,
+    }),
+  });
+  return data.mindmap;
+};
+
+/** 从 mermaid mindmap 文本导入创建导图（走后端解析器；非法语法 400 且错误带行号） */
+export const importMindmap = async (input: {
+  mermaid: string;
+  title?: string;
+  workspaceId?: string | null;
+}): Promise<MindmapInfo> => {
+  const data = await request<{ mindmap: MindmapInfo }>('/mindmaps/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      mermaid: input.mermaid,
+      title: input.title ?? undefined,
+      workspace_id: input.workspaceId ?? undefined,
+    }),
+  });
+  return data.mindmap;
+};
+
+/** 读取导图完整文档（nodes 展开在顶层） */
+export const getMindmap = async (
+  mapId: string,
+  workspaceId?: string | null
+): Promise<MindmapInfo> => {
+  const data = await request<{ mindmap: MindmapInfo }>(
+    `/mindmaps/${encodeURIComponent(mapId)}${mindmapWsQuery(workspaceId)}`
+  );
+  return data.mindmap;
+};
+
+/** 重命名导图，返回更新后的完整文档 */
+export const renameMindmap = async (
+  mapId: string,
+  title: string,
+  workspaceId?: string | null
+): Promise<MindmapInfo> => {
+  const data = await request<{ mindmap: MindmapInfo }>(
+    `/mindmaps/${encodeURIComponent(mapId)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ title, workspace_id: workspaceId ?? undefined }),
+    }
+  );
+  return data.mindmap;
+};
+
+/** 删除导图（级联删除全部修订）；后端 DELETE 同时接受 body/query 中的 workspace_id */
+export const deleteMindmapApi = async (
+  mapId: string,
+  workspaceId?: string | null
+): Promise<void> => {
+  await request(`/mindmaps/${encodeURIComponent(mapId)}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ workspace_id: workspaceId ?? undefined }),
+  });
+};
+
+/**
+ * 原子提交一批结构化编辑动作（乐观锁，baseVersion 为编辑所依据的版本）。
+ * - 成功：返回提交后完整导图 + 临时 ID→正式 ID 的 idMap；
+ * - 版本过期：抛 MindmapConflictError（携带服务端 currentVersion/currentMindmap），
+ *   调用方须刷新画布后再决定重试或放弃；
+ * - 动作非法：抛 ApiRequestError(400)，文案已本地化为「第 N 个操作失败：…」。
+ */
+export const submitMindmapActions = async (
+  mapId: string,
+  baseVersion: number,
+  actions: MindmapAction[],
+  workspaceId?: string | null
+): Promise<MindmapActionsResult> => {
+  try {
+    return await request<MindmapActionsResult>(
+      `/mindmaps/${encodeURIComponent(mapId)}/actions`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          baseVersion,
+          actions,
+          workspace_id: workspaceId ?? undefined,
+        }),
+      }
+    );
+  } catch (err) {
+    if (err instanceof ApiRequestError && err.status === 409) {
+      const body = err.body as
+        | { currentVersion?: number; mindmap?: MindmapInfo }
+        | null;
+      if (body && typeof body.currentVersion === 'number' && body.mindmap) {
+        throw new MindmapConflictError(body.currentVersion, body.mindmap, err.message);
+      }
+    }
+    throw err;
+  }
+};
+
+/** 导出导图为 mermaid mindmap 文本（节点带稳定 ID 注解） */
+export const exportMindmapMermaid = async (
+  mapId: string,
+  workspaceId?: string | null
+): Promise<string> => {
+  const data = await request<{ mermaid: string }>(
+    `/mindmaps/${encodeURIComponent(mapId)}/mermaid${mindmapWsQuery(workspaceId)}`
+  );
+  return data.mermaid;
+};
+
+/** 撤销一次 AI 编辑事务（字段级逆向）；transactionId 缺省=最近一次未撤销的 AI 事务 */
+export const undoMindmapAi = async (
+  mapId: string,
+  options?: { transactionId?: string; workspaceId?: string | null }
+): Promise<MindmapUndoResult> => {
+  return request<MindmapUndoResult>(
+    `/mindmaps/${encodeURIComponent(mapId)}/undo-ai`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        transactionId: options?.transactionId ?? undefined,
+        workspace_id: options?.workspaceId ?? undefined,
+      }),
+    }
+  );
 };

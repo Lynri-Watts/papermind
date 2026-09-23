@@ -70,7 +70,10 @@ export interface RagSource {
   context_id?: number | null;
   /** 来源若为论文，对应的论文内部 id（source:external_id），供"跳转原文"使用 */
   paper_id?: string | null;
+  /** 检索分块全文：仅用于 PDF 原文定位兜底，不在界面展示 */
   text: string;
+  /** 该引用对应的原文核心句（AI 逐字摘录/后端校验回退）；缺失时界面只显示来源行 */
+  quote?: string | null;
   score: number;
 }
 
@@ -170,27 +173,43 @@ export interface ChatMessage {
   toolCall?: ReactTrailState;
   /** 完成后的步骤记录（折叠为紧凑卡片，持久化保留） */
   toolLog?: ToolCallLog[];
+  // ---- 本次回答中 AI 对思维导图的编辑（一问一事务，可整事务撤销） ----
+  mindmapEdits?: ChatMindmapEdit[];
+  /** 非阻断提示（如本次无可用文献材料、回答未引用来源）；随消息持久化 */
+  notice?: string;
 }
 
-export interface GraphNode {
+/**
+ * 一轮归档的问答会话。「清空对话」不再直接删除消息，而是把当前会话
+ * 归档到 chatConversations 列表，用户可随时重新打开继续追问。
+ * 当前未归档的草稿（chatMessages + activeConversationId=null）不入此结构，
+ * 首条用户提问发出时才建档。
+ */
+export interface ChatConversation {
   id: string;
-  label: string;
-  type: 'paper' | 'author' | 'topic';
-  x?: number;
-  y?: number;
-  size?: number;
-  color?: string;
+  /** 会话标题：首问截断占位 → 后端 LLM 生成后异步替换 */
+  title: string;
+  /** AI 标题是否仍在生成（列表可显示轻量等待态）；失败时置 false 保留占位标题 */
+  titlePending?: boolean;
+  /** 建档时间（首条用户提问时间，ISO） */
+  createdAt: string;
+  /** 最近一条消息时间（ISO）；列表按此倒序排列 */
+  updatedAt: string;
+  messages: ChatMessage[];
 }
 
-export interface GraphEdge {
-  source: string;
-  target: string;
-  type: 'cites' | 'author' | 'related';
-}
-
-export interface GraphResponse {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
+/** 一次回答中 AI 对某张导图的事务编辑记录（用于「撤销本次 AI 修改 / 保留」） */
+export interface ChatMindmapEdit {
+  mapId: string;
+  transactionId: string;
+  /** 收到最后一个 diff 后的导图版本（撤销成功前用于状态展示） */
+  version: number;
+  /** 编辑发生时的作用域（null=全局库；撤销请求必须带同一作用域） */
+  workspaceId?: string | null;
+  /** 用户已在本消息上撤销该事务 */
+  undone?: boolean;
+  /** 用户选择保留（关闭提示条），不再展示撤销入口 */
+  kept?: boolean;
 }
 
 export interface Note {
@@ -352,4 +371,128 @@ export interface WorkspaceFile {
   kind: 'pdf' | 'latex' | 'text' | 'other';
   /** PDF 文件映射的本地文献 id（local:<ws_id>:<path>），供阅读/上下文/问答复用 */
   paper_id: string | null;
+}
+
+// ---------- 思维导图（mindmap） ----------
+// 自定义 JSON 文档为唯一真源，mermaid mindmap 文本为互换格式；
+// 字段与后端 backend/services/mindmap_doc.py 逐字段对齐。
+/** 节点类型：普通主题 / 论文引用（paper 节点必须带合法 paperId） */
+export type MindmapNodeKind = 'topic' | 'paper';
+
+/** 思维导图节点（GUI 与 AI 共用的最小结构单元，v1 限定单根树、无交叉边） */
+export interface MindmapNode {
+  /** 稳定 ID（n_<8hex>），一律由服务端生成；add_node 传入的 id 仅为批内临时 ID */
+  id: string;
+  /** 父节点 ID；全图唯一根为 null */
+  parentId: string | null;
+  /** 同级位置（同父下唯一非负；每批动作提交后服务端规范化为 0..n-1） */
+  order: number;
+  text: string;
+  kind: MindmapNodeKind;
+  /** kind=paper 时必填且形如 source:external_id；topic 时必须为 null */
+  paperId: string | null;
+  /** 几何坐标：mermaid 不表达几何；手动拖拽写回，未布局节点为 0 由前端布局引擎补位 */
+  x: number;
+  y: number;
+  /** 折叠分支：为 true 时画布隐藏其子树 */
+  collapsed?: boolean;
+}
+
+/** 导图文档（mindmaps.doc 列存储的 JSON） */
+export interface MindmapDoc {
+  nodes: MindmapNode[];
+}
+
+/** 导图元信息（列表项，不含 nodes） */
+export interface MindmapMeta {
+  id: string;
+  /** 作用域：''=全局；'ws:<工作区id>'=工作区。由后端归一化，前端只透传 workspace_id */
+  scope: string;
+  title: string;
+  version: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** 导图完整文档（后端 _serialize 将 doc.nodes 展开到顶层，避免双重嵌套） */
+export interface MindmapInfo extends MindmapMeta {
+  nodes: MindmapNode[];
+}
+
+/** 删除节点策略：promote=直系孩子上提（默认）；delete_branch=整支删除 */
+export type MindmapDeleteStrategy = 'promote' | 'delete_branch';
+
+/**
+ * 结构化编辑动作（POST /mindmaps/<id>/actions 的 actions[] 元素）。
+ * 一批动作顺序应用到服务端深拷贝上，任一非法即整批拒绝（无半截写入）。
+ * 临时 ID：add_node 可带 id（批内引用用），正式 ID 经响应 idMap 回填。
+ */
+export type MindmapAction =
+  | {
+      op: 'add_node';
+      /** 客户端临时 ID（可选）；同批后续动作可用它引用新节点 */
+      id?: string;
+      /** 父节点 ID；null 仅在图为空、添加唯一根时合法 */
+      parentId: string | null;
+      text?: string;
+      kind?: MindmapNodeKind;
+      paperId?: string | null;
+      x?: number;
+      y?: number;
+      /** 缺省追加到同父末尾 */
+      order?: number;
+    }
+  | {
+      op: 'update_node';
+      id: string;
+      text?: string;
+      kind?: MindmapNodeKind;
+      paperId?: string | null;
+      x?: number;
+      y?: number;
+      collapsed?: boolean;
+    }
+  | { op: 'move_node'; id: string; newParentId: string; newOrder?: number }
+  | { op: 'delete_node'; id: string; strategy?: MindmapDeleteStrategy }
+  | { op: 'set_collapsed'; id: string; collapsed: boolean }
+  | { op: 'attach_paper'; id: string; paperId: string };
+
+/** POST /actions 成功响应 */
+export interface MindmapActionsResult {
+  mindmap: MindmapInfo;
+  /** 客户端临时 ID → 服务端正式 ID 映射 */
+  idMap: Record<string, string>;
+}
+
+/** POST /undo-ai 的字段级逆向统计（后端 mindmap_undo.revert_transaction） */
+export interface MindmapUndoStats {
+  /** 事务新增、当前仍存活而被移除的节点数 */
+  removed: number;
+  /** 事务删除而被重建的节点数 */
+  restored: number;
+  /** 恢复的字段数（current 仍等于事务末值才恢复） */
+  fields_restored: number;
+  /** 因用户后续修改而跳过的字段数 */
+  fields_skipped: number;
+}
+
+/** POST /undo-ai 响应 */
+export interface MindmapUndoResult {
+  mindmap: MindmapInfo;
+  stats: MindmapUndoStats;
+  transactionId: string;
+}
+
+/**
+ * SSE mindmap_diff 事件（RAG 流中 AI 编辑导图的实时推送，Task 11 接入）。
+ * 前端收到后与本地编辑走同一动作应用函数，实现画布无刷新增量更新。
+ */
+export interface MindmapDiffEvent {
+  mapId: string;
+  /** AI 提交后的服务端新版本号 */
+  version: number;
+  actions: MindmapAction[];
+  idMap: Record<string, string>;
+  /** 同一次问答共享一个 transactionId，是整事务撤销的单位 */
+  transactionId: string;
 }

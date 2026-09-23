@@ -14,6 +14,7 @@ import pdf from './pdf';
 import store from './store';
 import api from './api';
 import writing from './writing';
+import mindmap from './mindmap';
 
 /** 中文资源：命名空间与 src 下的功能域一一对应，便于按文件维护 */
 const zh = {
@@ -33,6 +34,7 @@ const zh = {
   store,
   api,
   writing,
+  mindmap,
 };
 
 export default zh;

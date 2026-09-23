@@ -1,6 +1,15 @@
 import { create } from 'zustand';
-import { Paper, ChatMessage, Note, Highlight, AISuggestion, ContextItem, DataBlock, ReaderTab, WorkspaceInfo, SettingsSnapshot } from '../types';
-import { loadState, saveState, listContextItems, listWorkspaces, readLatexFile, saveLatexFile, getSettings } from '../api';
+import { Paper, ChatMessage, ChatConversation, Note, Highlight, AISuggestion, ContextItem, DataBlock, ReaderTab, WorkspaceInfo, SettingsSnapshot, MindmapMeta, MindmapInfo } from '../types';
+import {
+  loadState, saveState, listContextItems, listWorkspaces, readLatexFile, saveLatexFile, getSettings,
+  generateChatTitle,
+  listMindmaps as listMindmapsApi,
+  createMindmap as createMindmapApi,
+  importMindmap as importMindmapApi,
+  getMindmap as getMindmapApi,
+  renameMindmap as renameMindmapApi,
+  deleteMindmapApi,
+} from '../api';
 import i18n from '../i18n';
 
 /** 创作模块（原 Workspace / LaTeX 写作）是否对用户开放。
@@ -33,6 +42,87 @@ const INITIAL_SEARCH_FILTERS: SearchFilters = {
   source: 'all',
 };
 
+// ---------- 问答会话（归档/重开/标题） ----------
+/** 占位标题最大长度（超出截断加省略号）；AI 生成标题由后端限长 */
+const CONV_PLACEHOLDER_MAX = 24;
+
+// ---------- AI 面板宽度 ----------
+/** AI 面板默认宽度（旧版默认 380；升级时把仍是旧默认值的快照迁移到新默认） */
+const QA_PANEL_DEFAULT_WIDTH = 420;
+const QA_PANEL_MIN_WIDTH = 300;
+const QA_PANEL_MAX_WIDTH = 640;
+/** 旧版默认宽度：快照中恰好等于该值视为"从未手动拖拽"，迁移到新默认 */
+const QA_PANEL_LEGACY_DEFAULT_WIDTH = 380;
+/**
+ * 收敛宽度到合法区间。
+ * @param migrateLegacyDefault 仅快照恢复时传 true：恰好等于旧默认 380 视为
+ *        "从未手动拖拽"，迁移到新默认；拖拽 setter 不走迁移（允许精确停在 380）
+ */
+function clampQaPanelWidth(width: unknown, migrateLegacyDefault = false): number {
+  if (typeof width !== 'number' || !Number.isFinite(width) || width <= 0) {
+    return QA_PANEL_DEFAULT_WIDTH;
+  }
+  if (migrateLegacyDefault && width === QA_PANEL_LEGACY_DEFAULT_WIDTH) {
+    return QA_PANEL_DEFAULT_WIDTH;
+  }
+  return Math.max(QA_PANEL_MIN_WIDTH, Math.min(QA_PANEL_MAX_WIDTH, Math.round(width)));
+}
+
+/** 首条用户提问的本地占位标题（AI 标题返回前即时可见；失败时永久保留） */
+function conversationPlaceholderTitle(firstQuestion: string): string {
+  const q = firstQuestion.replace(/\s+/g, ' ').trim();
+  return q.length > CONV_PLACEHOLDER_MAX ? `${q.slice(0, CONV_PLACEHOLDER_MAX)}…` : q;
+}
+
+/** 归一化持久化的聊天消息：过期实时态（toolCall/streaming）在重新加载时一律剥离 */
+function normalizeChatMessages(raw: unknown): ChatMessage[] {
+  if (!Array.isArray(raw)) return [];
+  return (raw as ChatMessage[]).map((m) => {
+    const { toolCall: _toolCall, ...rest } = m;
+    return {
+      ...rest,
+      streaming: false,
+      toolLog: Array.isArray(m.toolLog) ? m.toolLog : undefined,
+    } as ChatMessage;
+  });
+}
+
+/** 归一化会话列表（旧快照/损坏条目容错）；不做消息迁移，迁移在 applyWsState */
+function normalizeConversations(raw: unknown): ChatConversation[] {
+  if (!Array.isArray(raw)) return [];
+  const untitled = i18n.language?.startsWith('zh') ? '未命名会话' : 'Untitled chat';
+  return (raw as Array<Record<string, unknown>>)
+    .filter((c) => c && typeof c === 'object' && Array.isArray(c.messages))
+    .map((c) => {
+      const messages = normalizeChatMessages(c.messages);
+      const createdAt = typeof c.createdAt === 'string' ? c.createdAt : '';
+      const updatedAt = typeof c.updatedAt === 'string'
+        ? c.updatedAt
+        : (messages[messages.length - 1]?.timestamp ?? createdAt);
+      return {
+        id: typeof c.id === 'string' && c.id ? c.id : `c_${createdAt || Date.now()}`,
+        title: typeof c.title === 'string' && c.title.trim() ? c.title : untitled,
+        titlePending: c.titlePending === true,
+        createdAt: createdAt || updatedAt || new Date(0).toISOString(),
+        updatedAt: updatedAt || createdAt || new Date(0).toISOString(),
+        messages,
+      } satisfies ChatConversation;
+    });
+}
+
+/** 异步请求 AI 标题并回写；任何失败（未配置 Key/网络/内容异常）都保留占位标题 */
+function requestConversationTitle(conversationId: string, firstQuestion: string): void {
+  void (async () => {
+    try {
+      const title = (await generateChatTitle(firstQuestion)).replace(/\s+/g, ' ').trim();
+      usePaperMindStore.getState().setConversationTitle(conversationId, title || undefined);
+    } catch (err) {
+      console.warn('AI 会话标题生成失败，保留首问占位标题:', err);
+      usePaperMindStore.getState().setConversationTitle(conversationId, undefined);
+    }
+  })();
+}
+
 interface PaperMindStore {
   selectedPaper: Paper | null;
   setSelectedPaper: (paper: Paper | null) => void;
@@ -51,10 +141,22 @@ interface PaperMindStore {
   latexContent: string;
   setLatexContent: (content: string) => void;
   
+  /** 当前视图中的聊天消息（活跃会话的消息视图；重开会话时整体替换） */
   chatMessages: ChatMessage[];
   addChatMessage: (message: ChatMessage) => void;
   updateChatMessage: (id: string, updates: Partial<ChatMessage>) => void;
-  clearChatMessages: () => void;
+  /** 已归档的历史会话列表（持久化，按 updatedAt 倒序展示） */
+  chatConversations: ChatConversation[];
+  /** 当前活跃会话 id；null = 尚未建档的新对话草稿 */
+  activeConversationId: string | null;
+  /** 归档当前会话并开始新对话（当前草稿若已随首问建档，自然留在历史列表） */
+  newChat: () => void;
+  /** 重新打开某历史会话：其消息载入当前视图，可继续追问（追加进同一会话） */
+  openConversation: (id: string) => void;
+  /** 永久删除某历史会话（删除活跃会话时同时回到新对话草稿） */
+  deleteConversation: (id: string) => void;
+  /** 回写 AI 生成标题；title 为空/undefined 时仅结束 pending、保留占位标题 */
+  setConversationTitle: (id: string, title?: string) => void;
   
   notes: Note[];
   addNote: (note: Note) => void;
@@ -65,8 +167,8 @@ interface PaperMindStore {
   addHighlight: (highlight: Highlight) => void;
   removeHighlight: (id: string) => void;
   
-  currentView: 'home' | 'workspace' | 'research' | 'explore' | 'settings';
-  setCurrentView: (view: 'home' | 'workspace' | 'research' | 'explore' | 'settings') => void;
+  currentView: 'home' | 'workspace' | 'research' | 'explore' | 'mindmaps' | 'settings';
+  setCurrentView: (view: 'home' | 'workspace' | 'research' | 'explore' | 'mindmaps' | 'settings') => void;
 
   /** 全局 AI 助手面板是否展开 */
   qaPanelOpen: boolean;
@@ -74,6 +176,9 @@ interface PaperMindStore {
   /** 全局 AI 助手面板宽度（可拖拽调整，持久化） */
   qaPanelWidth: number;
   setQaPanelWidth: (width: number) => void;
+  /** AI 面板宽度分隔条是否正在拖拽中（运行时标志，不持久化；阅读器据此延迟重排） */
+  qaPanelResizing: boolean;
+  setQaPanelResizing: (resizing: boolean) => void;
   /** Explore 左栏（搜索）宽度（可拖拽调整，持久化） */
   exploreSearchWidth: number;
   setExploreSearchWidth: (width: number) => void;
@@ -155,6 +260,34 @@ interface PaperMindStore {
   /** 把当前 latexContent 保存到活跃工作区的 main.tex */
   saveLatexToWorkspace: () => Promise<void>;
 
+  // ---------- 思维导图（多导图，按作用域隔离，服务端为真源） ----------
+  /** 各作用域导图列表缓存：key=工作区 id（''=全局）；进入页面时 refreshMindmaps 拉取 */
+  mindmapsByScope: Record<string, MindmapMeta[]>;
+  /** 已打开导图的完整文档缓存：mapId → 文档（含 version/nodes，乐观编辑与 409 对账用） */
+  mindmapDocs: Record<string, MindmapInfo>;
+  /** 工作区内当前选中的导图 id（随工作区快照独立持久化，切工作区互不串） */
+  activeWsMindmapId: string | null;
+  /** 全局作用域当前选中的导图 id（随全局快照持久化） */
+  activeGlobalMindmapId: string | null;
+  /** 取某作用域当前选中导图 id；workspaceId=undefined 时按当前活跃工作区/全局解析 */
+  getActiveMindmapId: (workspaceId?: string | null) => string | null;
+  /** 设置某作用域当前选中导图（workspaceId=null 表示全局；mapId=null 取消选中） */
+  setActiveMindmapId: (workspaceId: string | null, mapId: string | null) => void;
+  /** 拉取某作用域导图列表（默认当前作用域）；选中导图已不在列表时清空选中 */
+  refreshMindmaps: (workspaceId?: string | null) => Promise<MindmapMeta[]>;
+  /** 新建空白导图（仅根节点）并选中；workspaceId=undefined 取当前活跃工作区 */
+  createMindmap: (input: { title?: string; rootText?: string; workspaceId?: string | null }) => Promise<MindmapInfo>;
+  /** 从 mermaid mindmap 文本导入导图并选中 */
+  importMindmap: (input: { mermaid: string; title?: string; workspaceId?: string | null }) => Promise<MindmapInfo>;
+  /** 读取导图完整文档（命中缓存不重复请求；force=true 强制拉服务端版本对账） */
+  loadMindmapDoc: (mapId: string, workspaceId?: string | null, force?: boolean) => Promise<MindmapInfo>;
+  /** 写入/更新文档缓存，并同步列表元信息（version/title/updated_at）；画布提交/AI diff 后统一入口 */
+  cacheMindmapDoc: (info: MindmapInfo) => void;
+  /** 重命名导图（作用域自动解析：文档缓存 → 列表缓存 → 当前作用域） */
+  renameMindmap: (mapId: string, title: string) => Promise<MindmapInfo>;
+  /** 删除导图：清文档缓存、从列表移除；若当前选中它则清空选中 */
+  deleteMindmap: (mapId: string) => Promise<void>;
+
   /** 启动时从后端快照恢复全部工作状态 */
   hydrate: () => Promise<void>;
 }
@@ -197,14 +330,54 @@ function normalizePaper(paper: Partial<Paper> | null | undefined): Paper | null 
   return paper as Paper;
 }
 
-type ViewType = 'home' | 'workspace' | 'research' | 'explore' | 'settings';
+// ---------- 思维导图作用域辅助 ----------
+/**
+ * 前端导图作用域 key：工作区 id 原样使用；null/undefined → ''（全局）。
+ * 注意区别于 MindmapMeta.scope 的后端形态（'' / 'ws:<id>'）。
+ */
+export function mindmapScopeKey(workspaceId?: string | null): string {
+  return workspaceId ? workspaceId : '';
+}
+
+/** 后端 scope 形态 → workspaceId（'' 或无法识别时为 null=全局）。 */
+function mindmapScopeToWs(scope: string): string | null {
+  return typeof scope === 'string' && scope.startsWith('ws:') ? scope.slice(3) : null;
+}
+
+/** 完整文档 → 列表元信息（去 nodes）。 */
+function toMindmapMeta(info: MindmapInfo): MindmapMeta {
+  const meta: MindmapMeta = {
+    id: info.id,
+    scope: info.scope,
+    title: info.title,
+    version: info.version,
+    created_at: info.created_at,
+    updated_at: info.updated_at,
+  };
+  return meta;
+}
+
+/**
+ * 解析导图所属工作区（重命名/删除等只拿到 mapId 的场景）：
+ * 文档缓存（携带后端 scope）最可靠 → 列表缓存 → 兜底当前活跃工作区。
+ */
+function resolveMindmapWs(state: PaperMindStore, mapId: string): string | null {
+  const doc = state.mindmapDocs[mapId];
+  if (doc) return mindmapScopeToWs(doc.scope);
+  for (const [key, items] of Object.entries(state.mindmapsByScope)) {
+    if (items.some((m) => m.id === mapId)) return key === '' ? null : key;
+  }
+  return state.activeWorkspaceId;
+}
+
+type ViewType = 'home' | 'workspace' | 'research' | 'explore' | 'mindmaps' | 'settings';
 
 /** 视图归一化：旧快照可能存有 'search'（独立搜索页已并入 Explore），回退到 explore。 */
 function normalizeView(view: unknown): ViewType {
   if (view === 'search') return 'explore';
   // 创作模块下线期间，历史快照中的 'workspace' 一律回落到主页，避免恢复出不可用页面
   if (view === 'workspace') return WRITING_ENABLED ? 'workspace' : 'home';
-  if (view === 'home' || view === 'research' || view === 'explore' || view === 'settings') return view;
+  if (view === 'home' || view === 'research' || view === 'explore' || view === 'mindmaps' || view === 'settings') return view;
   // 未知视图统一回落主页：不再默认进入创作页
   return 'home';
 }
@@ -217,6 +390,8 @@ const WS_STATE_KEYS: (keyof PaperMindStore)[] = [
   'selectedPaper',
   'latexContent',
   'chatMessages',
+  'chatConversations',
+  'activeConversationId',
   'notes',
   'highlights',
   'qaPanelOpen',
@@ -236,6 +411,8 @@ const WS_STATE_KEYS: (keyof PaperMindStore)[] = [
   'dataBlocks',
   'readerTabs',
   'activeTabId',
+  // 思维导图：每个工作区记住各自最后选中的导图（列表/文档缓存不进快照，服务端为真源）
+  'activeWsMindmapId',
 ];
 
 /** 从当前 store 提取工作区专属字段快照。 */
@@ -250,21 +427,41 @@ function pickWsState(current: PaperMindStore): Record<string, unknown> {
  * 与旧 hydrate 的字段处理逻辑一致，供 hydrate / switchWorkspace 复用。
  */
 function applyWsState(state: Record<string, unknown>): Partial<PaperMindStore> {
+  // 旧快照迁移：没有会话列表、但存在含用户提问的裸 chatMessages（新版本前
+  // 的唯一聊天记录）→ 包成一个历史会话，避免升级后旧对话失去归档入口
+  const migratedMessages = normalizeChatMessages(state.chatMessages);
+  let chatConversations = normalizeConversations(state.chatConversations);
+  if (chatConversations.length === 0 && migratedMessages.some((m) => m.role === 'user')) {
+    const first = migratedMessages.find((m) => m.role === 'user') as ChatMessage;
+    const last = migratedMessages[migratedMessages.length - 1];
+    chatConversations = [{
+      id: `c_migrated_${first.id}`,
+      title: conversationPlaceholderTitle(first.content),
+      titlePending: false,
+      createdAt: first.timestamp,
+      updatedAt: last.timestamp,
+      messages: migratedMessages,
+    }];
+  }
+  const rawActiveId = state.activeConversationId;
+  const activeConversationId = typeof rawActiveId === 'string'
+    && chatConversations.some((c) => c.id === rawActiveId)
+    ? rawActiveId
+    : (chatConversations.length > 0 && migratedMessages.length > 0
+        // 迁移场景：载入被包成会话的旧对话时直接呈现它
+        && state.chatConversations === undefined
+        ? chatConversations[0].id
+        : null);
   return {
     selectedPaper: normalizePaper(state.selectedPaper as Partial<Paper> | null | undefined),
     latexContent: typeof state.latexContent === 'string' ? state.latexContent : INITIAL_LATEX,
-    chatMessages: Array.isArray(state.chatMessages)
-      ? (state.chatMessages as ChatMessage[]).map((m) => {
-          // toolCall 是生成中的实时状态，重启后会话已过期，仅保留持久化记录 toolLog
-          const { toolCall: _toolCall, ...rest } = m;
-          return { ...rest, toolLog: Array.isArray(m.toolLog) ? m.toolLog : undefined } as ChatMessage;
-        })
-      : [],
+    chatMessages: migratedMessages,
+    chatConversations,
+    activeConversationId,
     notes: Array.isArray(state.notes) ? state.notes as Note[] : [],
     highlights: Array.isArray(state.highlights) ? state.highlights as Highlight[] : [],
     qaPanelOpen: state.qaPanelOpen !== false,
-    qaPanelWidth: typeof state.qaPanelWidth === 'number' && state.qaPanelWidth > 0
-      ? state.qaPanelWidth : 380,
+    qaPanelWidth: clampQaPanelWidth(state.qaPanelWidth, true),
     exploreSearchWidth: typeof state.exploreSearchWidth === 'number' && state.exploreSearchWidth > 0
       ? state.exploreSearchWidth : 360,
     exploreSearchCollapsed: state.exploreSearchCollapsed === true,
@@ -296,10 +493,12 @@ function applyWsState(state: Record<string, unknown>): Partial<PaperMindStore> {
       && Array.isArray(state.readerTabs) && (state.readerTabs as ReaderTab[]).some(t => t.paperId === state.activeTabId)
       ? state.activeTabId
       : null,
+    // 导图选中项：快照缺失/损坏时为 null（图库页据此呈现空状态）
+    activeWsMindmapId: typeof state.activeWsMindmapId === 'string' ? state.activeWsMindmapId : null,
   };
 }
 
-export const usePaperMindStore = create<PaperMindStore>((set) => ({
+export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
   selectedPaper: null,
   setSelectedPaper: (paper) => set({ selectedPaper: paper }),
 
@@ -334,11 +533,78 @@ export const usePaperMindStore = create<PaperMindStore>((set) => ({
   setLatexContent: (content) => set({ latexContent: content }),
   
   chatMessages: [],
-  addChatMessage: (message) => set((state) => ({ chatMessages: [...state.chatMessages, message] })),
-  updateChatMessage: (id, updates) => set((state) => ({
-    chatMessages: state.chatMessages.map((m) => (m.id === id ? { ...m, ...updates } : m)),
+  chatConversations: [],
+  activeConversationId: null,
+  addChatMessage: (message) => set((state) => {
+    const chatMessages = [...state.chatMessages, message];
+    let { chatConversations, activeConversationId } = state;
+
+    // 草稿的首条用户提问 → 建档：占位标题即时可见，AI 标题异步替换
+    if (message.role === 'user' && !activeConversationId) {
+      const id = `c${Date.now()}`;
+      const nowIso = message.timestamp || new Date().toISOString();
+      chatConversations = [{
+        id,
+        title: conversationPlaceholderTitle(message.content),
+        titlePending: true,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        messages: chatMessages,
+      }, ...chatConversations];
+      activeConversationId = id;
+      requestConversationTitle(id, message.content);
+    } else if (activeConversationId) {
+      // 已建档：消息快照随流式更新同步（列表随时可切换/重开，不丢进行中的内容）
+      chatConversations = chatConversations.map((c) => (
+        c.id === activeConversationId
+          ? { ...c, messages: chatMessages, updatedAt: message.timestamp || c.updatedAt }
+          : c
+      ));
+    }
+    return { chatMessages, chatConversations, activeConversationId };
+  }),
+  updateChatMessage: (id, updates) => set((state) => {
+    const chatMessages = state.chatMessages.map((m) => (m.id === id ? { ...m, ...updates } : m));
+    const chatConversations = state.activeConversationId
+      ? state.chatConversations.map((c) => (
+          c.id === state.activeConversationId
+            ? { ...c, messages: chatMessages, updatedAt: new Date().toISOString() }
+            : c
+        ))
+      : state.chatConversations;
+    return { chatMessages, chatConversations };
+  }),
+  newChat: () => set({ chatMessages: [], activeConversationId: null }),
+  openConversation: (id) => {
+    const conv = get().chatConversations.find((c) => c.id === id);
+    if (!conv) return;
+    // 重新加载持久化消息时剥离过期实时态（toolCall / streaming 光标）
+    const messages = conv.messages.map((m) => {
+      const { toolCall: _toolCall, ...rest } = m;
+      return { ...rest, streaming: false } as ChatMessage;
+    });
+    set({
+      chatMessages: messages,
+      activeConversationId: id,
+      chatConversations: get().chatConversations.map((c) => (
+        c.id === id ? { ...c, messages } : c
+      )),
+    });
+  },
+  deleteConversation: (id) => set((state) => {
+    const chatConversations = state.chatConversations.filter((c) => c.id !== id);
+    if (state.activeConversationId === id) {
+      return { chatConversations, chatMessages: [], activeConversationId: null };
+    }
+    return { chatConversations };
+  }),
+  setConversationTitle: (id, title) => set((state) => ({
+    chatConversations: state.chatConversations.map((c) => (
+      c.id === id
+        ? { ...c, title: title?.trim() || c.title, titlePending: false }
+        : c
+    )),
   })),
-  clearChatMessages: () => set({ chatMessages: [] }),
   
   notes: [],
   addNote: (note) => set((state) => ({ notes: [...state.notes, note] })),
@@ -356,8 +622,10 @@ export const usePaperMindStore = create<PaperMindStore>((set) => ({
 
   qaPanelOpen: true,
   setQaPanelOpen: (open) => set({ qaPanelOpen: open }),
-  qaPanelWidth: 380,
-  setQaPanelWidth: (width) => set({ qaPanelWidth: Math.max(300, Math.min(640, Math.round(width))) }),
+  qaPanelWidth: QA_PANEL_DEFAULT_WIDTH,
+  setQaPanelWidth: (width) => set({ qaPanelWidth: clampQaPanelWidth(width) }),
+  qaPanelResizing: false,
+  setQaPanelResizing: (resizing) => set({ qaPanelResizing: resizing }),
   exploreSearchWidth: 360,
   setExploreSearchWidth: (width) => set({ exploreSearchWidth: Math.max(240, Math.min(560, Math.round(width))) }),
   exploreSearchCollapsed: false,
@@ -631,6 +899,123 @@ export const usePaperMindStore = create<PaperMindStore>((set) => ({
     }
   },
 
+  // ---------- 思维导图 ----------
+  mindmapsByScope: {},
+  mindmapDocs: {},
+  activeWsMindmapId: null,
+  activeGlobalMindmapId: null,
+  getActiveMindmapId: (workspaceId) => {
+    // undefined=按当前活跃工作区解析；显式 null=强制全局；显式 id=该工作区
+    const ws = workspaceId === undefined ? get().activeWorkspaceId : workspaceId;
+    return ws ? get().activeWsMindmapId : get().activeGlobalMindmapId;
+  },
+  setActiveMindmapId: (workspaceId, mapId) => set(
+    workspaceId ? { activeWsMindmapId: mapId } : { activeGlobalMindmapId: mapId }
+  ),
+  refreshMindmaps: async (workspaceId) => {
+    const ws = workspaceId === undefined ? get().activeWorkspaceId : workspaceId;
+    const key = mindmapScopeKey(ws);
+    const items = await listMindmapsApi(ws ?? undefined);
+    set((state) => {
+      const activeId = ws ? state.activeWsMindmapId : state.activeGlobalMindmapId;
+      const patch: Partial<PaperMindStore> = {
+        mindmapsByScope: { ...state.mindmapsByScope, [key]: items },
+      };
+      // 选中导图已被删除/易主：清空选中，避免编辑器对着不存在的地图发请求
+      if (activeId && !items.some((m) => m.id === activeId)) {
+        if (ws) patch.activeWsMindmapId = null;
+        else patch.activeGlobalMindmapId = null;
+      }
+      return patch;
+    });
+    return items;
+  },
+  createMindmap: async (input) => {
+    const ws = input.workspaceId === undefined ? get().activeWorkspaceId : input.workspaceId;
+    const info = await createMindmapApi({
+      title: input.title,
+      rootText: input.rootText,
+      workspaceId: ws,
+    });
+    const key = mindmapScopeKey(ws);
+    set((state) => ({
+      mindmapsByScope: {
+        ...state.mindmapsByScope,
+        [key]: [toMindmapMeta(info), ...(state.mindmapsByScope[key] ?? [])],
+      },
+      mindmapDocs: { ...state.mindmapDocs, [info.id]: info },
+      ...(ws ? { activeWsMindmapId: info.id } : { activeGlobalMindmapId: info.id }),
+    }));
+    return info;
+  },
+  importMindmap: async (input) => {
+    const ws = input.workspaceId === undefined ? get().activeWorkspaceId : input.workspaceId;
+    const info = await importMindmapApi({
+      mermaid: input.mermaid,
+      title: input.title,
+      workspaceId: ws,
+    });
+    const key = mindmapScopeKey(ws);
+    set((state) => ({
+      mindmapsByScope: {
+        ...state.mindmapsByScope,
+        [key]: [toMindmapMeta(info), ...(state.mindmapsByScope[key] ?? [])],
+      },
+      mindmapDocs: { ...state.mindmapDocs, [info.id]: info },
+      ...(ws ? { activeWsMindmapId: info.id } : { activeGlobalMindmapId: info.id }),
+    }));
+    return info;
+  },
+  loadMindmapDoc: async (mapId, workspaceId, force = false) => {
+    const cached = get().mindmapDocs[mapId];
+    if (cached && !force) return cached;
+    const ws = workspaceId === undefined ? get().activeWorkspaceId : workspaceId;
+    const info = await getMindmapApi(mapId, ws ?? undefined);
+    get().cacheMindmapDoc(info);
+    return info;
+  },
+  cacheMindmapDoc: (info) => set((state) => {
+    const key = mindmapScopeKey(mindmapScopeToWs(info.scope));
+    const byScope = { ...state.mindmapsByScope };
+    const list = byScope[key];
+    if (Array.isArray(list)) {
+      const meta = toMindmapMeta(info);
+      byScope[key] = list.some((m) => m.id === info.id)
+        ? list.map((m) => (m.id === info.id ? meta : m))
+        : [meta, ...list];
+    }
+    return {
+      mindmapDocs: { ...state.mindmapDocs, [info.id]: info },
+      mindmapsByScope: byScope,
+    };
+  }),
+  renameMindmap: async (mapId, title) => {
+    const ws = resolveMindmapWs(get(), mapId);
+    const info = await renameMindmapApi(mapId, title, ws ?? undefined);
+    get().cacheMindmapDoc(info);
+    return info;
+  },
+  deleteMindmap: async (mapId) => {
+    const ws = resolveMindmapWs(get(), mapId);
+    await deleteMindmapApi(mapId, ws ?? undefined);
+    const key = mindmapScopeKey(ws);
+    set((state) => {
+      const docs = { ...state.mindmapDocs };
+      delete docs[mapId];
+      const patch: Partial<PaperMindStore> = { mindmapDocs: docs };
+      const list = state.mindmapsByScope[key];
+      if (Array.isArray(list)) {
+        patch.mindmapsByScope = {
+          ...state.mindmapsByScope,
+          [key]: list.filter((m) => m.id !== mapId),
+        };
+      }
+      if (ws && state.activeWsMindmapId === mapId) patch.activeWsMindmapId = null;
+      if (!ws && state.activeGlobalMindmapId === mapId) patch.activeGlobalMindmapId = null;
+      return patch;
+    });
+  },
+
   hydrate: async () => {
     try {
       // 1. 全局状态：哪个工作区活跃 + 当前视图（跨工作区共享）
@@ -652,8 +1037,13 @@ export const usePaperMindStore = create<PaperMindStore>((set) => ({
       const restoredView = normalizeView(globalState.currentView);
       set({
         activeWorkspaceId,
-        // 无活跃工作区时统一回到主页引导；「设置」是全局页，不依赖工作区，允许停留
-        currentView: !activeWorkspaceId && restoredView !== 'settings' ? 'home' : restoredView,
+        // 无活跃工作区时统一回到主页引导；「设置」与「导图」（全局作用域）不依赖工作区，允许停留
+        currentView: !activeWorkspaceId && restoredView !== 'settings' && restoredView !== 'mindmaps'
+          ? 'home'
+          : restoredView,
+        // 全局作用域导图选中项（跨重启恢复；工作区内的选中项在 applyWsState 中恢复）
+        activeGlobalMindmapId: typeof globalState.activeGlobalMindmapId === 'string'
+          ? globalState.activeGlobalMindmapId : null,
         ...applyWsState(wsState),
       });
       // 3. context 库以后端 /context 为准（按当前工作区过滤，避免与快照脱节）
@@ -695,7 +1085,7 @@ export const usePaperMindStore = create<PaperMindStore>((set) => ({
 // 快照按归属拆分：
 //   - 全局字段（activeWorkspaceId / currentView）→ 存 'default' 项目；
 //   - 工作区专属字段 → 存 'ws:<id>' 项目（各工作区页面状态互相隔离）。
-const GLOBAL_STATE_KEYS: (keyof PaperMindStore)[] = ['activeWorkspaceId', 'currentView'];
+const GLOBAL_STATE_KEYS: (keyof PaperMindStore)[] = ['activeWorkspaceId', 'currentView', 'activeGlobalMindmapId'];
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 let hydrationDone = false;

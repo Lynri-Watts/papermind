@@ -1,8 +1,8 @@
 /** Assistant message rendering (AssistantMessage) copy */
 export default {
-  /** Tooltip for the inline [Source N] badge */
+  /** Tooltip for the inline [Source N] jump button */
   inlineSource: {
-    title: 'View source [{{n}}]',
+    locate: 'Locate source [{{n}}] in the paper',
   },
   /** ReAct / AI reasoning trail */
   trail: {
@@ -21,14 +21,20 @@ export default {
   stream: {
     processing: 'Working…',
   },
-  /** Sources section */
+  /** Inline mid-sentence citation marker (numberless citation card) */
+  citation: {
+    /** Source not yet bound while streaming */
+    verifying: 'Verifying source…',
+    /** Failed card: the sentence cannot be found in the materials */
+    failedTitle: 'Citation not verified',
+    failedNote: 'This sentence could not be found verbatim in the provided materials; its source is unavailable.',
+  },
+  /** Sources section: source name + core quote only; chunk text is not expanded */
   sources: {
     title: 'Sources',
     /** Fallback name for a source entry without a context_id */
     currentPaper: 'Current paper',
-    collapse: 'Click to collapse',
-    expandFull: 'Click to expand the full source',
-    locateInPaper: 'Locate this sentence in the paper',
+    locateInPaper: 'Locate',
     openInReaderTitle: 'Open this paper in the reader and locate the passage',
   },
 } as const;

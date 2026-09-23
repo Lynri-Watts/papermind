@@ -1,73 +1,110 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import ReactMarkdown, { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { BookOpen, Brain, Check, Copy, ExternalLink, Globe, Loader2 } from 'lucide-react';
-import { ChatMessage, ToolPaper } from '../types';
+import { Brain, Check, Copy, Info, Loader2 } from 'lucide-react';
+import { ChatMessage, ChatMindmapEdit, RagSource, ToolPaper } from '../types';
 import ToolStepCard from './ToolStepCard';
+import AiMindmapEditBar from './mindmap/AiMindmapEditBar';
+import CitationMarker from './CitationBlock';
+import {
+  protectCitations,
+  remarkCitationCards,
+  splitInlineCitations,
+  stripInlineCitations,
+  stripLegacySourceTags,
+} from '../utils/inlineCitations';
 
 interface AssistantMessageProps {
   message: ChatMessage;
   streamStage: string | null;
   copiedId: string | null;
   onCopy: (id: string, content: string) => void;
-  /** 点击 [Source N] 或出处条目时回调，请求打开对应论文并定位原文 */
-  onOpenSource?: (sourceIndex: number) => void;
+  /** 点击引用卡「定位原文」：sourceIndex 对应 RagSource.index，quote 为卡片原句 */
+  onOpenSource?: (sourceIndex: number, quote?: string) => void;
   // ---- ReAct 步骤中返回的论文操作 ----
   /** 把工具返回的某篇论文加入上下文库 */
   onAddToContext?: (paper: ToolPaper) => void;
   /** 在阅读器中打开工具返回的某篇论文 */
   onOpenPaper?: (paper: ToolPaper) => void;
+  /** 撤销/保留本次回答对某张导图的 AI 编辑 */
+  onMindmapEditChange?: (messageId: string, mapId: string, patch: Partial<ChatMindmapEdit>) => void;
 }
 
-/** 识别 markdown 文本中的 [Source N] 引用标签（AI 约定格式） */
-const SOURCE_TAG_RE = /\[Source\s*(\d+)\]/gi;
-
-/** 把一段纯文本中的 [Source N] 渲染为可点击的引用徽标（与出处区域联动） */
-function InlineSourceTags({ text, onTag }: { text: string; onTag: (n: number) => void }) {
-  const { t } = useTranslation('assistant');
-  const parts = text.split(/(\[Source\s*\d+\])/gi);
-  return (
-    <>
-      {parts.map((part, i) => {
-        SOURCE_TAG_RE.lastIndex = 0;
-        const m = SOURCE_TAG_RE.exec(part);
-        if (m) {
-          const n = Number(m[1]);
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={() => onTag(n)}
-              className="mx-0.5 inline-flex items-center rounded bg-primary/20 px-1 py-px text-[11px] font-semibold text-primary align-baseline hover:bg-primary/30 hover:underline transition-colors"
-              title={t('inlineSource.title', { n })}
-            >
-              [{n}]
-            </button>
-          );
-        }
-        return <React.Fragment key={i}>{part}</React.Fragment>;
-      })}
-    </>
-  );
+/** remark 自定义节点 <citecard> 透传来的属性（hast 属性名为全小写） */
+interface CiteCardNodeProps {
+  state: 'pending' | 'bound' | 'failed';
+  sourceindex?: number;
+  quote?: string;
 }
 
 const AssistantMessage: React.FC<AssistantMessageProps> = ({
   message, streamStage, copiedId, onCopy, onOpenSource,
-  onAddToContext, onOpenPaper,
+  onAddToContext, onOpenPaper, onMindmapEditChange,
 }) => {
   const { t } = useTranslation('assistant');
 
-  // 当前展开的出处编号（点击正文 [Source N] 或出处条目联动）
-  const [expandedSource, setExpandedSource] = useState<number | null>(null);
+  /**
+   * 行内分段：把正文按 [Q]...[/Q] / [Q+n]...[/Q] / [Q!]...[/Q] 切成
+   * 「正文段 / 引用段」。流式中以纯文本 + 行内标记渲染（标记可位于句中）；
+   * 完成后整段正文走 markdown 管线（标记经 remark 插件替换为同样的组件）。
+   */
+  const segments = useMemo(
+    () => splitInlineCitations(message.content),
+    [message.content],
+  );
 
-  const toggleSource = (n: number) => {
-    setExpandedSource((cur) => (cur === n ? null : n));
-  };
+  // 序号 -> 出处元数据（sources 事件先于 delta 到达，生成中即可定位/显名）
+  const sourceMap = useMemo(() => {
+    const map = new Map<number, RagSource>();
+    for (const src of message.sourceDetails ?? []) map.set(src.index, src);
+    return map;
+  }, [message.sourceDetails]);
 
-  const markdownComponents = useMemo<Components>(() => ({
-    text: ({ children }) => (
-      <InlineSourceTags text={String(children ?? '')} onTag={toggleSource} />
+  /**
+   * 终态 markdown：先剔除旧版 [Source N]，再把引用块替换为 PUA 占位符
+   * （摘录内的 markdown 敏感字符不会破坏解析），remark 插件在 AST 内
+   * 把占位符替换成 <citecard> 自定义节点 → CitationMarker。
+   */
+  const protectedMd = useMemo(
+    () => protectCitations(stripLegacySourceTags(message.content)),
+    [message.content],
+  );
+  const remarkPlugins = useMemo<
+    NonNullable<React.ComponentProps<typeof ReactMarkdown>['remarkPlugins']>
+  >(
+    // 元组形式 [plugin, options]：unified 以 registry 为参数调用 attacher
+    () => [remarkGfm, [remarkCitationCards, protectedMd.registry]],
+    [protectedMd.registry],
+  );
+
+  const renderMarker = (
+    key: React.Key,
+    cite: { state: 'pending' | 'bound' | 'failed'; sourceIndex?: number; quote: string },
+  ) => (
+    <CitationMarker
+      key={key}
+      state={cite.state}
+      sourceIndex={cite.sourceIndex}
+      quote={cite.quote}
+      source={cite.sourceIndex != null ? sourceMap.get(cite.sourceIndex) : undefined}
+      onLocate={
+        cite.sourceIndex != null
+          ? () => onOpenSource?.(cite.sourceIndex!, cite.quote)
+          : undefined
+      }
+    />
+  );
+
+  const markdownComponents = useMemo(() => ({
+    // 自定义节点：行内引用标记（可出现在句子中间、列表项、表格单元格内）
+    citecard: (props: CiteCardNodeProps) => renderMarker(
+      `cite-${props.state}-${props.sourceindex ?? 'x'}-${props.quote}`,
+      {
+        state: props.state,
+        sourceIndex: typeof props.sourceindex === 'number' ? props.sourceindex : undefined,
+        quote: props.quote ?? '',
+      },
     ),
     p: ({ children }) => <p className="text-sm leading-relaxed my-1.5">{children}</p>,
     h1: ({ children }) => <h1 className="text-lg font-bold text-text mt-3 mb-1.5">{children}</h1>,
@@ -104,7 +141,8 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
     th: ({ children }) => <th className="border border-border px-2 py-1 text-left font-medium">{children}</th>,
     td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
     hr: () => <hr className="my-2 border-border" />,
-  }), []);
+  // citecard 是 remark 插件注入的自定义标签，不在 Components 已知标签联合内
+  }) as Components, [sourceMap, onOpenSource]);
 
   /** ReAct 轨迹统一渲染：生成中实时展开（thinking/running 自动开），结束后折叠为紧凑记录 */
   const renderReactTrail = () => {
@@ -174,6 +212,10 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
     return null;
   };
 
+  const hasBody = segments.some((s) =>
+    s.type === 'cite' || stripLegacySourceTags(s.text).length > 0
+  );
+
   return (
     <div className="flex justify-start">
       <div className="max-w-[85%]">
@@ -181,25 +223,47 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
           {/* ReAct 轨迹：置于正文之前（思考/动作/观察先于最终回答出现） */}
           {renderReactTrail()}
 
-          {/* 流式：先展示中间过程 / 纯文本增量；完成后切换 markdown 结构化渲染 */}
-          {message.streaming ? (
-            message.content ? (
-              <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                {message.content}
-                <span className="inline-block w-[2px] h-4 ml-0.5 bg-primary align-text-bottom animate-pulse" />
-              </p>
-            ) : (
-              <p className="text-sm text-textSecondary flex items-center gap-2">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                {message.toolCall?.cancelling ? t('stopping') : (streamStage || t('stream.processing'))}
-              </p>
-            )
+          {/* 非阻断提示：如本次问答无可用文献材料、已降级为通用知识回答 */}
+          {message.notice && (
+            <div className="mb-2 flex items-start gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-300">
+              <Info className="mt-px h-3 w-3 flex-shrink-0" />
+              <span>{message.notice}</span>
+            </div>
+          )}
+
+          {/* 正文：流式中为纯文本流 + 句中行内引用标记；完成后整段 markdown
+              （引用标记经 remark 插件内联注入，markdown 语法可跨标记成对） */}
+          {message.streaming && !hasBody ? (
+            <p className="text-sm text-textSecondary flex items-center gap-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              {message.toolCall?.cancelling ? t('stopping') : (streamStage || t('stream.processing'))}
+            </p>
+          ) : message.streaming ? (
+            <div className="text-sm leading-relaxed whitespace-pre-wrap">
+              {segments.map((seg, i) =>
+                seg.type === 'text' ? (
+                  <React.Fragment key={i}>{stripLegacySourceTags(seg.text)}</React.Fragment>
+                ) : (
+                  renderMarker(i, seg.citation)
+                ),
+              )}
+              <span className="inline-block w-[2px] h-4 ml-0.5 bg-primary align-text-bottom animate-pulse" />
+            </div>
           ) : (
             <div className="assistant-markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                {message.content}
+              <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
+                {protectedMd.markdown}
               </ReactMarkdown>
             </div>
+          )}
+
+          {/* AI 思维导图编辑：一问一事务的撤销/保留条 */}
+          {message.mindmapEdits && message.mindmapEdits.length > 0 && onMindmapEditChange && (
+            <AiMindmapEditBar
+              edits={message.mindmapEdits}
+              locked={Boolean(message.streaming)}
+              onChange={(mapId, patch) => onMindmapEditChange(message.id, mapId, patch)}
+            />
           )}
 
           <div className="flex items-center justify-between mt-2 pt-2 border-t border-border/50">
@@ -207,7 +271,7 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
               {new Date(message.timestamp).toLocaleTimeString()}
             </span>
             <button
-              onClick={() => onCopy(message.id, message.content)}
+              onClick={() => onCopy(message.id, stripInlineCitations(message.content))}
               className="p-1 rounded hover:bg-white/10 text-textSecondary hover:text-text transition-colors"
             >
               {copiedId === message.id ? (
@@ -217,60 +281,6 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
               )}
             </button>
           </div>
-
-          {/* 出处区域：与正文 [Source N] 引用标签联动（高亮 + 展开全文） */}
-          {message.sourceDetails && message.sourceDetails.length > 0 && (
-            <div className="mt-2 pt-2 border-t border-border/50 space-y-1.5">
-              <p className="text-[11px] font-medium text-textSecondary uppercase tracking-wide">
-                {t('sources.title')}
-              </p>
-              {message.sourceDetails.map((src) => {
-                const isActive = expandedSource === src.index;
-                return (
-                  <button
-                    key={src.index}
-                    type="button"
-                    onClick={() => toggleSource(src.index)}
-                    className={`w-full text-left text-xs rounded-lg px-2 py-1.5 transition-colors ${
-                      isActive
-                        ? 'bg-primary/10 border border-primary/30'
-                        : 'border border-transparent hover:bg-background/60'
-                    }`}
-                  >
-                    <div className="flex items-center gap-1 mb-0.5">
-                      {src.context_id
-                        ? <Globe className="w-3 h-3 text-secondary flex-shrink-0" />
-                        : <BookOpen className="w-3 h-3 text-primary flex-shrink-0" />}
-                      <span className="font-medium text-text/80 truncate flex-1">
-                        {src.context_id ? `Context #${src.context_id}` : t('sources.currentPaper')}
-                        {src.label ? ` · ${src.label}` : ''}
-                      </span>
-                      <span className="text-textSecondary/70 text-[10px] font-mono flex-shrink-0">[{src.index}]</span>
-                    </div>
-                    <p className={`text-accent/90 pl-4 ${isActive ? '' : 'line-clamp-2'}`}>{src.text}</p>
-                    {src.text.length > 180 && (
-                      <span className="mt-0.5 pl-4 inline-block text-[10px] text-textSecondary/60">
-                        {isActive ? t('sources.collapse') : t('sources.expandFull')}
-                      </span>
-                    )}
-                    {src.paper_id && (
-                      <span
-                        role="button"
-                        tabIndex={0}
-                        onClick={(e) => { e.stopPropagation(); onOpenSource?.(src.index); }}
-                        onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); onOpenSource?.(src.index); } }}
-                        className="mt-1 ml-4 inline-flex items-center gap-1 text-[10px] text-secondary underline underline-offset-2 hover:text-secondary/80 cursor-pointer"
-                        title={t('sources.openInReaderTitle')}
-                      >
-                        <ExternalLink className="w-2.5 h-2.5" />
-                        {t('sources.locateInPaper')}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-          )}
         </div>
       </div>
     </div>

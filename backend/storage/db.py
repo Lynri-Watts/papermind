@@ -130,6 +130,36 @@ def init_db(db_path: Path = DB_PATH) -> None:
             value      TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        -- 思维导图：scope 沿用 context_items 约定（''=全局，'ws:<id>'=工作区）。
+        -- doc 为 MindmapDoc 内容 JSON（节点树带稳定 ID/父子/order/手动坐标）；
+        -- title 以本表列为准（避免与 doc 内标题双重真源）。
+        CREATE TABLE IF NOT EXISTS mindmaps (
+            id         TEXT PRIMARY KEY,
+            scope      TEXT NOT NULL DEFAULT '',
+            title      TEXT NOT NULL,
+            doc        TEXT NOT NULL,          -- JSON {"nodes": [...]}
+            version    INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mindmaps_scope ON mindmaps(scope);
+
+        -- 导图修订：每次成功写入（含创建）留一行。doc 为该 version 写入后的全量
+        -- 快照；actions 为产生该版本的动作 JSON；actor=user|ai|system；
+        -- transaction_id 标记同一次问答内的 AI 编辑事务；undo_of 标记本版本是对
+        -- 哪个 AI 事务的逆向恢复（防止同一事务被撤销两次）。仅保留最近 20 版。
+        CREATE TABLE IF NOT EXISTS mindmap_revisions (
+            map_id         TEXT NOT NULL,
+            version        INTEGER NOT NULL,
+            doc            TEXT NOT NULL,
+            actions        TEXT NOT NULL DEFAULT '[]',
+            actor          TEXT NOT NULL DEFAULT 'user',
+            transaction_id TEXT,
+            undo_of        TEXT,
+            created_at     TEXT NOT NULL,
+            PRIMARY KEY (map_id, version)
+        );
         """
     )
     _migrate(conn)
@@ -602,8 +632,287 @@ def update_workspace(ws_id: str, *, name: str | None = None,
     conn.close()
 
 
-def delete_workspace(ws_id: str) -> None:
+def _delete_local_paper_refs(conn: sqlite3.Connection, paper_id: str) -> None:
+    """在给定连接上删除一篇本地文献的全部 DB 关联数据（不含磁盘文件）。
+
+    清理 papers 缓存（含全文）、PDF 可打开性标记、笔记、数据块，以及引用该
+    论文的上下文库条目。思维导图节点 JSON 内的 paperId 引用不在此清理
+    （遵循"不删除/改写用户导图节点"原则，悬空引用由前端按论文缺失容错）。
+    """
+    conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+    conn.execute("DELETE FROM paper_pdf_status WHERE paper_id = ?", (paper_id,))
+    conn.execute("DELETE FROM notes WHERE paper_id = ?", (paper_id,))
+    conn.execute("DELETE FROM data_blocks WHERE paper_id = ?", (paper_id,))
+    conn.execute(
+        "DELETE FROM context_items WHERE type = 'paper' AND ref_id = ?",
+        (paper_id,),
+    )
+
+
+def delete_local_paper_data(paper_id: str) -> None:
+    """删除一篇本地文献（local:<ws>:<path>）在 DB 中的全部关联数据。
+
+    工作区磁盘上的对应 PDF 被删除后调用（权威副本在磁盘，本函数只清 DB）。
+    """
     conn = _connect()
-    conn.execute("DELETE FROM workspaces WHERE id = ?", (ws_id,))
+    try:
+        _delete_local_paper_refs(conn, paper_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_workspace(ws_id: str) -> None:
+    """删除工作区的全部 DB 数据（磁盘目录由 storage.workspace 层先行删除）。
+
+    单事务级联清理，避免删除工作区后留下孤儿行：
+    - workspaces 元数据行；
+    - app_state 中 project_id='ws:<id>' 的工作区状态快照；
+    - context_items 中 workspace_id='ws:<id>' 的上下文条目；
+    - mindmaps/mindmap_revisions 中 scope='ws:<id>' 的工作区导图；
+    - id/paper_id 以 'local:<ws_id>:' 开头的本地文献数据（papers 全文缓存、
+      paper_pdf_status、notes、data_blocks）及引用它们的上下文条目
+      （含跨库引用的防御性清理）。
+    思维导图节点 JSON 内指向这些论文的 paperId 不做改写（保留用户节点）。
+    """
+    scope = f"ws:{ws_id}"
+    prefix = f"local:{ws_id}:"
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM app_state WHERE project_id = ?", (scope,))
+        conn.execute("DELETE FROM context_items WHERE workspace_id = ?", (scope,))
+        conn.execute(
+            "DELETE FROM mindmap_revisions WHERE map_id IN "
+            "(SELECT id FROM mindmaps WHERE scope = ?)",
+            (scope,),
+        )
+        conn.execute("DELETE FROM mindmaps WHERE scope = ?", (scope,))
+        # 本地文献按前缀精确匹配：用 substr 而非 LIKE——ws_id 允许下划线，
+        # 而 '_' 在 LIKE 中是单字符通配，会误删同名前缀的其它工作区数据
+        for table, col in (
+            ("papers", "id"),
+            ("paper_pdf_status", "paper_id"),
+            ("notes", "paper_id"),
+            ("data_blocks", "paper_id"),
+        ):
+            conn.execute(
+                f"DELETE FROM {table} WHERE substr({col}, 1, ?) = ?",
+                (len(prefix), prefix),
+            )
+        # 防御性清理：引用本工作区本地论文的上下文条目（通常已随 workspace_id
+        # 条件删除，此句覆盖跨库/历史数据的悬空引用）
+        conn.execute(
+            "DELETE FROM context_items WHERE type = 'paper' "
+            "AND substr(ref_id, 1, ?) = ?",
+            (len(prefix), prefix),
+        )
+        conn.execute("DELETE FROM workspaces WHERE id = ?", (ws_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ---------- mindmaps / mindmap_revisions：思维导图 ----------
+MINDMAP_REVISION_LIMIT = 20
+
+
+def _decode_mindmap(row: sqlite3.Row | dict) -> dict:
+    """DB 行 → API 用 dict：doc 列 JSON 解析为对象。"""
+    item = dict(row)
+    raw = item.get("doc")
+    if isinstance(raw, str):
+        try:
+            item["doc"] = json.loads(raw)
+        except json.JSONDecodeError:
+            item["doc"] = {"nodes": []}
+    return item
+
+
+def create_mindmap(map_id: str, scope: str, title: str, doc: dict) -> dict:
+    """创建导图并写入 version=1 的首版快照。返回完整行。"""
+    now = _now()
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO mindmaps (id, scope, title, doc, version, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (map_id, scope, title, json.dumps(doc, ensure_ascii=False), now, now),
+        )
+        conn.execute(
+            "INSERT INTO mindmap_revisions "
+            "(map_id, version, doc, actions, actor, transaction_id, undo_of, created_at) "
+            "VALUES (?, 1, ?, '[]', 'user', NULL, NULL, ?)",
+            (map_id, json.dumps(doc, ensure_ascii=False), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    row = get_mindmap(map_id)
+    assert row is not None
+    return row
+
+
+def get_mindmap(map_id: str) -> dict | None:
+    conn = _connect()
+    row = conn.execute("SELECT * FROM mindmaps WHERE id = ?", (map_id,)).fetchone()
+    conn.close()
+    return _decode_mindmap(row) if row else None
+
+
+def list_mindmaps(scope: str = "", include_doc: bool = False) -> list[dict]:
+    """列出某作用域导图（''=全局库）。默认不含 doc，保持轻量。"""
+    conn = _connect()
+    cols = "id, scope, title, version, created_at, updated_at"
+    if include_doc:
+        cols += ", doc"
+    rows = conn.execute(
+        f"SELECT {cols} FROM mindmaps WHERE scope = ? ORDER BY updated_at DESC",
+        (scope,),
+    ).fetchall()
+    conn.close()
+    items = []
+    for r in rows:
+        item = dict(r)
+        if include_doc:
+            item = _decode_mindmap(item)
+        items.append(item)
+    return items
+
+
+def rename_mindmap(map_id: str, title: str) -> None:
+    conn = _connect()
+    conn.execute(
+        "UPDATE mindmaps SET title = ?, updated_at = ? WHERE id = ?",
+        (title, _now(), map_id),
+    )
     conn.commit()
     conn.close()
+
+
+def delete_mindmap(map_id: str) -> None:
+    """删除导图及其全部修订。"""
+    conn = _connect()
+    conn.execute("DELETE FROM mindmap_revisions WHERE map_id = ?", (map_id,))
+    conn.execute("DELETE FROM mindmaps WHERE id = ?", (map_id,))
+    conn.commit()
+    conn.close()
+
+
+def commit_mindmap_doc(map_id: str, doc: dict, actions: list, *,
+                       actor: str = "user", transaction_id: str | None = None,
+                       undo_of: str | None = None) -> int | None:
+    """乐观锁提交一次文档写入，原子完成：版本自增 + 修订快照 + 裁剪。
+
+    调用方须先基于读到的当前版本应用 actions（services.mindmap_doc）。
+    返回新版本号；导图不存在或版本已被他人推进（条件 UPDATE 0 行）时返回 None。
+    """
+    now = _now()
+    doc_json = json.dumps(doc, ensure_ascii=False)
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT version FROM mindmaps WHERE id = ?", (map_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        cur = conn.execute(
+            "UPDATE mindmaps SET doc = ?, version = version + 1, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (doc_json, now, map_id, row["version"]),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return None
+        new_version = row["version"] + 1
+        conn.execute(
+            "INSERT INTO mindmap_revisions "
+            "(map_id, version, doc, actions, actor, transaction_id, undo_of, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (map_id, new_version, doc_json,
+             json.dumps(actions, ensure_ascii=False), actor, transaction_id, undo_of, now),
+        )
+        conn.execute(
+            "DELETE FROM mindmap_revisions WHERE map_id = ? AND version NOT IN "
+            "(SELECT version FROM mindmap_revisions WHERE map_id = ? "
+            " ORDER BY version DESC LIMIT ?)",
+            (map_id, map_id, MINDMAP_REVISION_LIMIT),
+        )
+        conn.commit()
+        return new_version
+    finally:
+        conn.close()
+
+
+def list_mindmap_revisions(map_id: str, limit: int = MINDMAP_REVISION_LIMIT) -> list[dict]:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT map_id, version, actions, actor, transaction_id, undo_of, created_at "
+        "FROM mindmap_revisions WHERE map_id = ? ORDER BY version DESC LIMIT ?",
+        (map_id, limit),
+    ).fetchall()
+    conn.close()
+    items = []
+    for r in rows:
+        item = dict(r)
+        try:
+            item["actions"] = json.loads(item.get("actions") or "[]")
+        except json.JSONDecodeError:
+            item["actions"] = []
+        items.append(item)
+    return items
+
+
+def get_mindmap_revision(map_id: str, version: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT * FROM mindmap_revisions WHERE map_id = ? AND version = ?",
+        (map_id, version),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    item = dict(row)
+    item["doc"] = json.loads(item["doc"]) if isinstance(item.get("doc"), str) else None
+    try:
+        item["actions"] = json.loads(item.get("actions") or "[]")
+    except json.JSONDecodeError:
+        item["actions"] = []
+    return item
+
+
+def get_latest_ai_transaction(map_id: str) -> dict | None:
+    """最近一次 AI 编辑事务（且未被撤销过）。无则 None。
+
+    返回 {transaction_id, version, created_at}（version 为该事务最后一个版本）。
+    """
+    conn = _connect()
+    row = conn.execute(
+        """
+        SELECT transaction_id, version, created_at FROM mindmap_revisions r
+        WHERE map_id = ? AND actor = 'ai' AND transaction_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM mindmap_revisions u
+              WHERE u.map_id = r.map_id AND u.undo_of = r.transaction_id
+          )
+        ORDER BY version DESC LIMIT 1
+        """,
+        (map_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def is_transaction_undone(map_id: str, transaction_id: str) -> bool:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT 1 FROM mindmap_revisions WHERE map_id = ? AND undo_of = ? LIMIT 1",
+        (map_id, transaction_id),
+    ).fetchone()
+    conn.close()
+    return row is not None

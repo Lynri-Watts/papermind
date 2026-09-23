@@ -33,6 +33,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "rag.value_no_abstract": "（无摘要）",
         # 全文读取工具回执
         "rag.read_paper_no_ids": "未提供要读取全文的论文 id（paper_ids）。",
+        "rag.read_paper_internal_index": "「{pid}」是材料清单的内部选材编号（0=当前论文，其余数字=上下文库条目），不是论文 id，read_paper 无法据此读取。请改用标准论文 id（source:external_id 形式，如 arxiv:2103.03404、local:工作区:相对路径）：从当前可用材料清单中标注为论文的「论文 id」取用，或先调用 paper_search 取其返回的 id。若该材料是网页，则没有论文 id，不能用 read_paper 读取。",
         "rag.read_paper_unknown_reason": "未知原因，未获取到全文",
         "rag.read_paper_failed_header": "无法读取所选论文的全文：",
         "rag.read_paper_loaded_header": "已读取 {n} 篇论文全文：",
@@ -68,6 +69,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "rag.value_no_abstract": "(No abstract)",
         # Fulltext reading tool result
         "rag.read_paper_no_ids": "No paper ids (paper_ids) provided to read the fulltext.",
+        "rag.read_paper_internal_index": "'{pid}' is an internal material-selection index from the material list (0 = the currently open paper; other numbers = context-library items), not a paper id, so read_paper cannot use it. Use a standard paper id in source:external_id form (e.g. arxiv:2103.03404 or local:<workspace>:<relative path>): take the \"paper id\" shown for paper entries in the available-material list, or call paper_search and use an id it returns. Webpage materials have no paper id and cannot be read with read_paper.",
         "rag.read_paper_unknown_reason": "Unknown reason; fulltext was not retrieved",
         "rag.read_paper_failed_header": "Could not read the fulltext of the selected papers:",
         "rag.read_paper_loaded_header": "Read the fulltext of {n} papers:",

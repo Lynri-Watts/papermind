@@ -13,7 +13,7 @@ export default {
     research: 'Deep Research',
     researchDesc: 'Reading + RAG Q&A',
     explore: 'Explore',
-    exploreDesc: 'Search + Knowledge Graph',
+    exploreDesc: 'Multi-source search',
     settings: 'Settings',
     settingsDesc: 'Data sources & LLM',
   },

@@ -12,6 +12,7 @@ from flask import Flask
 from flask_cors import CORS
 
 import config
+from routes.mindmaps import mindmaps_api
 from routes.papers import api
 from routes.settings import settings_api
 from routes.workspaces import workspaces_api
@@ -30,6 +31,7 @@ def create_app() -> Flask:
     app.register_blueprint(api, url_prefix="/api")
     app.register_blueprint(workspaces_api, url_prefix="/api")
     app.register_blueprint(settings_api, url_prefix="/api")
+    app.register_blueprint(mindmaps_api, url_prefix="/api")
 
     init_db()
     return app

@@ -5,6 +5,64 @@ export function normalizeText(raw: string): string {
   return (raw || '').replace(/\s+/g, ' ').trim();
 }
 
+/** CJK 统一表意文字（含扩展A）、CJK 部首/符号、全角标点——这类字符之间的
+ *  排版空白没有语义，PyMuPDF 与 pdf.js 提取时取舍相反（如封面"作 者 姓 名"
+ *  vs"作者姓名"），匹配时必须忽略 */
+const CJK_CHAR_RE = /[㐀-鿿豈-﫿　-〿＀-￯]/;
+
+function isCJK(ch: string | undefined): boolean {
+  return !!ch && CJK_CHAR_RE.test(ch);
+}
+
+/**
+ * 构造"紧凑匹配索引"：删除**至少一侧是 CJK 字符**的空白。
+ *
+ * 后端 PyMuPDF 提取中文时常把 run 直接相连（"作者姓名"），pdf.js 常保留
+ * 排版空格（"作 者 姓 名"），两侧规范化后仍无法字符级对齐。紧凑索引在
+ * :func:`normalizeText` 之上再抹掉 CJK 周边空白，两侧文本即可对齐。
+ * 拉丁词之间的空格保留，英文匹配不受影响。
+ *
+ * 同时返回紧凑偏移 → norm 偏移映射，命中后可换算回 run 坐标做高亮。
+ */
+function buildSquashIndex(norm: string): { text: string; toNorm: number[] } {
+  let text = '';
+  const toNorm: number[] = [];
+  for (let i = 0; i < norm.length; i++) {
+    const ch = norm[i];
+    if (/\s/.test(ch) && (isCJK(text[text.length - 1]) || isCJK(norm[i + 1]))) {
+      continue; // 丢弃 CJK 周边空白
+    }
+    toNorm.push(i);
+    text += ch;
+  }
+  return { text, toNorm };
+}
+
+/**
+ * 从紧凑目标中取一个"定位签名"：足够长的连续 CJK 片段，优先取片段中部
+ * （开头常是章节号/页眉，中部最具区分度）。优先选择在全文中**唯一命中**
+ * 的候选（避免跳到重复出现的页眉/措辞处）；所有候选都不唯一时（典型为
+ * 目录条目——标题在目录与正文各出现一次），取**首次命中**，即目录页位置。
+ */
+function findCjkSignature(sqTarget: string, sqFull: string): { start: number; length: number } | null {
+  const runs = (sqTarget.match(/[㐀-鿿豈-﫿]{6,}/g) ?? [])
+    .sort((a, b) => b.length - a.length);
+  let firstNonUnique: { start: number; length: number } | null = null;
+  for (const run of runs) {
+    for (const size of [14, 12, 10, 8]) {
+      if (run.length < size) continue;
+      const begin = Math.max(0, Math.floor((run.length - size) / 2));
+      const gram = run.slice(begin, begin + size);
+      const first = sqFull.indexOf(gram);
+      if (first === -1) continue;
+      const hit = { start: first, length: gram.length };
+      if (sqFull.indexOf(gram, first + 1) === -1) return hit; // 唯一命中，最可靠
+      firstNonUnique ??= hit;
+    }
+  }
+  return firstNonUnique;
+}
+
 /** 去除引用文本常见的前后引号/撇号（AI 引用时可能带原文引号） */
 export function stripQuotes(target: string): string {
   return target.replace(/^[\s"'“”‘’「」《》]+|[\s"'“”‘’「」《》]+$/g, '').trim();
@@ -33,11 +91,14 @@ export interface LocateResult {
  * 因此这里在 hasEOL 的行尾补一个空格，保证与后端提取的文本字符级对齐。
  */
 /** 整篇文档的拼接全文缓存：同一次 PDF 加载内多次定位（点击多个引用）不必反复提取 */
-const fullTextCache = new WeakMap<pdfjsLib.PDFDocumentProxy, { fullText: string; pageOffsets: number[] }>();
+const fullTextCache = new WeakMap<
+  pdfjsLib.PDFDocumentProxy,
+  { fullText: string; pageOffsets: number[]; squashText: string; sqToNorm: number[] }
+>();
 
 export async function extractFullText(
   doc: pdfjsLib.PDFDocumentProxy,
-): Promise<{ fullText: string; pageOffsets: number[] }> {
+): Promise<{ fullText: string; pageOffsets: number[]; squashText: string; sqToNorm: number[] }> {
   const cached = fullTextCache.get(doc);
   if (cached) return cached;
 
@@ -58,14 +119,25 @@ export async function extractFullText(
     pageOffsets.push(fullText.length);
     fullText += normalizeText(pageText);
   }
-  const result = { fullText, pageOffsets };
+  const { text: squashText, toNorm: sqToNorm } = buildSquashIndex(fullText);
+  const result = { fullText, pageOffsets, squashText, sqToNorm };
   fullTextCache.set(doc, result);
   return result;
 }
 
 /**
  * 在全文（逐页拼接）中定位某段文本，返回命中信息；找不到返回 null。
- * 优先精确匹配，其次去掉引号后匹配，再退化为逐词连续匹配的模糊定位。
+ *
+ * 匹配层级（逐级放宽，命中即止）：
+ * 1. norm 全文精确子串（含去首尾引号的变体）；
+ * 2. **CJK 紧凑整段**：两侧都抹掉 CJK 周边排版空格后子串（修复中文文档
+ *    PyMuPDF「作者姓名」与 pdf.js「作 者 姓 名」的提取差异）；
+ * 3. **CJK 唯一短签名**：整段仍对不齐时（页眉页脚插入、多栏排序差异），
+ *    取目标中部一段 8~14 字的唯一汉字片段定位；
+ * 4. 英文逐词连续模糊匹配（findFuzzyMatch）。
+ *
+ * 层级 2/3 命中的是"紧凑索引"偏移，经 sqToNorm 映射回 norm 偏移后再返回，
+ * 页码反查与 run 高亮坐标换算与层级 1 完全一致。
  */
 export async function locateInDocument(
   doc: pdfjsLib.PDFDocumentProxy,
@@ -73,7 +145,7 @@ export async function locateInDocument(
 ): Promise<LocateResult | null> {
   const target = normalizeText(rawText);
   if (!target) return null;
-  const { fullText, pageOffsets } = await extractFullText(doc);
+  const { fullText, pageOffsets, squashText, sqToNorm } = await extractFullText(doc);
 
   // 1) 精确匹配（原文逐字；AI 引用可能是去引号后的文本）
   const unquoted = stripQuotes(target);
@@ -84,7 +156,28 @@ export async function locateInDocument(
     hitLen = unquoted.length;
   }
 
-  // 2) 精确匹配失败 → 模糊匹配：按词序列找"最连续的片段"
+  // 2) CJK 紧凑匹配：整段去 CJK 周边空格
+  if (hitIdx === -1) {
+    const sqTarget = buildSquashIndex(unquoted || target);
+    const pos = squashText.indexOf(sqTarget.text);
+    if (pos !== -1) {
+      const normStart = sqToNorm[pos];
+      const normEnd = sqToNorm[Math.min(pos + sqTarget.text.length, sqToNorm.length) - 1] + 1;
+      hitIdx = normStart;
+      hitLen = Math.max(1, normEnd - normStart);
+    } else {
+      // 3) CJK 唯一短签名（8~14 字中部片段，必须在全文唯一出现）
+      const sig = findCjkSignature(sqTarget.text, squashText);
+      if (sig) {
+        const normStart = sqToNorm[sig.start];
+        const normEnd = sqToNorm[Math.min(sig.start + sig.length, sqToNorm.length) - 1] + 1;
+        hitIdx = normStart;
+        hitLen = Math.max(1, normEnd - normStart);
+      }
+    }
+  }
+
+  // 4) 仍失败 → 英文词序列模糊匹配
   if (hitIdx === -1) {
     const fuzzy = findFuzzyMatch(fullText, unquoted || target);
     if (fuzzy) {

@@ -5,6 +5,26 @@ import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { ZoomIn, ZoomOut, Maximize, Loader2, FileText, RotateCw, PenLine, Boxes, MessageCircleQuestion } from 'lucide-react';
 import { Highlight } from '../types';
 import { locateInDocument, normalizeText, normOffsetToRunRange, PageRun } from '../utils/pdfLocate';
+import { usePaperMindStore } from '../store';
+
+/**
+ * scale/rotation 变化导致整列表拆毁重建前的滚动锚点。
+ * 重建会瞬间清空全部页 wrapper（scrollHeight 塌陷，浏览器把 scrollTop 钳 0），
+ * 必须在拆毁前记录"当前视口顶部落在哪一页的哪个纵向比例"，重建后按新几何还原，
+ * 否则开关 AI 面板/拖拽调宽/缩放/旋转后阅读位置会跳到别处。
+ */
+interface ScrollAnchor {
+  /** 视口顶部当前所在页（按重建前几何判定） */
+  page: number;
+  /** 视口顶部在该页 wrapper 内的纵向比例 [0,1]（同文档纯缩放时可精确映射） */
+  ratioInPage: number;
+  /** 全局滚动比例兜底（跨文档/旋转后页内几何不再对应时使用） */
+  globalRatio: number;
+  /** 捕获时的旋转角：与重建后不一致则只能用全局比例 */
+  rotation: number;
+  /** 捕获时的文档代理：换文档后锚点失效（页码/几何不再对应） */
+  doc: pdfjsLib.PDFDocumentProxy;
+}
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -176,9 +196,30 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   // 避免捕获 effect 创建时的旧高亮版本而漏掉之后新增的高亮（在 applyPageHighlights 定义处同步）
   const applyHighlightsRef = useRef<((wrap: HTMLElement, pageNum: number) => void) | null>(null);
 
+  // 重建（scale/rotation 变化）前后的滚动位置锚点，见 ScrollAnchor 说明
+  const scrollAnchorRef = useRef<ScrollAnchor | null>(null);
+  // AI 面板分隔条拖拽中：只更新容器宽度基准，fit-width 重排延迟到松手后一次应用，
+  // 避免拖拽途中逐像素拆毁重建（卡顿 + 滚动位置反复跳动）
+  const qaPanelResizing = usePaperMindStore((s) => s.qaPanelResizing);
+  // ResizeObserver 回调在 [doc] effect 闭包内创建，用 ref 读最新拖拽状态
+  const qaPanelResizingRef = useRef(qaPanelResizing);
+  useEffect(() => { qaPanelResizingRef.current = qaPanelResizing; }, [qaPanelResizing]);
+
+  /** 按当前容器宽度计算并应用 fit-width 缩放（无文档/用户手动缩放时不干预） */
+  const applyFitWidthScale = useCallback(() => {
+    const firstVp = fitScaleBasisRef.current;
+    const w = containerWidthRef.current;
+    if (!firstVp || w <= 0 || userZoomRef.current) return;
+    const next = Math.max(0.5, Math.min(3, w / firstVp.width));
+    fitScaleRef.current = next;
+    setScale((prev) => (Math.abs(prev - next) < 1e-6 ? prev : next));
+  }, []);
+
   // 加载 PDF 文档
   useEffect(() => {
     let cancelled = false;
+    // 换文档：旧文档的滚动锚点失效（页码/几何不再对应），新文档从顶部开始
+    scrollAnchorRef.current = null;
     setLoading(true);
     setError(null);
     setDoc(null);
@@ -220,23 +261,22 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     const container = scrollRef.current;
     if (!container) return;
     const observer = new ResizeObserver((entries) => {
-      containerWidthRef.current = entries[0].contentRect.width;
-      // 容器尺寸变化时，重新计算 fit scale（若用户未手动缩放，时刻贴合宽度）
-      if (doc && !userZoomRef.current) {
-        const firstVp = fitScaleBasisRef.current;
-        if (firstVp) {
-          const w = entries[0].contentRect.width;
-          if (w > 0) {
-            fitScaleRef.current = Math.max(0.5, Math.min(3, w / firstVp.width));
-            setScale(fitScaleRef.current);
-          }
-        }
+      const w = entries[0].contentRect.width;
+      containerWidthRef.current = w;
+      // 拖拽 AI 面板分隔条途中不逐帧重排：只记录最新宽度，松手后由
+      // qaPanelResizing 翻转的 effect 一次性应用（滚动锚点在那次重建时还原）
+      if (w > 0 && doc && !userZoomRef.current && !qaPanelResizingRef.current) {
+        applyFitWidthScale();
       }
     });
     observer.observe(container);
     return () => observer.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [doc]);
+  }, [doc, applyFitWidthScale]);
+
+  // 拖拽结束：按最终宽度做一次 fit-width 重排（重建时走滚动锚点还原）
+  useEffect(() => {
+    if (!qaPanelResizing) applyFitWidthScale();
+  }, [qaPanelResizing, applyFitWidthScale]);
 
   // 渲染所有页面为纵向列表（视口惰性渲染）：
   // 1) 分片并行预取页面对象（避免逐页串行 getPage 卡顿）
@@ -261,6 +301,48 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
       renderInFlightRef.current.clear();
       list.innerHTML = '';
       setRenderedCount(0);
+    };
+
+    // 拆毁前捕获滚动锚点（必须在 cleanup() 清空 DOM 之前）：
+    // scale/rotation 变化会走 cleanup→重建，期间 scrollHeight 塌陷使浏览器
+    // 钳住 scrollTop，需记录视口顶部所在页及页内纵向比例，重建后按新几何还原
+    const captureScrollAnchor = () => {
+      const el = scrollRef.current;
+      if (!el) return;
+      const scrollable = el.scrollHeight - el.clientHeight;
+      const globalRatio = scrollable > 0 ? el.scrollTop / scrollable : 0;
+      let page = 0;
+      let ratioInPage = 0;
+      // pageWrapRefs 按页码升序插入：取第一个底边越过视口顶部的页
+      for (const [p, wrap] of pageWrapRefs.current) {
+        if (wrap.offsetTop + wrap.offsetHeight > el.scrollTop + 1) {
+          page = p;
+          ratioInPage = wrap.offsetHeight > 0
+            ? Math.min(1, Math.max(0, (el.scrollTop - wrap.offsetTop) / wrap.offsetHeight))
+            : 0;
+          break;
+        }
+      }
+      scrollAnchorRef.current = { page, ratioInPage, globalRatio, rotation, doc };
+    };
+
+    // 全部 wrapper 按新几何重建后还原滚动位置
+    const restoreScrollAnchor = () => {
+      const el = scrollRef.current;
+      const anchor = scrollAnchorRef.current;
+      scrollAnchorRef.current = null;
+      if (!el || !anchor || anchor.doc !== doc) return;
+      // 同文档且未旋转：页内比例可随缩放线性映射，位置精确
+      if (anchor.rotation === rotation && anchor.page > 0) {
+        const wrap = pageWrapRefs.current.get(anchor.page);
+        if (wrap && wrap.offsetHeight > 0) {
+          el.scrollTop = Math.round(wrap.offsetTop + anchor.ratioInPage * wrap.offsetHeight);
+          return;
+        }
+      }
+      // 旋转后页内几何不再对应：用全局滚动比例近似还原
+      const scrollable = el.scrollHeight - el.clientHeight;
+      el.scrollTop = Math.round(Math.max(0, scrollable) * anchor.globalRatio);
     };
 
     // 渲染单页：canvas 渲染与 getTextContent 并行，完成后建 TextLayer 并应用高亮
@@ -444,6 +526,9 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
       // 3) 预建全部占位 wrapper（高度固定 → 滚动条稳定），观察器接管后续惰性渲染
       for (let p = 1; p <= doc.numPages; p++) buildWrap(p);
 
+      // 3.5) 全部占位已就位、列表总高度已确定：还原缩放/旋转前的阅读位置
+      restoreScrollAnchor();
+
       // 4) 首屏立即渲染第 1 页（其余由观察器随滚动渲染）
       void renderPage(1);
     };
@@ -451,6 +536,8 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     setup();
 
     return () => {
+      // 拆毁旧 DOM 前先记录锚点（cleanup 会瞬间清空列表导致 scrollTop 被钳 0）
+      captureScrollAnchor();
       cancelled = true;
       observer.disconnect();
       renderPageRef.current = undefined;

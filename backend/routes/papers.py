@@ -17,10 +17,15 @@ import storage.db as db
 import storage.workspace as ws
 from config import PDF_DIR
 from i18n import tr
-from llm.client import LLMNotConfiguredError
-from llm.rag import build_rag_engine
+from llm.client import LLMClient, LLMNotConfiguredError
+from llm.rag import (
+    build_rag_engine,
+    finalize_inline_answer,
+    InlineQuoteExtractor,
+)
 from llm.summarize import summarize_text, truncate_summary
 from llm.tools import default_registry
+from llm.tools_mindmap import register_mindmap_tools
 from providers import get_provider
 from providers.base import SearchQuery
 from providers.download import PdfDownloadError, download_pdf, parse_pdf_to_text
@@ -270,10 +275,16 @@ def _find_existing_context(item_type: str, workspace_id: str, key_col: str, key:
 # 作为 SSE 事件随生成过程实时发给前端，最终合并进聊天记录（toolLog），前端可随时停止。
 
 _TOOL_REGISTRY = default_registry()
+register_mindmap_tools(_TOOL_REGISTRY)
 _TOOL_LABEL_KEYS = {
     "paper_search": "api.tool_label.paper_search",
     "read_paper": "api.tool_label.read_paper",
     "read_document": "api.tool_label.read_document",
+    "list_mindmaps": "api.tool_label.list_mindmaps",
+    "create_mindmap": "api.tool_label.create_mindmap",
+    "read_mindmap": "api.tool_label.read_mindmap",
+    "edit_mindmap": "api.tool_label.edit_mindmap",
+    "attach_paper_to_mindmap": "api.tool_label.attach_paper_to_mindmap",
     # 非真实工具：读取"当前论文 + 上下文库"候选材料的内部步骤，用于展示 ReAct 轨迹
     "read_materials": "api.tool_label.read_materials",
 }
@@ -337,13 +348,19 @@ def _select_materials(question: str, use_context: bool, context_ids: list[int],
 
 
 def _read_selected_sources(selected_ids: list[int], paper_id: str,
-                           paper_title: str, emit, failures: list[str]) -> list[dict]:
+                           paper_title: str, emit, failures: list[str],
+                           warnings: list[str] | None = None,
+                           paper_abstract: str = "") -> list[dict]:
     """按需读取选中候选的全文（生成器：逐个 emit stage 事件，return 来源列表）。
 
     未选中的候选完全不读，节约时间与 token。读取失败不静默：把每一项
     失败的具体原因（未开放 PDF / 403 / 404 / 解析失败 / 扫描版等）记入
     failures，供 read_materials 的 observation 准确反馈。
+
+    ``warnings``：读取**降级成功**（如当前论文全文不可得、退用摘要）的说明，
+    与 failures 区分——材料仍然进入了检索池，只是完整度打折扣。
     """
+    warnings = warnings if warnings is not None else []
     sources: list[dict] = []
     for sid in selected_ids:
         if sid == 0:
@@ -351,6 +368,15 @@ def _read_selected_sources(selected_ids: list[int], paper_id: str,
                 continue
             yield emit("stage", {"label": tr("api.stage.fetch_current_fulltext")})
             fulltext, reason = get_paper_fulltext_checked(paper_id)
+            if not fulltext and paper_abstract.strip():
+                # 全文不可得（闭源/限流/解析失败）但有摘要：降级用摘要作答，
+                # 明确告知用户依据打了折扣——不能让"打开着论文却像没文档"
+                fulltext = paper_abstract.strip()
+                warnings.append(tr(
+                    "api.read_fail.paper_abstract_only",
+                    title=paper_title,
+                    reason=reason or tr("api.reason.fulltext_missing"),
+                ))
             if fulltext:
                 sources.append({
                     "label": paper_title,
@@ -407,37 +433,85 @@ def _react_loop_prompt(question: str, summaries: list[dict],
         candidates.append(current)
     candidates.extend(summaries)
     candidates = candidates[:30]
-    listing = "\n\n".join(
-        f"[{it['id']}] {it['title']}\n摘要: {(it.get('summary') or '')[:200]}"
-        for it in candidates
-    ) or "（当前无可用材料）"
+
+    def _render_candidate(it: dict) -> str:
+        head = f"[{it['id']}] {it['title']}"
+        summary = f"摘要: {(it.get('summary') or '')[:200]}"
+        if it["id"] == 0:
+            # 当前论文：选材编号 [0] 仅供系统选材；标准 id 可直接用于 read_paper
+            real_id = it.get("paper_id")
+            if real_id:
+                rule = (
+                    f"类型: 当前论文；论文 id: {real_id}"
+                    "（read_paper 只能传这个标准 id，不能传选材编号 0）"
+                )
+            else:
+                rule = "类型: 当前论文（无标准论文 id，不能对它调用 read_paper）"
+        elif it.get("type") == "paper":
+            ref_id = it.get("ref_id")
+            if ref_id:
+                rule = (
+                    f"类型: 论文库材料；论文 id: {ref_id}"
+                    "（需要其全文时 read_paper 传这个标准 id；严禁传方括号选材编号）"
+                )
+            else:
+                rule = "类型: 论文库材料（无标准论文 id，不能用 read_paper 读取）"
+            return f"{head}\n{rule}\n{summary}"
+        else:
+            # 网页材料：read_paper 只处理论文 PDF，网页正文不在其能力范围内
+            rule = "类型: 网页材料（无论文 id，read_paper 不支持网页）"
+        return f"{head}\n{rule}\n{summary}"
+
+    listing = "\n\n".join(_render_candidate(it) for it in candidates) or "（当前无可用材料）"
 
     focus_parts = []
     if current is not None:
-        focus_parts.append("用户当前打开一篇论文（编号 0，标注'当前论文'）")
+        focus_parts.append("用户当前打开一篇论文（材料清单编号 0，标注'当前论文'）")
     if document:
         focus_parts.append("用户当前正在编辑 LaTeX 文档（写作场景，可用 read_document 读取）")
-    focus_parts.append("其余编号为上下文库中的材料" if candidates else "")
+    focus_parts.append("上下文库中还有以下材料" if summaries else "")
     focus_desc = "、".join(p for p in focus_parts if p) or "当前无任何可用材料"
 
     system = (
-        "你是论文研究助手的工具链调度器，采用 ReAct（思考→行动→观察）模式工作。\n"
-        f"当前情况：{focus_desc}。你在处理用户问题，可调用工具获取更多材料。\n"
+        "你是论文研究助手的工具调度器，采用 ReAct（思考→行动→观察）模式工作。\n"
+        f"当前情况：{focus_desc}。\n"
         "每步先输出一小段**思考**文字（会实时展示给用户）：说明这步的意图与依据。"
-        "思考结束后，再决定动作：\n"
-        "- 需要外部文献时，调用 paper_search 获取候选论文及其摘要；其摘要**仅用于"
-        "筛选**哪些论文与问题相关：若问题需要具体细节（方法、实验数据、公式、结论"
-        "依据等），必须再调用 read_paper 读取这些论文的全文，不得仅凭摘要作答；\n"
+        "思考结束后，再根据**任务本身的需要**决定动作。工具彼此平行，没有固定的"
+        "调用先后，按下列情形选择：\n"
+        "- 需要查找库中有哪些相关论文、或当前没有可用的论文标准 id 时，调用 "
+        "paper_search（返回候选摘要与每篇的标准论文 id）；\n"
+        "- 当问题需要某篇论文的具体细节（方法、实验数据、公式、结论依据等），"
+        "而该论文全文不在系统已读取的材料中时，调用 read_paper 读取其全文。"
+        "paper_ids 使用**标准论文 id**（source:external_id 或 local:工作区:路径），"
+        "可平行地取自两处、无先后要求：①上方材料清单中论文条目的「论文 id」；"
+        "②paper_search 返回的 id。若仅靠已有摘要或已读全文即可作答，则不要调用；\n"
         "- 写作任务（改写/续写/检查语法/整理结构/把材料插入论文）调用 read_document；\n"
-        "- 材料已足够时不要再请求工具，思考结束后回复 READY 即可。\n"
-        "规则：一次只请求一个工具；工具会自动执行无需你等待用户确认，执行结果会以 "
+        "- 当用户希望**梳理、做笔记、构建/更新思维导图**（如「整理成导图」「把这几篇"
+        "论文的关系画出来」「在导图里加一个分支」）时，使用导图工具：先 list_mindmaps"
+        "（不确定 map_id 时）与 read_mindmap 取得带节点 ID 的结构，再用 edit_mindmap"
+        "批量修改，或用 attach_paper_to_mindmap 挂论文；导图是用户思考的延伸，"
+        "**编辑必须基于读到的材料与对话意图**，节点文本要简洁、沿用导图既有语言，"
+        "**不得删除用户节点，除非用户明确要求**；一次问答里的导图修改应尽量集中在"
+        "尽量少的 edit_mindmap 批次中；\n"
+        "- 材料已足够且无导图等操作诉求时不要再请求工具，思考结束后回复 READY 即可。\n"
+        "硬性规则：\n"
+        "- 材料清单中的 [0]、[9] 等方括号数字是**系统内部选材编号**，只能用于系统"
+        "选材环节，绝不能作为任何工具的参数（尤其不能传给 read_paper）；\n"
+        "- read_paper 只处理论文 PDF：只接受标准论文 id，不接受网页 URL/网页材料"
+        "（网页无论文 id），也不接受纯数字编号；\n"
+        "- 「内部读取情况」与上方清单中已成功读取的材料可直接用于最终回答，不要"
+        "重复读取；读取失败的论文可凭其标准 id 用 read_paper 自行重试；\n"
+        "- 一次只请求一个工具；工具会自动执行无需你等待用户确认，执行结果会以 "
         "tool 角色返回，据此继续思考下一步；**禁止在本回合直接撰写最终回答正文**"
         "（最终回答由系统在检索材料后单独生成）。"
     )
     user = f"用户问题：{question}\n\n当前可用材料：\n{listing}"
     if material_note:
-        user += f"\n\n（内部读取情况：{material_note}。若材料未能读取成功，可调用 paper_search "
-        user += "另找相关论文，再 read_paper 读取其全文；无法解决时也可如实告诉用户并给出建议。）"
+        user += (
+            f"\n\n（内部读取情况：{material_note}。若某篇论文未能读取成功，可凭其标准"
+            "论文 id 用 read_paper 重试；若没有可用 id 或需要另找替代文献，可先 "
+            "paper_search 再 read_paper；无法解决时如实告诉用户并给出建议。）"
+        )
     return system, user
 
 
@@ -467,22 +541,42 @@ def _merge_material(materials: list[dict], src: dict) -> None:
 def _answer_events(engine, question: str, sources: list[dict],
                    paper_meta: dict, history: list, emit,
                    material_note: str | None = None):
-    """检索相关内容 + 流式生成回答（生成器：yield emit 结果；无依据时发 error）。
+    """检索相关内容 + 流式生成回答（生成器：yield emit 结果）。
 
-    ``material_note``：步骤一读取候选材料的结果（成功/失败原因）。当最终仍无任何
-    材料可检索时，把它并入错误提示，让用户明白是"PDF 无法读取"还是"没有材料"。
+    无材料不再硬失败：先发一条 ``notice`` 事件（前端渲染为提示条而非错误），
+    随后以 grounded=False 让模型仅凭通用知识作答；材料存在但切不出可用正文
+    （ValueError）时走同一条降级路径，并把具体原因写进提示。
     """
+    def stream_unguided():
+        """无检索段落：空出处 + 通用知识流式回答（生成器，yield SSE 帧）。"""
+        yield emit("stage", {"label": tr("api.stage.generating")})
+        answer_parts: list[str] = []
+        yield emit("sources", {"sources": []})
+        for ev in engine.stream_answer(
+            question, [], paper_meta, history, grounded=False,
+        ):
+            if ev["type"] == "sources":
+                continue  # 空出处已由本函数发出
+            answer_parts.append(ev["delta"])
+            yield emit("delta", {"delta": ev["delta"]})
+        yield emit("done", {"answer": "".join(answer_parts), "sources": []})
+
     if not sources:
-        hint = ""
         if material_note:
-            hint = tr("api.answer.reason_suffix", note=material_note)
-        yield emit("error", {
-            "message": tr("api.answer.no_material") + hint
-        })
+            notice = tr("api.answer.no_material_with_note", note=material_note)
+        else:
+            notice = tr("api.answer.no_material_notice")
+        yield emit("notice", {"message": notice})
+        yield from stream_unguided()
         return
     yield emit("stage", {"label": tr("api.stage.retrieving")})
     answer_parts: list[str] = []
     final_sources: list[dict] = []
+    # 无编号行内引用 [Q]...[/Q]：流式转发时增量解析，半截标签扣留不泄漏，
+    # 闭合即以"未决"态随 delta 内联转发（前端先显示核对中的引用标记）；
+    # 出处绑定（逐字匹配 / 多命中上下文消歧 / 扩展模糊匹配 / 失败卡）
+    # 需要标签之后的上下文句，统一在流末 finalize_inline_answer 完成。
+    quote_extractor = InlineQuoteExtractor()
     try:
         for ev in engine.stream_answer(question, sources, paper_meta, history):
             if ev["type"] == "sources":
@@ -490,15 +584,26 @@ def _answer_events(engine, question: str, sources: list[dict],
                 yield emit("stage", {"label": tr("api.stage.generating")})
                 yield emit("sources", {"sources": ev["sources"]})
             else:
-                answer_parts.append(ev["delta"])
-                yield emit("delta", {"delta": ev["delta"]})
+                visible = quote_extractor.feed(ev["delta"])
+                if not visible:
+                    continue
+                answer_parts.append(visible)
+                yield emit("delta", {"delta": visible})
     except ValueError as exc:
-        # prepare_answer 仅在材料完全没有可切分正文时抛 ValueError
-        # （弱相关段落不再中止问答，交由 LLM 判断）
-        yield emit("error", {"message": str(exc)})
+        # 材料存在但完全没有可切分正文（如全是图表/引用列表）：同样降级为
+        # 通用知识回答 + 提示，不再以错误中断问答
+        yield emit("notice", {"message": tr("api.answer.no_passages_notice", note=str(exc))})
+        yield from stream_unguided()
         return
-    # done 事件必须携带 sources，前端据此渲染出处区与 [Source N] 引用联动
-    yield emit("done", {"answer": "".join(answer_parts), "sources": final_sources})
+    tail_visible = quote_extractor.finish()
+    if tail_visible:
+        answer_parts.append(tail_visible)
+        yield emit("delta", {"delta": tail_visible})
+    # 收口：逐字绑定出处、多命中上下文消歧、零命中扩展模糊匹配、失败卡终态
+    final_answer = finalize_inline_answer("".join(answer_parts), final_sources)
+    # done 事件必须携带最终正文（含终态引用标签）与 sources，
+    # 前端据此把未决标记替换为成功/失败引用卡
+    yield emit("done", {"answer": final_answer, "sources": final_sources})
 
 
 # ---------- 健康检查 ----------
@@ -804,7 +909,10 @@ def rag_stream():
 
     事件序列：
       stage（阶段进度）→ [thought 思考增量 → react_action 动作（自动执行，无需确认）
-      → observation 观察结果]×N → sources（出处分块）→ delta（回答增量）→ done/error。
+      → mindmap_diff（仅导图编辑：增量差异实时落图）? → observation 观察结果]×N
+      → sources（出处分块）→ delta（回答增量，其中内联经校验的
+      [Q:N]...[/Q:N] 引用块标签）→ done（answer 含最终引用块标签、
+      sources 含 quote）/error。
     材料充足时不会出现工具动作，直接 sources → delta → done/error。
     前端把 thought/react_action/observation 实时渲染为 ReAct 步骤，完成后折叠进 toolLog
     持久化；生成过程中可随时 POST /rag/cancel（body: run_id）停止。
@@ -845,6 +953,9 @@ def rag_stream():
                     "id": 0,
                     "title": paper_title,
                     "summary": paper_meta.get("abstract") or "（无摘要，标题见上）",
+                    # 真实论文 id 仅用于 ReAct 提示：步骤一自动读取失败时，
+                    # 允许 LLM 用该 id 经 read_paper 显式重试（编号 0 本身不可传）
+                    "paper_id": paper_id,
                 }
 
             try:
@@ -854,8 +965,13 @@ def rag_stream():
                 return
 
             # ---- 候选材料（当前论文 + 当前工作区上下文库）----
+            # 保留 type/ref_id：ReAct 工具循环的提示需据此给出真实论文 id，
+            # 避免 LLM 把内部选材编号（[0]/[9]）误当 read_paper 的 paper_id
             summaries = [
-                {"id": it["id"], "title": it["title"], "summary": it["summary"]}
+                {
+                    "id": it["id"], "title": it["title"], "summary": it["summary"],
+                    "type": it.get("type"), "ref_id": it.get("ref_id"),
+                }
                 for it in db.list_context_items(workspace_id=workspace_id)
                 if it["id"] not in exclude_ids and it.get("status") != "failed"
             ] if use_context else []
@@ -894,8 +1010,11 @@ def rag_stream():
                         "arguments": {}, "thought": "",
                     })
                     read_failures: list[str] = []
+                    read_warnings: list[str] = []
                     sources = yield from _read_selected_sources(
                         selected_ids, paper_id, paper_title, emit, read_failures,
+                        warnings=read_warnings,
+                        paper_abstract=paper_meta.get("abstract") or "",
                     )
                     for src in sources:
                         _merge_material(materials, src)
@@ -909,6 +1028,11 @@ def rag_stream():
                                 shown += tr("api.more_items", n=len(labels))
                             detail = tr("api.read_materials.read_ok", n=len(materials),
                                          shown=shown or tr("api.read_materials.empty"))
+                            if read_warnings:
+                                # 降级成功（如仅有摘要）：材料可用但依据打折扣
+                                detail += tr("api.read_materials.some_degraded",
+                                             n=len(read_warnings),
+                                             reasons=_join_reasons(read_warnings))
                             if read_failures:
                                 detail += tr("api.read_materials.some_failed",
                                              n=len(read_failures), reasons=_join_reasons(read_failures))
@@ -931,6 +1055,10 @@ def rag_stream():
 
             # ---- ReAct 步骤二：自动工具循环（AI 自主思考 → 执行工具 → 观察结果） ----
             if enable_tool and not _request_cancelled(run_id):
+                # 本次问答的 AI 导图编辑事务：同一会话的全部导图写共享一个 ID，
+                # 用户可按"一问一事务"整体撤销（修订表持久化，离会也可撤最近一次）
+                mindmap_txn_id = "mmtx_" + uuid.uuid4().hex[:12]
+                mindmap_events: list[dict] = []
                 tool_system, tool_user = _react_loop_prompt(
                     question, summaries, current_candidate, document or None,
                     material_note=material_note,
@@ -989,7 +1117,13 @@ def rag_stream():
                     try:
                         result = _TOOL_REGISTRY.execute(
                             name, arguments,
-                            context={"document": document or None},
+                            context={
+                                "document": document or None,
+                                # 导图工具：作用域隔离 + 一问一事务 + SSE 事件收集
+                                "scope": workspace_id,
+                                "transaction_id": mindmap_txn_id,
+                                "mindmap_events": mindmap_events,
+                            },
                         )
                     except Exception as exc:
                         yield emit("observation", {
@@ -998,6 +1132,10 @@ def rag_stream():
                             "tool_message": tr("api.tool_exec_failed", tool_label=tool_label, exc=exc),
                         })
                         break
+                    # 导图编辑先以增量差异实时落图，再给 observation 文本
+                    for mm_event in mindmap_events:
+                        yield emit("mindmap_diff", mm_event)
+                    mindmap_events.clear()
                     data = result.data or {}
                     papers = data.get("papers") or []
                     yield emit("observation", {
@@ -1112,6 +1250,51 @@ def state_put():
     project = _project_id_from_ws((body.get("project") or "").strip())
     db.save_app_state(project, _STATE_KEY, state)
     return jsonify({"ok": True})
+
+
+# ---------- 问答会话标题（首条提问 → AI 短标题） ----------
+_TITLE_MAX_CHARS = 40
+_TITLE_QUERY_MAX_CHARS = 1000
+
+
+@api.post("/chat/title")
+def chat_title():
+    body = request.get_json(silent=True) or {}
+    query = (body.get("query") or "").strip()
+    if not query:
+        raise ApiError(tr("api.chat_title.empty"))
+    query = re.sub(r"\s+", " ", query)[:_TITLE_QUERY_MAX_CHARS]
+    try:
+        client = LLMClient()
+    except LLMNotConfiguredError as err:
+        # 前端会静默保留本地占位标题，400 仅用于表达"标题服务不可用"
+        raise ApiError(str(err), 400) from err
+    system = (
+        "You generate a very short title for a research-assistant chat conversation, "
+        "based ONLY on the user's first message.\n"
+        "Rules:\n"
+        "1. Use the SAME language as the user's message "
+        "(a Chinese question must produce a Chinese title).\n"
+        "2. At most 20 CJK characters, or at most 8 English words; "
+        "capture the core topic, not the full sentence.\n"
+        "3. Output the title ONLY: no quotation marks, brackets, numbering, "
+        "a prefix such as \"Title:\" / \"标题：\", Markdown, explanation, "
+        "or trailing sentence punctuation."
+    )
+    resp = client.chat(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": query},
+        ],
+        temperature=0.2,
+    )
+    title = (resp.get("content") or "").strip()
+    # 清洗模型偶发的包装：标题前缀、引号/书名号、首尾句读与多余空白
+    title = re.sub(r"^\s*(?:标题|Title)\s*[:：]\s*", "", title, flags=re.IGNORECASE)
+    title = title.strip(" \t\r\n\"'“”‘’「」『』《》【】#*`")
+    title = re.sub(r"[。！？!?.,，：:；;…\s]+$", "", title).strip()
+    title = re.sub(r"\s+", " ", title)[:_TITLE_MAX_CHARS].strip()
+    return jsonify({"title": title})
 
 
 # ---------- 笔记 ----------

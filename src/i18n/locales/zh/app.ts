@@ -13,7 +13,7 @@ export default {
     research: '研究',
     researchDesc: '阅读 + RAG 问答',
     explore: '探索',
-    exploreDesc: '检索 + 知识图谱',
+    exploreDesc: '多源文献检索',
     settings: '设置',
     settingsDesc: '数据源与大模型服务',
   },

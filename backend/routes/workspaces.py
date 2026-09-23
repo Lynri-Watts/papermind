@@ -167,6 +167,11 @@ def delete_file(ws_id: str, rel_path: str):
         ws.delete_file(ws_id, rel_path)
     except ws.WorkspaceError as exc:
         raise ApiError(str(exc), 404) from exc
+    # PDF 是对应本地文献（local:<ws>:<path>）的权威副本：文件删除后清理
+    # 其 DB 全文缓存、PDF 状态、笔记/数据块及引用它的上下文条目，避免孤儿数据。
+    # 非 PDF（tex/bib/txt/md）无文献 id，不涉及关联数据。
+    if Path(rel_path).suffix.lower() == ".pdf":
+        db.delete_local_paper_data(_paper_id(ws_id, rel_path))
     return jsonify({"ok": True})
 
 

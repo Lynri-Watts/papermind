@@ -4,11 +4,13 @@ import {
   MessageCircle, Send, BookOpen, RefreshCw, Check, FileText, Plus, X,
   Globe, BarChart3, Table, TrendingUp, FileImage, Sigma,
   ExternalLink, Sparkles, Search, Settings2, ChevronLeft, ChevronRight, Square,
+  History, Trash2,
 } from 'lucide-react';
 import { queryRAGStream, cancelRagRun, RagStreamHandlers } from '../api';
-import { ChatMessage, ContextItem, DataBlock, ReactStep, ToolPaper } from '../types';
+import { ChatMessage, ChatMindmapEdit, ContextItem, DataBlock, ReactStep, ToolPaper } from '../types';
 import { usePaperMindStore } from '../store';
 import { addPaperContextItem, isPaperInContext } from '../lib/context';
+import { emitMindmapCommitted } from '../lib/mindmap/bridge';
 import AssistantMessage from '../components/AssistantMessage';
 import AddContextModal from '../components/AddContextModal';
 import ContextItemCard from '../components/ContextItemCard';
@@ -27,13 +29,18 @@ import ResizableDivider from '../components/ResizableDivider';
  */
 const QAPanel: React.FC = () => {
   // 命名单一命名空间 'qa'，本域键写相对路径（t('tab.qa')）；跨命名空间用冒号（t('common:action.clear')）。
-  const { t } = useTranslation('qa');
+  const { t, i18n } = useTranslation('qa');
   // ---- 面板开关 ----
   const qaPanelOpen = usePaperMindStore((s) => s.qaPanelOpen);
   const setQaPanelOpen = usePaperMindStore((s) => s.setQaPanelOpen);
   // ---- 面板宽度（可拖拽调整，持久化） ----
   const qaPanelWidth = usePaperMindStore((s) => s.qaPanelWidth);
   const setQaPanelWidth = usePaperMindStore((s) => s.setQaPanelWidth);
+  const setQaPanelResizing = usePaperMindStore((s) => s.setQaPanelResizing);
+  // 拖拽中的最新宽度：mousemove 监听注册在 mousedown 时刻，回调闭包拿不到
+  // 拖拽期间的新宽度，用 ref 做增量累加（每次移动在当前值上 +dx，不回跳）
+  const dragWidthRef = useRef(qaPanelWidth);
+  dragWidthRef.current = qaPanelWidth;
   // ---- 全局问答控制（持久化） ----
   const useContext = usePaperMindStore((s) => s.useContext);
   const setUseContext = usePaperMindStore((s) => s.setUseContext);
@@ -58,7 +65,11 @@ const QAPanel: React.FC = () => {
   const chatMessages = usePaperMindStore((s) => s.chatMessages);
   const addChatMessage = usePaperMindStore((s) => s.addChatMessage);
   const updateChatMessage = usePaperMindStore((s) => s.updateChatMessage);
-  const clearChatMessages = usePaperMindStore((s) => s.clearChatMessages);
+  const chatConversations = usePaperMindStore((s) => s.chatConversations);
+  const activeConversationId = usePaperMindStore((s) => s.activeConversationId);
+  const newChat = usePaperMindStore((s) => s.newChat);
+  const openConversation = usePaperMindStore((s) => s.openConversation);
+  const deleteConversation = usePaperMindStore((s) => s.deleteConversation);
   // ---- 上下文库 ----
   const contextItems = usePaperMindStore((s) => s.contextItems);
   const addContextItem = usePaperMindStore((s) => s.addContextItem);
@@ -74,6 +85,8 @@ const QAPanel: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [streamStage, setStreamStage] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  /** 历史会话列表面板（覆盖在消息区上） */
+  const [showHistory, setShowHistory] = useState(false);
   const [showCtxSelector, setShowCtxSelector] = useState(false);
   const [showAddContextModal, setShowAddContextModal] = useState(false);
   const [ctxTagFilter, setCtxTagFilter] = useState<string | null>(null);
@@ -83,6 +96,13 @@ const QAPanel: React.FC = () => {
     message: '',
     type: 'success',
   });
+
+  /**
+   * 提交防重入锁：在第一个 await **之前**同步置位。
+   * 否则在 ensureReadingFocusInContext 的网络等待窗口里（loading 态尚未渲染、
+   * 输入框也未清空），回车连发/连点发送会发出两条提问、打出两条气泡和两个后端请求。
+   */
+  const submittingRef = useRef(false);
 
   // 当前焦点论文：仅阅读视图下取激活标签（写作/搜索视图无"当前论文"）
   const paperId = currentView === 'research' ? (activeTabId ?? '') : '';
@@ -107,6 +127,11 @@ const QAPanel: React.FC = () => {
     setQaInputDraft('');
     setActiveTab('qa');
     setQaPanelOpen(true);
+    if (submittingRef.current) {
+      // 上一轮问答仍在生成：不静默丢问题，回填输入框供用户随后手动发送
+      setInput(text);
+      return;
+    }
     setInput(text);
     setTimeout(() => {
       handleSubmitWithText(text);
@@ -140,6 +165,13 @@ const QAPanel: React.FC = () => {
     let trail: ReactStep[] = [];
     let openIndex = -1; // 当前正在接收 Thought 增量的步骤（-1=无开放步骤）
     let seq = 0;
+    // 本次回答的导图事务编辑（mapId→记录），与 SSE 同步实时落消息，供结束后整事务撤销
+    const mindmapEditMap = new Map<string, ChatMindmapEdit>();
+    const syncMindmapEdits = () => {
+      updateChatMessage(assistantId, {
+        mindmapEdits: Array.from(mindmapEditMap.values()),
+      });
+    };
 
     const isOpen = (i: number) => i >= 0 && i < trail.length;
     const openStep = (): ReactStep => {
@@ -237,14 +269,41 @@ const QAPanel: React.FC = () => {
           openIndex = -1;
           sync();
         },
+        onSources: (sources) => {
+          // 出处先于回答增量到达：先把元数据挂到消息上，
+          // 行内引用卡片在生成中即有来源名与「定位原文」目标（quote 在 done 时补齐）
+          if (sources.length > 0) updateChatMessage(assistantId, { sourceDetails: sources });
+        },
         onDelta: (delta) => {
           answerText += delta;
           updateChatMessage(assistantId, { content: answerText });
         },
+        onMindmapDiff: (ev) => {
+          // 打开的画布走同一套外部差异管线（AI 编辑不进用户撤销栈）；
+          // 后挂载画布由 bridge 缓冲按版本回放
+          emitMindmapCommitted(ev.mapId, {
+            version: ev.version,
+            actions: ev.actions,
+            idMap: ev.idMap,
+            origin: 'ai',
+          });
+          mindmapEditMap.set(ev.mapId, {
+            mapId: ev.mapId,
+            transactionId: ev.transactionId,
+            version: ev.version,
+            workspaceId: usePaperMindStore.getState().activeWorkspaceId ?? null,
+          });
+          syncMindmapEdits();
+        },
+        onNotice: (message) => {
+          // 非阻断提示（如无材料降级通用知识回答）：挂消息上持久化展示，不替换正文
+          if (message) updateChatMessage(assistantId, { notice: message });
+        },
         onDone: (result) => {
           commit();
           updateChatMessage(assistantId, {
-            content: answerText || result.answer,
+            // 以服务端最终正文为准：流末本地回退的引用块只在 result.answer 里
+            content: result.answer || answerText,
             sources: result.sources,
             sourceDetails: result.sourceDetails,
             streaming: false,
@@ -311,13 +370,18 @@ const QAPanel: React.FC = () => {
   }, [openReaderTab, setCurrentView, showNotification, t]);
 
   // ---------- 引用定位：发出全局请求，由阅读器消费 ----------
-  const handleOpenSource = useCallback((sourceIndex: number, msg: ChatMessage) => {
+  const handleOpenSource = useCallback((
+    sourceIndex: number, msg: ChatMessage, quote?: string,
+  ) => {
     if (!msg.sourceDetails) return;
     const src = msg.sourceDetails.find((s) => s.index === sourceIndex);
     if (!src || !src.paper_id || !src.text) return;
     openReaderTab(src.paper_id, src.label || t('label.paper'));
     setCurrentView('research');
-    requestPdfLocate(src.paper_id, src.text);
+    // 优先用引用卡上的原句定位（短而精准，失败卡不可达此路径）；分块全文
+    // 兜底；PdfViewer 的多级匹配仍能再兜底
+    const locateText = quote?.trim() || src.quote?.trim() || src.text;
+    requestPdfLocate(src.paper_id, locateText);
   }, [openReaderTab, setCurrentView, requestPdfLocate, t]);
 
   // ---------- 显式文本提交（ReAct 自动流式：思考/动作/观察/回答 一体化输出） ----------
@@ -339,50 +403,59 @@ const QAPanel: React.FC = () => {
   };
 
   const handleSubmitWithText = async (query: string) => {
-    if (!query.trim()) return;
-    await ensureReadingFocusInContext();
-    // 精简历史：仅取之前的 user/assistant 文字（不含全文与出处详情）
-    const history = chatMessages
-      .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content && m.content.trim())
-      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content.trim().slice(0, 1500) }))
-      .slice(-6);
-    const userMessage: ChatMessage = {
-      id: `u${Date.now()}`,
-      content: query,
-      role: 'user',
-      timestamp: new Date().toISOString(),
-    };
-    addChatMessage(userMessage);
+    // 同步防重入：回车键连发、回车+点发送、阅读器选区提问的 setTimeout 都汇聚于此
+    if (!query.trim() || submittingRef.current) return;
+    submittingRef.current = true;
+    // 不等网络：先给输入框即时反馈（发送按钮随输入为空变灰），消除重复提交窗口
     setInput('');
-    const assistantId = `a${Date.now()}`;
-    const runId = (crypto.randomUUID?.() ?? `rag${Date.now()}_${Math.random().toString(36).slice(2)}`);
-    addChatMessage({
-      id: assistantId,
-      content: '',
-      role: 'assistant',
-      timestamp: new Date().toISOString(),
-      streaming: true,
-      toolCall: { runId, steps: [], cancelling: false },
-    });
-    await runReActAnswer(assistantId, runId, (handlers) =>
-      queryRAGStream(
-        {
-          paperId: paperId || undefined,
-          query,
-          useContext,
-          enableTool: toolEnabled,
-          contextIds: pinnedCtxIds,
-          excludeIds: excludedCtxIds,
-          history,
-          // 写作视图：携带当前 LaTeX 全文，AI 可经 read_document 工具主动读取（不随提问注入）
-          document: currentView === 'workspace' ? latexContent : '',
-          // 上下文库按工作区隔离：RAG 只检索当前工作区的上下文
-          workspaceId: usePaperMindStore.getState().activeWorkspaceId ?? undefined,
-          runId,
-        },
-        handlers
-      )
-    );
+    // 提问时收起历史面板，让用户看到流式回答
+    setShowHistory(false);
+    try {
+      await ensureReadingFocusInContext();
+      // 精简历史：仅取之前的 user/assistant 文字（不含全文与出处详情）
+      const history = chatMessages
+        .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content && m.content.trim())
+        .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content.trim().slice(0, 1500) }))
+        .slice(-6);
+      const userMessage: ChatMessage = {
+        id: `u${Date.now()}`,
+        content: query,
+        role: 'user',
+        timestamp: new Date().toISOString(),
+      };
+      addChatMessage(userMessage);
+      const assistantId = `a${Date.now()}`;
+      const runId = (crypto.randomUUID?.() ?? `rag${Date.now()}_${Math.random().toString(36).slice(2)}`);
+      addChatMessage({
+        id: assistantId,
+        content: '',
+        role: 'assistant',
+        timestamp: new Date().toISOString(),
+        streaming: true,
+        toolCall: { runId, steps: [], cancelling: false },
+      });
+      await runReActAnswer(assistantId, runId, (handlers) =>
+        queryRAGStream(
+          {
+            paperId: paperId || undefined,
+            query,
+            useContext,
+            enableTool: toolEnabled,
+            contextIds: pinnedCtxIds,
+            excludeIds: excludedCtxIds,
+            history,
+            // 写作视图：携带当前 LaTeX 全文，AI 可经 read_document 工具主动读取（不随提问注入）
+            document: currentView === 'workspace' ? latexContent : '',
+            // 上下文库按工作区隔离：RAG 只检索当前工作区的上下文
+            workspaceId: usePaperMindStore.getState().activeWorkspaceId ?? undefined,
+            runId,
+          },
+          handlers
+        )
+      );
+    } finally {
+      submittingRef.current = false;
+    }
   };
 
   const handleSubmit = async () => {
@@ -390,10 +463,60 @@ const QAPanel: React.FC = () => {
     await handleSubmitWithText(input);
   };
 
+  // ---------- 会话归档 / 历史 ----------
+  /** 归档当前对话并开始新对话（消息已随首问建档，保留在历史列表中） */
+  const handleNewChat = useCallback(() => {
+    if (chatMessages.length === 0) return;
+    newChat();
+    setShowHistory(false);
+    showNotification(t('notice.chatArchived'), 'success');
+  }, [chatMessages.length, newChat, t, showNotification]);
+
+  const handleOpenConversation = useCallback((id: string) => {
+    // 流式回答进行中禁止切换：否则在途 token 会写丢（找不到消息目标）
+    if (loading) return;
+    openConversation(id);
+    setShowHistory(false);
+  }, [loading, openConversation]);
+
+  const handleDeleteConversation = useCallback((id: string, title: string) => {
+    // 正在生成的会话不可删除（同上，避免在途更新悬挂）
+    if (loading && id === activeConversationId) return;
+    if (!window.confirm(t('history.deleteConfirm', { title }))) return;
+    deleteConversation(id);
+  }, [loading, activeConversationId, deleteConversation, t]);
+
+  /** 会话时间：今年显示月日时分，跨年附带年份 */
+  const formatConversationTime = useCallback((iso: string): string => {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return '';
+    const sameYear = date.getFullYear() === new Date().getFullYear();
+    return new Intl.DateTimeFormat(i18n.language?.startsWith('zh') ? 'zh-CN' : 'en-US', sameYear
+      ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }
+      : { year: 'numeric', month: 'short', day: 'numeric' }).format(date);
+  }, []);
+
+  /** 当前查看的历史会话（用于标题条） */
+  const activeConversation = chatConversations.find((c) => c.id === activeConversationId) ?? null;
+
   const handleCopy = async (messageId: string, content: string) => {
     await navigator.clipboard.writeText(content);
     setCopiedId(messageId);
     setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  /** 回写某条回答中某张导图的 AI 编辑状态（撤销成功 / 用户选择保留），随消息持久化 */
+  const handleMindmapEditChange = (
+    messageId: string,
+    mapId: string,
+    patch: Partial<ChatMindmapEdit>,
+  ) => {
+    const message = chatMessages.find((m) => m.id === messageId);
+    if (!message?.mindmapEdits) return;
+    updateChatMessage(messageId, {
+      mindmapEdits: message.mindmapEdits.map((e) =>
+        e.mapId === mapId ? { ...e, ...patch } : e),
+    });
   };
 
   // ---------- 上下文库操作 ----------
@@ -588,8 +711,16 @@ const QAPanel: React.FC = () => {
 
   return (
     <div className="h-full flex">
-      {/* 可拖拽分隔条：调宽 AI 面板（范围 300-640，持久化） */}
-      <ResizableDivider onDelta={(dx) => setQaPanelWidth(qaPanelWidth + dx)} />
+      {/* 可拖拽分隔条：调宽 AI 面板（范围 300-640，持久化）。
+          拖拽中置 qaPanelResizing：阅读器暂停 fit-width 重排，松手后一次性应用 */}
+      <ResizableDivider
+        onDelta={(dx) => {
+          const next = dragWidthRef.current + dx;
+          dragWidthRef.current = next;
+          setQaPanelWidth(next);
+        }}
+        onDraggingChange={setQaPanelResizing}
+      />
       <div
         style={{ width: qaPanelWidth }}
         className="flex-shrink-0 border-l border-border bg-surface flex flex-col overflow-hidden"
@@ -634,13 +765,34 @@ const QAPanel: React.FC = () => {
           </div>
 
           {activeTab === 'qa' && (
-            <button
-              onClick={clearChatMessages}
-              className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-textSecondary hover:text-text hover:border-red-400 transition-colors text-xs"
-              title={t('panel.clearChat')}
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-            </button>
+            <>
+              <button
+                onClick={() => setShowHistory((v) => !v)}
+                className={`relative flex items-center gap-1 px-2 py-1.5 rounded-lg transition-colors text-xs ${
+                  showHistory
+                    ? 'text-text bg-background border border-border'
+                    : 'text-textSecondary hover:text-text border border-transparent'
+                }`}
+                title={t('panel.history')}
+                aria-label={t('panel.history')}
+              >
+                <History className="w-3.5 h-3.5" />
+                {chatConversations.length > 0 && (
+                  <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-0.5 rounded-full bg-accent text-white text-[9px] leading-[14px] text-center">
+                    {chatConversations.length > 99 ? '99+' : chatConversations.length}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={handleNewChat}
+                disabled={loading || chatMessages.length === 0}
+                className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-textSecondary hover:text-text hover:border-red-400 disabled:opacity-35 disabled:hover:border-transparent transition-colors text-xs border border-transparent"
+                title={t('panel.newChat')}
+                aria-label={t('panel.newChat')}
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+            </>
           )}
           {activeTab === 'context' && (
             <button
@@ -697,7 +849,24 @@ const QAPanel: React.FC = () => {
             </div>
           </div>
 
-          <div className="flex-1 overflow-auto p-3">
+          <div className="flex-1 flex flex-col min-h-0 relative">
+            {/* 当前会话标题条（首问建档后显示，AI 标题生成中带指示） */}
+            {activeConversation && (
+              <div className="flex items-center gap-1.5 px-3 py-1.5 bg-surface border-b border-border min-w-0">
+                <MessageCircle className="w-3 h-3 text-textSecondary flex-shrink-0" />
+                <span className="text-[11px] font-medium text-textSecondary truncate">
+                  {activeConversation.title}
+                </span>
+                {activeConversation.titlePending && (
+                  <span className="flex items-center gap-1 text-[10px] text-textSecondary/70 flex-shrink-0">
+                    <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+                    {t('title.generating')}
+                  </span>
+                )}
+              </div>
+            )}
+
+            <div className="flex-1 overflow-auto p-3">
             <div className="space-y-3">
               {chatMessages.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-12 text-textSecondary">
@@ -715,9 +884,10 @@ const QAPanel: React.FC = () => {
                     streamStage={streamStage}
                     copiedId={copiedId}
                     onCopy={handleCopy}
-                    onOpenSource={(idx) => handleOpenSource(idx, message)}
+                    onOpenSource={(idx, quote) => handleOpenSource(idx, message, quote)}
                     onAddToContext={handleAddToolPaperToContext}
                     onOpenPaper={handleOpenToolPaper}
+                    onMindmapEditChange={handleMindmapEditChange}
                   />
                 ) : (
                   <div key={message.id} className="flex justify-end">
@@ -733,6 +903,98 @@ const QAPanel: React.FC = () => {
                 )
               ))}
             </div>
+          </div>
+
+            {/* 历史会话覆盖层：重开 / 删除归档会话 */}
+            {showHistory && (
+              <div className="absolute inset-0 z-10 bg-surface flex flex-col shadow-xl">
+                <div className="flex items-center justify-between px-3 py-2.5 border-b border-border">
+                  <span className="flex items-center gap-1.5 text-xs font-medium text-text">
+                    <History className="w-3.5 h-3.5 text-textSecondary" />
+                    {t('history.title')}
+                  </span>
+                  <button
+                    onClick={() => setShowHistory(false)}
+                    className="p-1 rounded-md text-textSecondary hover:text-text hover:bg-background transition-colors"
+                    title={t('history.close')}
+                    aria-label={t('history.close')}
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <div className="flex-1 overflow-auto p-2">
+                  {chatConversations.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-12 text-textSecondary">
+                      <History className="w-7 h-7 mb-2.5 opacity-40" />
+                      <p className="text-xs text-center px-6 leading-relaxed">{t('history.empty')}</p>
+                    </div>
+                  ) : (
+                    <ul className="space-y-1">
+                      {[...chatConversations]
+                        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+                        .map((conv) => {
+                          const isActive = conv.id === activeConversationId;
+                          return (
+                            <li key={conv.id}>
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                aria-disabled={loading}
+                                onClick={() => handleOpenConversation(conv.id)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    handleOpenConversation(conv.id);
+                                  }
+                                }}
+                                className={`group flex items-center gap-2 w-full px-2.5 py-2 rounded-lg text-left transition-colors ${
+                                  isActive
+                                    ? 'bg-primary/10 ring-1 ring-primary/30'
+                                    : 'hover:bg-background'
+                                } ${loading ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                              >
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-1.5 min-w-0">
+                                    <span className={`text-xs truncate ${isActive ? 'text-primary font-medium' : 'text-text'}`}>
+                                      {conv.title}
+                                    </span>
+                                    {conv.titlePending && (
+                                      <span className="flex-shrink-0 flex items-center gap-1 text-[10px] text-textSecondary/70">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+                                        {t('title.generating')}
+                                      </span>
+                                    )}
+                                    {isActive && (
+                                      <span className="flex-shrink-0 text-[10px] text-primary">{t('history.current')}</span>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-2 mt-0.5 text-[10px] text-textSecondary/80">
+                                    <span>{formatConversationTime(conv.updatedAt)}</span>
+                                    <span>·</span>
+                                    <span>{t('history.messageCount', { count: conv.messages.filter((m) => m.role === 'user').length })}</span>
+                                  </div>
+                                </div>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteConversation(conv.id, conv.title);
+                                  }}
+                                  className="flex-shrink-0 p-1 rounded-md text-textSecondary/60 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+                                  title={t('history.delete')}
+                                  aria-label={t('history.delete')}
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </li>
+                          );
+                        })}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="px-3 py-2.5 border-t border-border bg-surface">

@@ -8,9 +8,26 @@ export default {
   panel: {
     expand: 'Expand AI assistant',
     collapse: 'Collapse AI assistant',
-    clearChat: 'Clear chat',
+    /** Archive the current conversation (kept in history) and start a new one */
+    newChat: 'Archive chat & start new',
+    /** Open the conversation history panel */
+    history: 'Chat history',
     /** Context tab header: specialized for adding an external web link */
     addExternalLink: 'Add external link',
+  },
+  history: {
+    title: 'Chat history',
+    empty: 'No conversations yet. Once you ask your first question, the chat will be saved here.',
+    close: 'Close history',
+    current: 'Current',
+    resume: 'Resume conversation',
+    delete: 'Delete conversation',
+    deleteConfirm: 'Delete conversation "{{title}}"? This cannot be undone.',
+    messageCount_one: '{{count}} question',
+    messageCount_other: '{{count}} questions',
+  },
+  title: {
+    generating: 'Generating title…',
   },
   focus: {
     reading: 'Reading focus: {{title}}',
@@ -93,6 +110,7 @@ export default {
     openedInReader: 'Opened in reader: {{title}}',
     contextInserted: 'Context inserted into the paper (before Conclusion; can be accepted)',
     dataBlockAdded: '{{type}} added to paper',
+    chatArchived: 'Conversation archived; you can reopen it from chat history',
   },
   label: {
     paper: 'paper',

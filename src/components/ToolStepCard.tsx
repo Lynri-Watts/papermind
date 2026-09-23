@@ -1,9 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  Check, ChevronDown, ChevronRight, ExternalLink, Loader2, Plus, X,
+  Check, ChevronDown, ChevronRight, ExternalLink, ListTree, Loader2, Plus, X,
 } from 'lucide-react';
 import { ReactStep, ToolPaper } from '../types';
+
+/** 思维导图类工具（步骤头加专属标识） */
+const MINDMAP_TOOLS = new Set([
+  'list_mindmaps', 'create_mindmap', 'read_mindmap',
+  'edit_mindmap', 'attach_paper_to_mindmap',
+]);
 
 interface ToolStepCardProps {
   /** 一个 ReAct 步骤（Thought → Action → Observation；纯思考/工具调用均支持） */
@@ -77,6 +83,7 @@ const ToolStepCard: React.FC<ToolStepCardProps> = ({
   const obsText = step.observation ?? (step as unknown as { toolMessage?: string }).toolMessage;
   const isPureThought = !step.toolName; // 纯思考步骤（如 READY 直接回答）
   const hasAction = Boolean(onAddToContext || onOpenPaper);
+  const isMindmapTool = Boolean(step.toolName && MINDMAP_TOOLS.has(step.toolName));
 
   const toolName = step.toolLabel || step.toolName || '';
   const headerTitle = rejected
@@ -118,6 +125,12 @@ const ToolStepCard: React.FC<ToolStepCardProps> = ({
         </span>
         <span className="min-w-0 flex-1 truncate text-[11px] text-textSecondary">
           <span className="font-medium text-text">{headerTitle}</span>
+          {isMindmapTool && (
+            <span className="ml-1.5 inline-flex items-center gap-0.5 rounded bg-primary/15 px-1 py-px text-[9px] font-medium text-primary align-baseline">
+              <ListTree className="w-2.5 h-2.5" />
+              {t('mindmap:ai.stepBadge')}
+            </span>
+          )}
           {rejected && <span className="ml-1 text-textSecondary/60">{t('title.rejectedHint')}</span>}
         </span>
         {expandable && (

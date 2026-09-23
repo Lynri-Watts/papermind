@@ -1,15 +1,17 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
-import { LayoutGrid, BookOpen, Search, MessageCircle, Menu, X, Home as HomeIcon, FolderOpen, Settings as SettingsIcon } from 'lucide-react';
+import { LayoutGrid, BookOpen, Search, MessageCircle, Menu, X, Home as HomeIcon, FolderOpen, Settings as SettingsIcon, Loader2 } from 'lucide-react';
 import Home from './pages/Home';
 import Workspace from './pages/Workspace';
 import DeepResearch from './pages/DeepResearch';
 import Explore from './pages/Explore';
+// 导图页较重（React Flow + mermaid 预览），路由级懒加载：不进首屏主包
+const Mindmaps = lazy(() => import('./pages/Mindmaps'));
 import SettingsPage from './pages/Settings';
 import QAPanel from './components/QAPanel';
 import { usePaperMindStore, initPersistence, WRITING_ENABLED } from './store';
 
-type ViewType = 'home' | 'workspace' | 'research' | 'explore' | 'settings';
+type ViewType = 'home' | 'workspace' | 'research' | 'explore' | 'mindmaps' | 'settings';
 
 export default function App() {
   // 命名单一命名空间 'app'，键一律写相对路径（t('nav.home')）；
@@ -70,6 +72,16 @@ export default function App() {
         return <DeepResearch />;
       case 'explore':
         return <Explore />;
+      case 'mindmaps':
+        return (
+          <Suspense fallback={
+            <div className="flex h-full items-center justify-center text-textSecondary">
+              <Loader2 className="animate-spin" size={20} />
+            </div>
+          }>
+            <Mindmaps />
+          </Suspense>
+        );
       case 'settings':
         return <SettingsPage />;
       default:

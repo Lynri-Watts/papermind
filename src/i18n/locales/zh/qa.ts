@@ -8,9 +8,25 @@ export default {
   panel: {
     expand: '展开 AI 助手',
     collapse: '折叠 AI 助手',
-    clearChat: '清空对话',
+    /** 归档当前对话（消息保留在历史列表）并开始新对话 */
+    newChat: '归档当前对话并新建',
+    /** 打开历史会话列表面板 */
+    history: '历史会话',
     /** 上下文标签页头部：特化为添加外部网页链接 */
     addExternalLink: '添加外部链接',
+  },
+  history: {
+    title: '历史会话',
+    empty: '暂无历史会话。完成一次提问后，对话会自动保存在这里。',
+    close: '关闭历史列表',
+    current: '当前',
+    resume: '继续对话',
+    delete: '删除会话',
+    deleteConfirm: '确定删除会话「{{title}}」？删除后不可恢复。',
+    messageCount: '{{count}} 次提问',
+  },
+  title: {
+    generating: '生成标题中…',
   },
   focus: {
     reading: '阅读焦点：{{title}}',
@@ -93,6 +109,7 @@ export default {
     openedInReader: '已在阅读器中打开：{{title}}',
     contextInserted: 'Context 已插入论文（Conclusion 前，可接受）',
     dataBlockAdded: '{{type}} 已插入论文',
+    chatArchived: '当前对话已归档，可在历史会话中重新打开',
   },
   label: {
     paper: '论文',

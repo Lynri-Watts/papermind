@@ -153,6 +153,52 @@ body {
   height: 100%;
 }
 
+/* ---------- 思维导图（React Flow）深色控件：仅作用于 .mm-dark 画布 ---------- */
+.mm-dark .react-flow__controls {
+  border: 1px solid #334155;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.mm-dark .react-flow__controls-button {
+  background: #1E293B;
+  border-bottom: 1px solid #334155;
+  width: 26px;
+  height: 26px;
+}
+
+.mm-dark .react-flow__controls-button:last-child {
+  border-bottom: none;
+}
+
+.mm-dark .react-flow__controls-button:hover,
+.mm-dark .react-flow__controls-button:focus {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.mm-dark .react-flow__controls-button svg {
+  fill: #94A3B8;
+}
+
+.mm-dark .react-flow__controls-button:hover svg {
+  fill: #F8FAFC;
+}
+
+.mm-dark .react-flow__minimap {
+  border: 1px solid #334155;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.mm-dark .react-flow__attribution {
+  background: rgba(30, 41, 59, 0.75);
+}
+
+.mm-dark .react-flow__attribution a {
+  color: #64748b;
+}
+
 .animate-pulse-slow {
   animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }

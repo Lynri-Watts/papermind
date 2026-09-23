@@ -22,6 +22,11 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.tool_label.read_paper": "读取论文全文",
         "api.tool_label.read_document": "读取当前文档",
         "api.tool_label.read_materials": "读取候选材料",
+        "api.tool_label.list_mindmaps": "列出思维导图",
+        "api.tool_label.create_mindmap": "新建思维导图",
+        "api.tool_label.read_mindmap": "读取思维导图",
+        "api.tool_label.edit_mindmap": "编辑思维导图",
+        "api.tool_label.attach_paper_to_mindmap": "论文加入导图",
         # 列表 / 省略拼接
         "api.separator.list": "、",
         "api.separator.reason": "；",
@@ -43,6 +48,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.reason.fulltext_missing": "未获取到全文",
         "api.reason.no_usable_content": "没有可用的正文内容",
         "api.read_fail.paper": "「{title}」：{reason}",
+        "api.read_fail.paper_abstract_only": "「{title}」全文不可得（{reason}），已降级为仅依据摘要",
         "api.read_fail.context": "上下文「{title}」：{reason}",
         "api.read_fail.context_gone": "上下文项 #{sid}：已不存在，可能被删除",
         # 候选材料读取结果（observation / 内部读取情况）
@@ -50,12 +56,19 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.read_materials.read_ok": "已读取 {n} 项候选材料：{shown}",
         "api.read_materials.empty": "内容为空",
         "api.read_materials.some_failed": "；{n} 项未能读取：{reasons}",
+        "api.read_materials.some_degraded": "；{n} 项降级使用（如仅有摘要）：{reasons}",
         "api.read_materials.none_usable": "所选材料均无可用正文",
         "api.read_materials.all_failed": "候选材料均未能读取：{reasons}",
         # 回答生成
-        "api.answer.no_material": "没有可用于回答的材料：未打开论文、上下文库为空且未检索到文献。"
-                                  "可先打开论文、添加上下文，或让 AI 检索外部文献/读取当前文档。",
-        "api.answer.reason_suffix": "（原因：{note}）",
+        "api.answer.no_material_notice":
+            "当前没有可引用的文献材料（未打开论文、上下文库为空，也未检索到可读文献）。"
+            "以下回答由 AI 基于通用知识生成，未经材料核实，请注意甄别；"
+            "打开论文或添加上下文后即可获得有据可依的回答。",
+        "api.answer.no_material_with_note":
+            "材料未能成功读取（{note}）。以下回答未引用任何文献，"
+            "由 AI 基于通用知识生成，请注意甄别；可尝试刷新论文 PDF 或添加上下文。",
+        "api.answer.no_passages_notice":
+            "已有材料中没有可解析的正文段落（{note}）。以下回答由 AI 基于通用知识生成，请注意甄别。",
         # 材料兜底展示名
         "api.material_label.paper": "论文",
         "api.material_label.document": "当前文档",
@@ -75,6 +88,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         # state / 笔记 / 上下文库 / 数据块
         "api.title_required": "title 不能为空",
         "api.state.invalid": "state 必须是 JSON 对象",
+        "api.chat_title.empty": "query 不能为空",
         "api.note.empty": "笔记内容不能为空",
         "api.context.invalid_type": "type 必须是 paper/url 之一",
         "api.context.paper_requires_id": "paper 类型需要提供 paper_id",
@@ -101,6 +115,11 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.tool_label.read_paper": "Read paper full text",
         "api.tool_label.read_document": "Read current document",
         "api.tool_label.read_materials": "Read candidate materials",
+        "api.tool_label.list_mindmaps": "List mind maps",
+        "api.tool_label.create_mindmap": "Create mind map",
+        "api.tool_label.read_mindmap": "Read mind map",
+        "api.tool_label.edit_mindmap": "Edit mind map",
+        "api.tool_label.attach_paper_to_mindmap": "Attach paper to mind map",
         # List / truncation joining
         "api.separator.list": ", ",
         "api.separator.reason": "; ",
@@ -122,6 +141,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.reason.fulltext_missing": "Full text not retrieved",
         "api.reason.no_usable_content": "No usable body content",
         "api.read_fail.paper": "\"{title}\": {reason}",
+        "api.read_fail.paper_abstract_only": "\"{title}\": full text unavailable ({reason}); fell back to the abstract only",
         "api.read_fail.context": "Context \"{title}\": {reason}",
         "api.read_fail.context_gone": "Context item #{sid}: no longer exists; it may have been deleted",
         # Candidate material read result (observation / internal read note)
@@ -129,13 +149,22 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.read_materials.read_ok": "Read {n} candidate material item(s): {shown}",
         "api.read_materials.empty": "no content",
         "api.read_materials.some_failed": "; {n} item(s) could not be read: {reasons}",
+        "api.read_materials.some_degraded": "; {n} item(s) used in degraded form (e.g. abstract only): {reasons}",
         "api.read_materials.none_usable": "None of the selected materials has usable body content",
         "api.read_materials.all_failed": "No candidate material could be read: {reasons}",
         # Answer generation
-        "api.answer.no_material": "No material is available to answer with: no paper is open, the context "
-                                  "library is empty, and no literature was retrieved. Open a paper, add "
-                                  "context, or ask the AI to search external literature or read the current document.",
-        "api.answer.reason_suffix": " (Reason: {note})",
+        "api.answer.no_material_notice":
+            "No citable material is available right now (no paper is open, the context library is "
+            "empty, and no readable literature was retrieved). The answer below is generated from the "
+            "AI's general knowledge without source verification — please judge it carefully. Open a "
+            "paper or add context to get a source-grounded answer.",
+        "api.answer.no_material_with_note":
+            "The material could not be read ({note}). The answer below cites no literature and is "
+            "generated from the AI's general knowledge; please judge it carefully. Try refreshing the "
+            "paper's PDF or adding context.",
+        "api.answer.no_passages_notice":
+            "The available material contains no parseable body passages ({note}). The answer below is "
+            "generated from the AI's general knowledge; please judge it carefully.",
         # Fallback material display names
         "api.material_label.paper": "Paper",
         "api.material_label.document": "Current document",
@@ -155,6 +184,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         # state / notes / context library / data blocks
         "api.title_required": "title cannot be empty",
         "api.state.invalid": "state must be a JSON object",
+        "api.chat_title.empty": "query cannot be empty",
         "api.note.empty": "Note content cannot be empty",
         "api.context.invalid_type": "type must be one of paper/url",
         "api.context.paper_requires_id": "paper type requires paper_id",

@@ -50,26 +50,6 @@ export default {
     addedAction: 'In context',
     alreadyInContext: 'This paper is already in the context library',
   },
-  graph: {
-    title: 'Knowledge Graph',
-    nodesCount_one: '({{count}} node)',
-    nodesCount_other: '({{count}} nodes)',
-    zoomOut: 'Zoom Out',
-    zoomIn: 'Zoom In',
-    loading: 'Loading graph...',
-    unavailable: 'Knowledge Graph is not available yet',
-    unavailableHint: 'This feature is under development. Search papers in the left panel instead.',
-    legend: {
-      paper: 'Paper',
-      author: 'Author',
-      topic: 'Topic',
-      cites: 'Cites',
-    },
-  },
-  node: {
-    related: 'Related',
-    searchInPapers: 'Search in Papers',
-  },
   detail: {
     title: 'Paper Details',
     close: 'Close details',

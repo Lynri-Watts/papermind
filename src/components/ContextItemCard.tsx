@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { BookOpen, Check, ChevronDown, ChevronUp, ExternalLink, Eye, FileText, Globe, Pencil, Plus, RefreshCw, Tag, X } from 'lucide-react';
 import { ContextItem } from '../types';
 import { deleteContextItem, getContextContent, refreshContextItem, retryContextPaperPdf, updateContextItem } from '../api';
+import AddToMindmapButton from './mindmap/AddToMindmapButton';
 
 interface ContextItemCardProps {
   item: ContextItem;
@@ -253,6 +254,17 @@ const ContextItemCard: React.FC<ContextItemCardProps> = ({ item, onDelete, onCha
             >
               <BookOpen className="w-3.5 h-3.5" />
             </button>
+          )}
+          {isPaper && item.paperId && (
+            <AddToMindmapButton
+              paperId={item.paperId}
+              paperTitle={item.title}
+              defaultMapTitle={t('mindmap:gallery.newMapTitle')}
+              className="p-1.5 rounded-lg hover:bg-indigo-100 transition-colors"
+              onResult={(r) => {
+                if (r.kind === 'error') onError(r.message);
+              }}
+            />
           )}
           {onInsert && (
             <button
