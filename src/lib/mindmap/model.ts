@@ -13,6 +13,7 @@ import type {
   MindmapDoc,
   MindmapNode,
   MindmapNodeKind,
+  MindmapNodeShape,
   MindmapAction,
   MindmapDeleteStrategy,
 } from '../../types';
@@ -20,6 +21,8 @@ import type {
 /** paperId 必须形如 "source:external_id"（含 local:<...>），与后端 PAPER_ID_RE 一致。 */
 const PAPER_ID_RE = /^[A-Za-z0-9_.\-]+:[^\s]+$/;
 const VALID_KINDS: MindmapNodeKind[] = ['topic', 'paper'];
+/** 与后端 VALID_SHAPES 一致；缺省（旧文档）按 default 处理 */
+const VALID_SHAPES: MindmapNodeShape[] = ['default', 'rect', 'rounded', 'circle', 'hexagon'];
 
 /** 结构化导图错误：携带 i18n 键与插值参数（对齐后端 MindmapError）。 */
 export class MindmapError extends Error {
@@ -57,6 +60,7 @@ export function newNodeId(existing: Set<string> = new Set()): string {
 
 export interface MakeNodeOptions {
   kind?: MindmapNodeKind;
+  shape?: MindmapNodeShape;
   paperId?: string | null;
   x?: number;
   y?: number;
@@ -76,6 +80,7 @@ export function makeNode(
     order,
     text,
     kind: opts.kind ?? 'topic',
+    shape: opts.shape ?? (parentId === null ? 'circle' : 'default'),
     paperId: opts.paperId ?? null,
     x: opts.x ?? 0,
     y: opts.y ?? 0,
@@ -169,6 +174,9 @@ export function validateDoc(doc: unknown): asserts doc is MindmapDoc {
     if (!VALID_KINDS.includes(n.kind)) {
       throw new MindmapError('mindmap.invalid_kind', { id: n.id, kind: String(n.kind) });
     }
+    if (n.shape !== undefined && !VALID_SHAPES.includes(n.shape)) {
+      throw new MindmapError('mindmap.invalid_shape', { id: n.id, shape: String(n.shape) });
+    }
     if (n.kind === 'paper') {
       if (typeof n.paperId !== 'string' || !n.paperId) {
         throw new MindmapError('mindmap.paper_id_required', { id: n.id });
@@ -257,6 +265,17 @@ function asCoord(value: unknown, nodeId: string): number {
   return value;
 }
 
+/** 形状缺省：根 circle（规范序列化恒为 ((x))），其余 default；非法值拒绝。 */
+function asShape(value: unknown, nodeId: string, isRoot = false): MindmapNodeShape {
+  if (value === undefined || value === null || value === '') {
+    return isRoot ? 'circle' : 'default';
+  }
+  if (typeof value !== 'string' || !VALID_SHAPES.includes(value as MindmapNodeShape)) {
+    throw new MindmapError('mindmap.invalid_shape', { id: nodeId, shape: String(value) });
+  }
+  return value as MindmapNodeShape;
+}
+
 function opAdd(
   doc: MindmapDoc,
   action: RawAction,
@@ -305,6 +324,7 @@ function opAdd(
   if (typeof text !== 'string') {
     throw new MindmapError('mindmap.text_invalid', { id: nodeId });
   }
+  const shape = asShape(action.shape, nodeId, parentId === null);
   const x = asCoord(action.x ?? 0, nodeId);
   const y = asCoord(action.y ?? 0, nodeId);
 
@@ -319,7 +339,9 @@ function opAdd(
     throw new MindmapError('mindmap.order_invalid', { id: nodeId });
   }
 
-  nodes.push(makeNode(nodeId, parentId, order, text, { kind, paperId, x, y }));
+  nodes.push(makeNode(nodeId, parentId, order, text, {
+    kind, shape, paperId, x, y,
+  }));
   normalizeOrders(doc);
 }
 
@@ -351,6 +373,9 @@ function opUpdate(node: MindmapNode, action: RawAction): void {
     }
     node.kind = kind;
     node.paperId = paperId;
+  }
+  if (Object.prototype.hasOwnProperty.call(action, 'shape')) {
+    node.shape = asShape(action.shape, node.id, node.parentId === null);
   }
   if (Object.prototype.hasOwnProperty.call(action, 'x')) {
     node.x = asCoord(action.x, node.id);
@@ -612,6 +637,7 @@ export function diffDocs(from: MindmapDoc, to: MindmapDoc): MindmapAction[] {
       parentId: n.parentId,
       text: n.text,
       kind: n.kind,
+      shape: n.shape ?? (n.parentId === null ? 'circle' : 'default'),
       paperId: n.paperId,
       x: n.x,
       y: n.y,
@@ -678,6 +704,12 @@ export function diffDocs(from: MindmapDoc, to: MindmapDoc): MindmapAction[] {
     if (cur.kind !== old.kind || cur.paperId !== old.paperId) {
       patch.kind = cur.kind;
       patch.paperId = cur.paperId;
+      dirty = true;
+    }
+    const curShape = cur.shape ?? (cur.parentId === null ? 'circle' : 'default');
+    const oldShape = old.shape ?? (old.parentId === null ? 'circle' : 'default');
+    if (curShape !== oldShape) {
+      patch.shape = curShape;
       dirty = true;
     }
     if (cur.x !== old.x) { patch.x = cur.x; dirty = true; }

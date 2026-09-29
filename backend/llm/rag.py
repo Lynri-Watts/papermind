@@ -1,290 +1,40 @@
-"""RAG：全文分块 + BM25 检索 + LLM 问答（支持多源 Context）。
+"""RAG：材料直注 + LLM 问答（支持多源 Context）。
 
-流程：
-1. 对每个数据源（当前论文 / context 项）的全文按句子边界分块
-2. 用户问题用 BM25（非负 IDF）检索最相关分块
-3. 汇总相关分块作为"上下文"拼接进 prompt，调用 LLM
-4. 返回答案 + 出处分块（含来源 label，前端可标注 context）
+流程（2026-09-28 起取消 BM25 检索——用户明确要求"完全通过工具层"）：
+
+1. 该读哪些材料由 LLM 在 ReAct 工具循环里自行决定并读取（``llm/tools.py``
+   的 ``read_paper`` / ``read_context`` / ``read_document``）：工具回执里
+   ``data["fulltexts"]`` / ``data["document"]`` 的正文进入材料池
+   （``routes/papers.py`` 的 ``_merge_material``），当前打开的论文与上下文
+   条目**都不自动注入**，只在提示词里被建议读取；
+2. 材料池里的每一条材料**原样**成为一个 ``[Source N]`` 段落注入最终 prompt，
+   不再分块、不再检索、不再截 TOP_K——"AI 没有打开应该打开的文章"正是因为
+   旧检索在词面零重合时（如中文提问检索英文论文）只喂了论文开头几块，模型
+   据此以为材料里没有相关内容；
+3. LLM 流式生成回答，行内引用 ``[Q]逐字原句||行内文字[/Q]`` 在流末统一绑定
+   出处（见下方"行内引用"一节）。
+
+系统只负责如实呈现工具读到的内容：是否读到、读到了多少，完全由工具调用
+本身决定；引用核对时忽略页码/页眉页脚噪声（``services/textmatch``）。
 """
 from __future__ import annotations
 
-import math
 import re
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
 
 from llm.client import LLMClient, LLMNotConfiguredError
 from i18n import tr
+from services import textmatch
 
-CHUNK_SIZE = 900
-CHUNK_OVERLAP = 150
-TOP_K = 4
-MAX_CONTEXT_SELECT = 4
-MAX_SUMMARY_LIST = 30
 # 精简历史：最多保留最近 N 轮、每轮最多 M 字符，控制 token 用量
 MAX_HISTORY_MESSAGES = 6
 MAX_HISTORY_CHARS = 1500
 
-# 常见缩写：其句号不表示句子边界，分块前先保护，避免把 "Fig. 1" 误切成两段
-_ABBR_WORDS = [
-    "e.g", "i.e", "et al", "etc", "Fig", "Figs", "Eq", "Eqs", "Ref", "Refs",
-    "Sec", "Secs", "Sect", "Sects", "Tab", "Tabs", "Vol", "Vols", "pp", "No",
-    "nos", "vs", "cf", "ca", "approx", "Dr", "Mr", "Mrs", "Ms", "Prof", "St",
-    "Mt", "Inc", "Ltd", "Co", "Jr", "Sr", "resp", "al", "Ch", "Chs", "App",
-    "Apps", "Ph.D", "M.S", "B.S", "U.S", "U.K",
-]
-
-
-def _protect_abbreviations(text: str) -> str:
-    """把缩写/小数里的句号替换为占位符，避免句子切分时被误切。"""
-    for w in _ABBR_WORDS:
-        text = re.sub(rf"\b{re.escape(w)}\.(?=[\s,])", w + "\x00", text, flags=re.I)
-    # 小数 / 版本号，如 1.2
-    text = re.sub(r"(?<=\d)\.(?=\d)", "\x00", text)
-    return text
-
-
-# 句末边界正则配合 _split_sentences 使用（模块级编译）
-_SENT_BOUNDARY_RE = re.compile(
-    r".+?(?:[.!?][\"')\]”’」』】》]*(?=\s|$)"      # 西文句末 + 可选闭引号 + 空白/文末
-    r"|[。！？…？！]+[\"')\]”’」』）)】》]*"         # 中文句末（连续标点整体，如……？！）+ 可选闭引号
-    r"|$)",
-    re.S,
-)
-
-
-def _split_sentences(text: str) -> list[str]:
-    """按句末标点把文本切成完整句子（保护缩写与小数）。
-
-    同时支持两类边界：
-    - 西文 ``.!?``：缩写/小数已被占位符保护，且其后必须跟空白或文末
-      （与论文正文的英文书写习惯一致，避免误切 "v1.2"、词中句点）；
-    - 中文/全角 ``。！？…？！``：中日韩文本句读后通常**直接**写下一句
-      （无空格），其后允许跟随闭引号/括号，不能要求空白——旧实现只认
-      西文边界，导致中文整篇被当成一个超长句、分块全部退化为定长窗口。
-    """
-    protected = _protect_abbreviations(text)
-    parts = [
-        m.group(0) for m in _SENT_BOUNDARY_RE.finditer(protected)
-    ]
-    return [p.replace("\x00", ".").strip() for p in parts if p.strip()]
-
-
-# CJK 统一表意文字 / 扩展A / 平假名-片假名 / 韩文音节（覆盖中、日、韩文本）
-_CJK_CHAR_RE = re.compile(r"[㐀-䶿一-鿿぀-ヿ가-힯]")
-_TOKEN_RE = re.compile(
-    r"[a-z0-9]+(?:[._\-][a-z0-9]+)*"   # 拉丁/数字词（含 1.2、AI-Dij 类连写）
-    r"|[㐀-䶿一-鿿぀-ヿ가-힯]",          # 单个 CJK 字符
-    re.IGNORECASE,
-)
-
-
-def _bm25_tokens(text: str) -> list[str]:
-    """BM25 统一分词（英文与 CJK 共用）。
-
-    - 拉丁/数字按空白与标点成词（与旧 ``str.split`` 对英文的效果一致）；
-    - CJK 文本词间无空格，取**单字 unigram + 相邻二字 bigram**：单字保证
-      召回，二字组提供词级区分度，高频虚字（的/了/在）由 BM25 IDF 自然
-      降权；标点/空白会隔断相邻字，不跨标点组 bigram。
-
-    旧实现对查询和文档一律 ``str.split``：中文被切成整段巨型 token，
-    与任何分块都不重合，BM25 恒 0，检索退化为"返回前 N 块"（即论文封面/
-    目录/摘要），真正相关的正文段落永远无法进入上下文。
-    """
-    tokens: list[str] = []
-    run: list[str] = []
-    last_end = 0
-
-    def flush_run() -> None:
-        if not run:
-            return
-        tokens.extend(run)
-        if len(run) >= 2:
-            tokens.extend(run[i] + run[i + 1] for i in range(len(run) - 1))
-        run.clear()
-
-    for m in _TOKEN_RE.finditer(text.lower()):
-        # 与上一 token 之间存在标点/空白：断开 CJK 连续段
-        if m.start() != last_end:
-            flush_run()
-        last_end = m.end()
-        tok = m.group(0)
-        if len(tok) == 1 and _CJK_CHAR_RE.match(tok):
-            run.append(tok)
-        else:
-            flush_run()
-            tokens.append(tok)
-    flush_run()
-    return tokens
-
-
-# 短语在单个入选块内的最低结构匹配度：连续 bigram 命中（允许 1 个译名/
-# 异写缺口）占短语 bigram 总数的比例低于此值，视为该短语未被材料覆盖。
-# 0.5 的含义：2 字词必须命中；3 字词至少命中相邻 2 个 bigram；4 字词
-# 锚定链至少覆盖 3 个位置（如"蒙特/特卡"命中、"卡洛"为译名缺口）。
-WEAK_PHRASE_SCORE = 0.5
-
-# 功能字集合：CJK bigram 任一端命中即视为短语边界（结构助词、语气词、
-# 疑问指代语素、连词、部分介词与副词）。真正的术语 bigram 几乎不含这些字；
-# 刻意排除"不/没/无/非/未/有/向/对/为/在/到/据/使/被/正/中/能/可/应/要/会/法"
-# 等字——它们参与构成"不足/未来/有效/方向/相对/数据/使用/被动/正常/
-# 中心/效应/性能/算法"等真实术语，不能误杀
-_STOP_CHARS = set(
-    "的地得了着是么吗呢吧啊呀嘛哦哈"
-    "怎哪谁何孰"
-    "这那此该其某每各"
-    "们你我他她它"
-    "与和及或且并"
-    "把让令"
-    "也都就还又再已将曾很最更只才便却"
-    "些做问"
-)
-# 不含功能字、但对话题无判别力的通用 bigram；在短语切分中同样作为断点
-# （"蒙特卡洛方法"→"蒙特卡洛"，"计算速度问题"→"计算速度"）
-_STOP_BIGRAMS = {
-    "完成", "工作", "论文", "本文", "作者", "研究", "方法", "方式", "问题",
-    "内容", "方面", "情况", "进行", "通过", "相关", "需要", "可能", "能够",
-    "应该", "可以", "必须", "已经", "主要", "重要", "具体", "基本", "一般",
-    "目前", "时候", "地方", "东西", "事情", "自己", "大家", "别人", "其他",
-    "其它", "其余", "另外", "知道", "觉得", "一下", "一些", "没有", "还有",
-}
-# 拉丁停用词（疑问/指代/系动词/介词 + 学术套话名词）
-_STOP_LATIN = {
-    "what", "which", "how", "why", "when", "where", "who", "whom", "whose",
-    "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
-    "can", "could", "should", "would", "will", "shall", "may", "might", "must",
-    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "and",
-    "or", "not", "no", "this", "that", "these", "those", "it", "its", "as",
-    "by", "from", "about", "there", "here", "their", "his", "her", "our",
-    "your", "we", "you", "they", "them", "us", "i", "he", "she",
-    "paper", "study", "method", "methods", "work", "research", "question",
-    "problem", "answer",
-}
-
-# 连续 CJK 字符段（与 _bm25_tokens 覆盖范围一致）
-_CJK_RUN_RE = re.compile(r"[㐀-䶿一-鿿぀-ヿ가-힯]+")
-
-
-def _split_cjk_phrase(run: str) -> list[str]:
-    """把连续 CJK 字符段按功能字与通用 bigram 切成候选话题短语。
-
-    例如 "蒙特卡洛方法的计算速度问题" → ["蒙特卡洛", "计算速度"]；
-    "不足与未来研究方向" → ["不足", "未来", "方向"]（"与"是功能字、
-    "研究"是停用 bigram，分别成断；碎片是否在同块连续命中仍由
-    _cjk_phrase_score 逐一检验）。
-    """
-    phrases: list[str] = []
-    start = 0
-    i = 0
-    while i < len(run):
-        if run[i] in _STOP_CHARS:
-            if i > start:
-                phrases.append(run[start:i])
-            start = i + 1
-            i += 1
-            continue
-        if i + 2 <= len(run) and run[i:i + 2] in _STOP_BIGRAMS:
-            if i > start:
-                phrases.append(run[start:i])
-            start = i + 2
-            i += 2
-            continue
-        i += 1
-    if start < len(run):
-        phrases.append(run[start:])
-    return [p for p in phrases if len(p) >= 2]
-
-
-def _question_phrases(question: str) -> tuple[list[str], list[str]]:
-    """提取问题中的候选话题短语：(CJK 短语, 拉丁内容词)。"""
-    cjk: list[str] = []
-    for m in _CJK_RUN_RE.finditer(question):
-        for p in _split_cjk_phrase(m.group(0)):
-            if p not in cjk:
-                cjk.append(p)
-    latin = [
-        t for t in dict.fromkeys(_bm25_tokens(question))
-        if t[:1].isascii() and t[:1].isalpha() and t not in _STOP_LATIN
-    ]
-    return cjk, latin
-
-
-def _cjk_phrase_score(phrase: str, chunk_terms: set[str]) -> float:
-    """单个 CJK 短语在一个上下文块内的结构匹配度。
-
-    bigram 命中序列上取两种覆盖的较大值：
-    - 裸命中率（容忍分散命中，如译名块只命中部分字组）；
-    - 锚定延伸链：从短语首/尾出现 ≥2 个连续命中时，向另一方向延伸并
-      容忍恰好 1 个内部缺口（"蒙特[✓]特卡[✓]卡洛[✗缺口]"仍算覆盖到
-      译名核心），防止"研究方向"式的 3/5 尾部碎片冒充"未来研究方向"
-      ——碎片左侧连续两个位置都缺失，锚定链无法延伸过去。
-    """
-    k = len(phrase) - 1
-    if k <= 0:
-        return 1.0 if phrase in chunk_terms else 0.0
-    marks = [phrase[i:i + 2] in chunk_terms for i in range(k)]
-    raw = sum(marks) / k
-
-    def anchored_chain(begin: int, step: int) -> int:
-        # 起点必须有 ≥2 连续命中锚定，随后容忍 1 个缺口，再遇缺口即止
-        end = begin + step
-        if not (0 <= begin < k and 0 <= end < k and marks[begin] and marks[end]):
-            return 0
-        covered = 2
-        gap_used = False
-        i = end + step
-        while 0 <= i < k:
-            if marks[i]:
-                covered += 1
-            elif not gap_used:
-                gap_used = True  # 容忍译名/异写造成的单个缺口
-            else:
-                break
-            i += step
-        return covered
-
-    chain = max(anchored_chain(0, 1), anchored_chain(k - 1, -1)) / k
-    return max(raw, chain)
-
-
-def is_weak_lexical_match(question: str, hit_chunks: list[str]) -> bool:
-    """判断入选上下文是否真正覆盖了问题的话题短语（弱词面匹配判定）。
-
-    判定只需要**实际入选上下文**的分块（不依赖全量候选池的文档频率——
-    词频/单字频率启发式已被证明不可靠："发展"高频会掩盖"展望"缺失，
-    译名变体"卡洛"反被误判为缺失）。流程：
-
-    1. 用功能字与通用停用词把问题切成话题短语（"未来展望""局限性"
-       "蒙特卡洛""剂量影响矩阵"）与拉丁内容词；
-    2. 每个 CJK 短语在每个入选块上取结构匹配度（连续 bigram 链，允许
-       1 个译名缺口）；拉丁词取同块命中率；
-    3. 所有短语的最佳得分都低于 WEAK_PHRASE_SCORE → 弱匹配——材料很
-       可能不涉及所问话题（如节选无论文结论/展望章），调用方据此提示
-       LLM 谨慎、如实说明缺口，而不是建议用户去翻一个并不存在的章节。
-
-    问题切不出任何 ≥2 字短语或没有候选块时保守返回 False，由调用方的
-    BM25 全 0 信号兜底。
-    """
-    cjk_phrases, latin_terms = _question_phrases(question)
-    if (not cjk_phrases and not latin_terms) or not hit_chunks:
-        return False
-    chunk_term_sets = [set(_bm25_tokens(c)) for c in hit_chunks]
-    for phrase in cjk_phrases:
-        best = max(_cjk_phrase_score(phrase, s) for s in chunk_term_sets)
-        if best >= WEAK_PHRASE_SCORE:
-            return False
-    if latin_terms:
-        for s in chunk_term_sets:
-            hit_ratio = sum(t in s for t in latin_terms) / len(latin_terms)
-            if hit_ratio >= WEAK_PHRASE_SCORE:
-                return False
-    return True
-
-
-def _parse_int_list(text: str) -> list[int]:
-    """从 LLM 输出中解析整数列表（容忍 JSON/自然语言混排）。"""
-    nums = re.findall(r"\d+", text)
-    return [int(n) for n in nums]
+# 发给前端的出处 ``text`` 上限：它只作为"模型没给原句时"的 PDF 定位兜底，
+# 完整正文留在 ``full_text``（后端行内引用核对用），路由层发给前端前剔除
+SOURCE_FALLBACK_CHARS = 1200
 
 
 def _normalize_history(history: Optional[list]) -> list[dict]:
@@ -309,25 +59,31 @@ def _normalize_history(history: Optional[list]) -> list[dict]:
 
 # ---------- 行内引用（无编号引用卡） ----------
 # 2026-09-22 第二次重构：放弃引用编号。模型在回答的任意位置（允许一句话
-# 中间）插入**不带编号**的行内引用标签，标签内是从某个出处分块逐字复制
-# 的一句原文：
+# 中间）插入**不带编号**的行内引用标签；2026-09-27 扩展为**双段**标签：
 #
-#   该方法在 ImageNet 上[Q]We report a top-1 accuracy of 85.3%.[/Q]取得最佳。
+#   该方法在 ImageNet 上[Q]We report a top-1 accuracy of 85.3% on ImageNet.
+#   ||85.3% 的 top-1 准确率[/Q]取得最佳。
 #
-# - 出处不由模型编号指定：后端把摘录与**全部检索分块**做逐字匹配来确定
-#   出处；每张卡独立，同一出处可被多张卡引用。界面上也不出现任何编号。
+# - 段 1（``||`` 之前）= 逐字原句：从某个出处分块逐字复制的一句原文，只
+#   用于**出处核对**、悬停卡片展示与「定位原文」。出处不由模型编号指定：
+#   后端把段 1 与**全部检索分块**做逐字匹配来确定出处；每张卡独立，同一
+#   出处可被多张卡引用。界面上也不出现任何编号。
+# - 段 2（``||`` 之后）= 行内文字：由模型随引用一并生成的短转述（或该出处
+#   的中心句本身），是**回答正文的一部分**——界面上直接以主色高亮显示在
+#   该位置，鼠标悬停才展开段 1 的逐字原句卡片。
 # - 摘录很短时可能逐字命中多个分块（相邻分块有重叠、或跨材料重复句）：
 #   先按出处身份归并（同一 paper/context 的重叠分块等价），仍歧义则用
 #   标签在答案中的**上下文句**对候选分块做相似度消歧（用户明确要求：
 #   短句多命中必须匹配上下文，不能随便取一个）。
 # - 逐字零命中（模型改写/编造）：用上下文句对全部分块做扩展模糊匹配，
-#   命中则把卡片文字替换为分块中的真实原句（保留历史锚句匹配机制）；
-#   仍失败 → 引用失败卡（保留模型文字、注明无法核对、不可定位）。
+#   命中则把段 1 替换为分块中的真实原句（保留历史锚句匹配机制）；仍失败
+#   → 引用失败卡（段 1 保留模型文字、注明无法核对、不可定位；段 2 不变）。
 #
 # 标签语法（前端按同一语法解析；数字只是后端绑定的内部键，界面不显示）：
-#   流式未决（闭合即转发，尚未绑定出处）：[Q]摘录[/Q]
-#   终态成功（绑定到第 n 个 source，1-based）：[Q+n]摘录[/Q]
-#   终态失败（无法核对原文）：              [Q!]摘录[/Q]
+#   流式未决（闭合即转发，尚未绑定出处）：[Q]原句||行内文字[/Q]
+#   终态成功（绑定到第 n 个 source，1-based）：[Q+n]原句||行内文字[/Q]
+#   终态失败（无法核对原文）：              [Q!]原句||行内文字[/Q]
+# 段 2 缺省（模型未给/历史消息）时只保留一段，界面退化为直接展示原句。
 INLINE_QUOTE_PENDING_RE = re.compile(
     r"\[\s*q\s*\]([\s\S]*?)\[\s*/\s*q\s*\]", re.IGNORECASE
 )
@@ -340,6 +96,8 @@ INLINE_QUOTE_FULL_RE = re.compile(
 )
 QUOTE_MAX_CHARS = 80          # 回退核心句展示/定位用的长度上限
 QUOTE_ACCEPT_MAX_CHARS = 120  # 失败卡展示模型原文的长度上限
+# 标签内两段的分隔符：``<逐字原句>||<行内文字>``（prompt 明确禁止在段内使用）
+QUOTE_FIELD_SEP = "||"
 _ANSWER_SENT_BOUNDARY = "。！？；!?;\n"
 _ANCHOR_RADIUS = 300          # 消歧/回退时取标签前后文的半径（字符）
 _ANCHOR_MIN_RUN = 10          # 上下文锚句与分块最长连续重合下限
@@ -378,10 +136,11 @@ def _open_tag_border(text: str) -> int:
 
 
 class InlineQuoteExtractor:
-    """从回答 delta 流中解析无编号行内引用 ``[Q]摘录[/Q]`` 的状态机。
+    """从回答 delta 流中解析无编号行内引用 ``[Q]原句||行内文字[/Q]`` 的状态机。
 
     - :meth:`feed` 接收模型原始增量，返回可转发给前端的可见文本：普通
-      正文原样转发；引用块闭合后以**未决态** ``[Q]摘录[/Q]`` 内联转发。
+      正文原样转发；引用块闭合后以**未决态** ``[Q]原句||行内文字[/Q]``
+      内联转发（两段都不解析，原样透传——前端据段 2 先把行内文字显示出来）。
       出处绑定在流末 :func:`finalize_inline_answer` 统一完成——多命中消歧
       与模糊匹配都需要标签之后的上下文句，流式中途无法可靠判定。
     - :meth:`finish` 在流结束时补发最后扣留的普通文本；空摘录块与未
@@ -405,11 +164,12 @@ class InlineQuoteExtractor:
                 if m is None:
                     self._qbuf, self._pending = haystack, ""
                     break
-                excerpt = haystack[:m.start()].strip()
+                # 整段内容（原句 + 分隔符 + 行内文字）原样透传，不在此解析
+                payload = haystack[:m.start()].strip()
                 self._pending = haystack[m.end():]
                 self._qbuf = None
-                if excerpt:
-                    out.append(f"[Q]{excerpt}[/Q]")
+                if payload:
+                    out.append(f"[Q]{payload}[/Q]")
                 continue
             m = INLINE_QUOTE_OPEN_RE.search(self._pending)
             if m is None:
@@ -433,6 +193,25 @@ class InlineQuoteExtractor:
 def strip_inline_quote_markers(text: str) -> str:
     """剔除全部行内引用块（标签 + 摘录，未决/终态通吃），得到纯正文。"""
     return INLINE_QUOTE_FULL_RE.sub("", text)
+
+
+def split_citation_fields(content: str) -> tuple[str, str]:
+    """把引用标签的内容拆为 ``(逐字原句, 行内文字)``。
+
+    只按**第一个** ``||`` 切分（prompt 禁止段内出现 ``||``；即便模型违约，
+    多出的 ``||`` 也只会留在行内文字里，不影响核对目标）。只有一段时行内
+    文字为空——此时段落本身即展示文字（历史消息与格式漂移的退化路径）。
+    """
+    text = content.strip()
+    if QUOTE_FIELD_SEP not in text:
+        return text, ""
+    quote, display = text.split(QUOTE_FIELD_SEP, 1)
+    return quote.strip(), display.strip()
+
+
+def _compose_citation(quote: str, display: str) -> str:
+    """拼回标签内容：行内文字缺省时只写原句（避免出现空的第二段）。"""
+    return f"{quote}{QUOTE_FIELD_SEP}{display}" if display else quote
 
 
 def _source_identity(src: dict, fallback: int) -> tuple:
@@ -461,60 +240,93 @@ def _anchor_around(answer: str, start: int, end: int) -> str:
 
 
 def finalize_inline_answer(answer: str, sources: list[dict]) -> str:
-    """流式/非流式共用的收口：为每个未决 ``[Q]摘录[/Q]`` 绑定出处并输出终态。
+    """流式/非流式共用的收口：为每个未决 ``[Q]原句||行内文字[/Q]`` 绑定出处
+    并输出终态。
 
     绑定策略见模块头注释：逐字唯一命中即绑定；多命中先按出处身份归并、
-    再用标签上下文句消歧；零命中走全分块扩展模糊匹配（卡片改用分块真实
-    原句）；都失败输出 ``[Q!]`` 失败卡。返回终态答案文本。
+    再用标签上下文句消歧；零命中走全分块扩展模糊匹配（段 1 改用分块真实
+    原句）；都失败输出 ``[Q!]`` 失败卡。**段 2（行内文字）全程原样保留**——
+    它是回答正文的一部分，绑定结果只影响段 1 与悬浮卡。返回终态答案文本。
+
+    核对在**去噪匹配视图**上进行（见 :class:`_SourceView`）：页码与页眉页脚
+    只在视图里剔除，原文一个字都不改。出处正文取 ``full_text``（完整材料），
+    没有该键时退回 ``text``。
     """
-    chunks = [s.get("text") or "" for s in sources]
-    norm_chunks = [_norm_with_offsets(c.lower()) for c in chunks]
+    chunks = [s.get("full_text") or s.get("text") or "" for s in sources]
+    views = [_build_source_view(c) for c in chunks]
 
     out: list[str] = []
     cursor = 0
     for m in INLINE_QUOTE_PENDING_RE.finditer(answer):
         out.append(answer[cursor:m.start()])
-        excerpt = m.group(1).strip()
+        quote, display = split_citation_fields(m.group(1))
         anchor = _anchor_around(answer, m.start(), m.end())
-        state, index, display = _bind_citation(
-            excerpt, sources, chunks, norm_chunks, anchor
-        )
-        if state == "bound":
-            out.append(f"[Q+{index}]{display}[/Q]")
-        else:
-            out.append(f"[Q!]{display}[/Q]")
+        state, index, final_quote = _bind_citation(quote, sources, views, anchor)
+        body = f"[Q+{index}]" if state == "bound" else "[Q!]"
+        out.append(f"{body}{_compose_citation(final_quote, display)}[/Q]")
         cursor = m.end()
     out.append(answer[cursor:])
     return "".join(out)
 
 
-def _is_verbatim_excerpt(quote: str, chunk: str) -> bool:
-    """校验模型摘录确为 chunk 中**逐字连续**出现的片段（防编造/改写）。
+# ---------- 逐字核对的"去噪匹配视图" ----------
+# 噪声（页码、页眉页脚）只在匹配视图里剔除，**原文一个字都不改**。模型引用
+# 时可能带上噪声（PyMuPDF 把页眉页脚插进了正文中间），也可能把它删掉，
+# 两种写法都必须能核对通过——因此同时保留"去噪视图"与"原文视图"两个比对面，
+# 逐字比对时两边都试。规则与前端 src/utils/pdfLocate.ts 的镜像实现一致。
+@dataclass
+class _SourceView:
+    """单个出处分块的匹配视图（原文 + 三种折叠形式的文本与下标映射）。"""
 
-    先在"去全部空白"层面比对（兼容 PDF/排版空格差异）；不通过再去掉
-    标点比对一层（容忍模型把中文标点写成西文等微小出入）。
+    raw: str              # 原文（从不改写）
+    squashed: str         # 去噪 + 去空白
+    raw_squashed: str     # 原文 + 去空白
+    stripped: str         # 去噪 + 去空白 + 去标点
+    raw_stripped: str     # 原文 + 去空白 + 去标点
+    norm: str             # 去噪 + 小写 + 去空白（相似度打分用）
+    offsets: list[int]    # norm 每个字符在 raw 中的下标
+
+
+_STRIP_PUNCT_RE = re.compile(r"[\s\W_]+", re.UNICODE)
+
+
+def _strip_punct(text: str) -> str:
+    """去掉空白与标点（保留字母/数字/下划线），用于容忍中英标点差异。"""
+    return _STRIP_PUNCT_RE.sub("", text)
+
+
+def _build_source_view(raw: str) -> _SourceView:
+    """为一个出处分块构造匹配视图（去噪、去空白、去标点、小写映射各一份）。"""
+    running = textmatch.detect_running_lines(raw)
+    norm, offsets = textmatch.normalize_for_match(raw, running)
+    raw_squashed = textmatch.squash_ws(raw)
+    squashed = textmatch.denoise_squash(raw, running)
+    return _SourceView(
+        raw=raw,
+        squashed=squashed,
+        raw_squashed=raw_squashed,
+        stripped=_strip_punct(squashed),
+        raw_stripped=_strip_punct(raw_squashed),
+        norm=norm,
+        offsets=offsets,
+    )
+
+
+def _is_verbatim_excerpt(quote: str, view: _SourceView) -> bool:
+    """校验模型给出的逐字原句确为出处分块中**逐字连续**出现的片段（防编造/改写）。
+
+    逐级放宽：先去空白逐字比对（兼容 PDF/排版空格差异），不通过再去掉标点
+    比对一层（容忍模型把中文标点写成西文等微小出入）。每一层都在"去噪视图"
+    与"原文视图"上各试一次——前者接受模型删掉了页码/页眉，后者接受模型把
+    页码/页眉一并照抄（两种都是对原文的忠实转录）。
     """
     q = _squash_ws(quote)
     if len(q) < 6:
         return False
-    if q in _squash_ws(chunk):
+    if q in view.squashed or q in view.raw_squashed:
         return True
-    strip_punct = lambda s: re.sub(r"[\s\W_]+", "", s, flags=re.UNICODE)
-    q2, c2 = strip_punct(q), strip_punct(_squash_ws(chunk))
-    return len(q2) >= 6 and q2 in c2
-
-
-def _norm_with_offsets(text: str) -> tuple[str, list[int]]:
-    """去全部空白，返回 (归一化文本, 映射)：映射[i]为第 i 个归一化字符
-    在原文中的索引（用于把命中窗口映射回 chunk 真实子串）。"""
-    chars: list[str] = []
-    offsets: list[int] = []
-    for i, ch in enumerate(text):
-        if ch.isspace():
-            continue
-        chars.append(ch)
-        offsets.append(i)
-    return "".join(chars), offsets
+    q2 = _strip_punct(q)
+    return len(q2) >= 6 and (q2 in view.stripped or q2 in view.raw_stripped)
 
 
 def _score_anchor_against_chunk(
@@ -560,39 +372,40 @@ def _raw_window(chunk: str, offsets: list[int], start: int, end: int) -> str:
 
 
 def _bind_citation(
-    excerpt: str,
+    verbatim: str,
     sources: list[dict],
-    chunks: list[str],
-    norm_chunks: list[tuple[str, list[int]]],
+    views: list[_SourceView],
     anchor_norm: str,
 ) -> tuple[str, Optional[int], str]:
-    """把一张未决引用卡绑定到出处分块。
+    """把一张未决引用卡的**段 1（逐字原句）**绑定到出处分块。
 
-    :returns: ``("bound", 1-based 序号, 卡片展示文字)`` 或
+    :param verbatim: 模型给出的逐字原句（行内文字不参与核对）
+    :param views: 与 sources 一一对应的去噪匹配视图
+    :returns: ``("bound", 1-based 序号, 段 1 的最终文字)`` 或
               ``("failed", None, 模型原文（截断）)``。
 
     顺序：逐字唯一命中 → 绑定；多命中先按出处身份归并（重叠分块等价），
-    仍跨材料则用锚句对候选打分消歧；零命中用锚句对全部分块扩展模糊
-    匹配，命中则把展示文字换成分块中的真实原句；全部失败返回失败卡。
+    仍跨材料则用锚句对候选打分消歧；零命中用锚句对全部材料扩展模糊
+    匹配，命中则段 1 换成材料中的真实原句；全部失败返回失败卡。
     """
-    ai_text = excerpt.strip()
+    ai_text = verbatim.strip()
     if not ai_text:
         return "failed", None, ""
     short = ai_text[:QUOTE_ACCEPT_MAX_CHARS]
 
     candidates = [
-        i for i, chunk in enumerate(chunks)
-        if chunk and _is_verbatim_excerpt(ai_text, chunk)
+        i for i, view in enumerate(views)
+        if view.raw and _is_verbatim_excerpt(ai_text, view)
     ]
     if len(candidates) == 1:
         return "bound", candidates[0] + 1, ai_text
     if len(candidates) > 1:
         identities = {_source_identity(sources[i], i) for i in candidates}
         if len(identities) == 1:
-            # 同一材料的重叠/重复分块：定位目标等价，取检索序最前者
+            # 同一材料的重复/重叠内容：定位目标等价，取材料序最前者
             return "bound", candidates[0] + 1, ai_text
         scored = [
-            (i, _score_anchor_against_chunk(anchor_norm, norm_chunks[i][0]))
+            (i, _score_anchor_against_chunk(anchor_norm, views[i].norm))
             for i in candidates
         ]
         scored = [(i, s) for i, s in scored if s is not None]
@@ -606,13 +419,13 @@ def _bind_citation(
         # 跨材料多命中且上下文无法消歧：不能猜，按引用失败处理
         return "failed", None, short
 
-    # 逐字零命中：模型改写或编造。用标签上下文句对全部分块扩展模糊匹配，
-    # 命中则卡片改用分块真实原句（保留历史扩展上下文匹配机制）。
+    # 逐字零命中：模型改写或编造。用标签上下文句对全部材料扩展模糊匹配，
+    # 命中则卡片改用材料中的真实原句（保留历史扩展上下文匹配机制）。
     best: Optional[tuple[int, float, int, int]] = None
-    for i, (chunk_norm, _offsets) in enumerate(norm_chunks):
-        if not chunks[i]:
+    for i, view in enumerate(views):
+        if not view.raw:
             continue
-        scored = _score_anchor_against_chunk(anchor_norm, chunk_norm)
+        scored = _score_anchor_against_chunk(anchor_norm, view.norm)
         if scored is None:
             continue
         ratio, start, end = scored
@@ -620,382 +433,66 @@ def _bind_citation(
             best = (i, ratio, start, end)
     if best is not None:
         i, _ratio, start, end = best
-        real = _raw_window(chunks[i], norm_chunks[i][1], start, end)
+        real = _raw_window(views[i].raw, views[i].offsets, start, end)
         if real:
             return "bound", i + 1, real
     return "failed", None, short
-
-
-def _bm25_scores(query_tokens: list[str], tokenized_docs: list[list[str]]) -> list[float]:
-    """对每个文档给出 BM25 相关分（k1=1.5, b=0.75），使用**平滑恒正 IDF**。
-
-    这里刻意不使用 rank_bm25 的原始 IDF = log((N - df + 0.5) / (df + 0.5))：
-    当某词出现在超过一半分块时（分块总数少、或论文通篇围绕同一核心概念——
-    两者都极常见）该值变负，会把"强相关"的整篇文档扣成负分，进而被误判成
-    "未检索到段落"。改用平滑 IDF = log1p((N - df + 0.5) / (df + 0.5))，它在
-    任何 df 下都为正：低频词权重高、高频词权重小但仍有贡献，兼顾区分度与
-    "命中即相关"的基本语义。
-
-    :returns: 与 tokenized_docs 一一对应的分数列表
-    """
-    n_docs = len(tokenized_docs)
-    if n_docs == 0 or not query_tokens:
-        return [0.0] * n_docs
-    doc_len = [len(doc) for doc in tokenized_docs]
-    avgdl = sum(doc_len) / n_docs
-    df: dict[str, int] = {}
-    for doc in tokenized_docs:
-        for term in set(doc):
-            df[term] = df.get(term, 0) + 1
-    k1, b = 1.5, 0.75
-    scores = [0.0] * n_docs
-    for q in query_tokens:
-        qdf = df.get(q, 0)
-        if qdf == 0:
-            continue
-        idf = math.log1p((n_docs - qdf + 0.5) / (qdf + 0.5))
-        for i, doc in enumerate(tokenized_docs):
-            freq = doc.count(q)
-            if freq == 0:
-                continue
-            denom = freq + k1 * (1 - b + b * doc_len[i] / avgdl)
-            scores[i] += idf * (freq * (k1 + 1) / denom)
-    return scores
 
 
 class RAGEngine:
     def __init__(self, client: LLMClient) -> None:
         self.client = client
 
-    # ---------- 分块 ----------
-    @staticmethod
-    def chunk_text(text: str, chunk_size: int = CHUNK_SIZE,
-                   overlap: int = CHUNK_OVERLAP) -> list[str]:
-        """按句子边界分块：每个分块以完整句子起止，引用可读、有头有尾。
-
-        说明：
-        - 先把文本切成完整句子，再按 chunk_size 贪心拼装句子成块；
-        - 若单句超过 chunk_size（长公式 / 引用列表），退化为字符窗口切分
-          （保留 overlap），避免无限循环，也保证该句内容不被遗漏；
-        - 相比固定字符窗口，句子级分块不会出现"引用没头没尾"的问题。
-        """
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            return []
-        sentences = _split_sentences(text)
-        if not sentences:
-            return []
-        chunks: list[str] = []
-        current = ""
-        for s in sentences:
-            if len(s) > chunk_size:
-                # 单句超长（长公式 / 引用列表）：先收尾当前块，再退化为字符窗口切分
-                if current:
-                    chunks.append(current)
-                    current = ""
-                step = chunk_size - overlap
-                if step < 1:
-                    step = max(1, chunk_size // 2)
-                windows = [s[i:i + chunk_size] for i in range(0, len(s), step)]
-                # 末尾残窗过短时并入前窗：避免夹在块序列中间的短块在 BM25
-                # 长度归一化下虚高（文末残块的同款处理在函数末尾）
-                if (len(windows) >= 2
-                        and len(windows[-1]) < chunk_size * 0.3):
-                    windows[-2] += windows[-1]
-                    windows.pop()
-                chunks.extend(windows)
-            elif not current:
-                current = s
-            elif len(current) + 1 + len(s) <= chunk_size:
-                current += " " + s
-            else:
-                chunks.append(current)
-                current = s
-        if current:
-            chunks.append(current)
-        # 末尾残块（如致谢/作者简介尾巴）过短时并入上一块：避免独立短块在
-        # BM25 长度归一化下获得虚高分数、挤掉正文相关块
-        if len(chunks) >= 2 and len(chunks[-1]) < chunk_size * 0.3:
-            chunks[-2] = chunks[-2] + " " + chunks[-1]
-            chunks.pop()
-        return chunks
-
-    # ---------- 检索 ----------
-    @staticmethod
-    def retrieve(query: str, chunks: list[str], top_k: int = TOP_K) -> list[tuple[str, float]]:
-        """BM25 检索最相关的 top_k 个分块。
-
-        检索分只表示**词形层面的重叠信号**：得分高代表分块确实出现了问题中的
-        词汇；得 0 分则只说明没有共享词（同义改写 / 跨语言 / 交叉学科术语差异
-        都会造成 0 分），**并不等价于"无关"**。因此即便全部 0 分也返回 top_k，
-        由上层（prepare_answer）标注弱相关后交给 LLM 做实质相关性判断，而不是
-        直接判死为"未检索到段落"。
-        """
-        if not chunks:
-            return []
-        tokenized_chunks = [_bm25_tokens(c) for c in chunks]
-        scores = _bm25_scores(_bm25_tokens(query), tokenized_chunks)
-        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-        return [(chunks[i], scores[i]) for i in ranked]
-
-    # ---------- 上下文项筛选（第一轮，混合模式） ----------
-    def select_context_items(self, question: str,
-                             summaries: list[dict], current: Optional[dict] = None,
-                             max_items: int = MAX_CONTEXT_SELECT) -> list[int]:
-        """根据摘要判定哪些候选项与问题相关。
-
-        当前论文作为特殊候选 id=0（标注"当前论文"），与 context 项一同交给
-        AI 判定是否需要阅读全文，未选中的候选不读，以节约时间与 token。
-        提示词会**强调当前论文是用户的阅读焦点、默认选中**，但最终选择权
-        仍在 AI：它可以显式输出 [] 表示问题与当前论文无关；仅在 LLM 调用
-        失败/输出不可解析时才退回 BM25（该降级路径同样默认带上 id=0）。
-
-        :param summaries: context 项 [{"id": int, "title": str, "summary": str}, ...]
-        :param current: 当前论文 {"id": 0, "title": str, "summary": str}；None 表示不纳入
-        :returns: 选中的候选 id 列表（0 表示当前论文；其余为 context item id）
-        """
-        candidates: list[dict] = []
-        if current is not None:
-            candidates.append(current)
-        candidates.extend(summaries)
-        candidates = candidates[:MAX_SUMMARY_LIST]
-        if not candidates:
-            return []
-        listing = "\n\n".join(
-            f"[{it['id']}] {it['title']}\n摘要: {(it.get('summary') or '')[:200]}"
-            for it in candidates
-        )
-        # 描述当前焦点（论文 / 上下文库），无焦点时说明仅凭问题作答
-        if current is not None:
-            focus_desc = (
-                "用户当前打开着一篇论文（编号 0，标注'当前论文'），其余编号为上下文库中的材料。"
-                "**编号 0 是用户正在阅读的论文，代表明确的阅读焦点，默认应当选中它读取全文**；"
-                "仅当问题明显与该论文无关时（如纯通用知识问题、或只涉及其他材料/写作的请求）"
-                "才可不选编号 0。根据用户问题与各候选项的摘要，判断还需要阅读哪些候选项的"
-            )
-        else:
-            focus_desc = "用户未打开论文，可用材料为下列上下文库条目。根据用户问题与各候选项的摘要，判断需要阅读哪些候选项的"
-        system = (
-            f"你是论文研究助手的上下文调度器。{focus_desc}"
-            "全文才能回答问题；除上述对当前论文的默认偏好外，与问题无关的候选项不要选中，"
-            "以节约计算。可输出空数组。"
-            "只输出 JSON 数组，例如 [0,3]，不要输出其他任何文字。"
-        )
-        user = f"用户问题：{question}\n\n可用候选项（含编号）：\n{listing}"
-        try:
-            result = self.client.chat(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0,
-            )
-            content = result.get("content") or ""
-            ids = _parse_int_list(content)
-            valid = {it["id"] for it in candidates}
-            ids = [i for i in ids if i in valid]
-            if ids:
-                return ids[:max_items]
-            # 模型成功响应且显式给出空数组：尊重"无需读取任何候选"的判断，
-            # 不用 BM25 降级把材料重新塞回去；输出无法解析时才走降级
-            if re.search(r"\[\s*\]", content):
-                return []
-        except Exception:
-            # LLM 不可用则回退 BM25
-            pass
-        return self._bm25_select(question, candidates, max_items)
-
-    @staticmethod
-    def _bm25_select(question: str, items: list[dict], max_items: int) -> list[int]:
-        """回退：在摘要文本上做 BM25（非负 IDF，CJK 感知分词），选最相关项。
-
-        仅在 LLM 选材调用失败时使用。当前打开的论文（id 保留为 0）是用户的
-        显式阅读焦点：即使 CJK 分词后摘要与问题仍可能词面零重合（如问
-        "局限性"而摘要只列成果），降级选择仍默认把 0 置于队首（受 max_items
-        截断保护）；其余候选项按真实 BM25 分数排序。
-        """
-        texts = [f"{(it.get('summary') or '')} {it['title']}" for it in items]
-        tokenized = [_bm25_tokens(t) for t in texts]
-        scores = _bm25_scores(_bm25_tokens(question), tokenized)
-        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:max_items]
-        picked = [items[i]["id"] for i in ranked if scores[i] > 0]
-        if any(it["id"] == 0 for it in items):
-            picked = [0, *[x for x in picked if x != 0]]
-        return picked[:max_items]
-
-    # ---------- 流式"思考 + 筛选"（ReAct：把选择候选的推理过程实时展示） ----------
-    def select_materials_reasoning(self, question: str,
-                                   summaries: list[dict], current: Optional[dict] = None,
-                                   max_items: int = MAX_CONTEXT_SELECT):
-        """边流式输出"为什么读这些候选"的思考，边决定要读取哪些候选（当前论文 + 上下文库）。
-
-        与 :meth:`select_context_items` 等价但多一个流式思考环节：模型先输出一段
-        面向用户的简短推理（说明依据问题打算阅读哪些候选及其原因），随后在同一回合
-        给出选择。真实候选读取动作由调用方在拿到选择后执行。
-
-        :param summaries: context 项 [{"id": int, "title": str, "summary": str}, ...]
-        :param current: 当前论文 {"id": 0, ...}；None 表示不纳入
-        :yields: {"type": "thought", "delta": str} 思考增量；
-                 最后 {"type": "selected", "ids": [int, ...]}（无候选时直接 yield 空选择）
-        """
-        candidates: list[dict] = []
-        if current is not None:
-            candidates.append(current)
-        candidates.extend(summaries or [])
-        candidates = candidates[:MAX_SUMMARY_LIST]
-        if not candidates:
-            yield {"type": "selected", "ids": []}
-            return
-        valid_ids = {it["id"] for it in candidates}
-
-        listing = "\n\n".join(
-            f"[{it['id']}] {it['title']}\n摘要: {(it.get('summary') or '')[:200]}"
-            for it in candidates
-        )
-        focus_desc = (
-            "用户当前打开着一篇论文（编号 0，标注'当前论文'），其余编号为上下文库"
-            "中的材料。**编号 0 是用户正在阅读的论文，代表明确的阅读焦点：默认必须"
-            "选中它读取全文**，仅当问题明显与该论文无关时（纯通用知识问题，或只涉及"
-            "其他材料/写作的请求）才可不选编号 0。"
-            if current is not None else
-            "用户未打开论文，可用材料为下列上下文库条目。"
-        )
-        system = (
-            "你是论文研究助手的上下文调度器。"
-            f"{focus_desc} 在此基础上判断为了回答问题还要读取哪些候选项的全文。"
-            "除对当前论文的上述默认偏好外，与问题无关的候选项不要选中，以节约时间与 token。\n"
-            "输出要求：先输出一段**思考**（会实时展示给用户）：说明根据问题你打算"
-            "阅读哪些候选、为什么（不要引用具体数字或编号）；思考后另起一行输出选择，"
-            f"格式为 SELECT: [候选编号数组]，只读候选输出 SELECT: []。\n"
-            f"示例思考格式：'用户询问具体方法细节，需要读取当前论文及相关材料的全文。'\n"
-            "除思考与 SELECT 行外不要输出其他内容。"
-        )
-        user = f"用户问题：{question}\n\n可用候选项（含编号）：\n{listing}"
-
-        parts: list[str] = []
-        try:
-            for delta in self.client.chat_stream(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0,
-            ):
-                parts.append(delta)
-                yield {"type": "thought", "delta": delta}
-        except Exception:
-            # LLM 不可用：跳过思考，直接用 BM25 回退选择
-            ids = self._bm25_select(question, candidates, max_items)
-            yield {"type": "selected", "ids": ids}
-            return
-
-        full = "".join(parts)
-        # 优先取最后一处 SELECT: [...] 标记；模型未遵循格式时回退全文字符解析
-        ids: list[int] = []
-        markers = list(re.finditer(r"SELECT\s*:\s*(\[[^\]\n]*\])", full, flags=re.I))
-        explicit_empty = bool(markers) and markers[-1].group(1).strip() == "[]"
-        if markers:
-            raw = re.findall(r"\d+", markers[-1].group(1))
-        else:
-            raw = re.findall(r"\d+", full)
-        for x in raw:
-            try:
-                num = int(x)
-            except ValueError:
-                continue
-            if num in valid_ids and num not in ids:
-                ids.append(num)
-        if not ids and not explicit_empty:
-            # 模型未给出可解析的选择（格式漂移/空输出）：回退 BM25，保证流程可用。
-            # 显式 SELECT: [] 代表"无需读取"，必须尊重，不做降级。
-            ids = self._bm25_select(question, candidates, max_items)
-        yield {"type": "selected", "ids": ids[:max_items]}
-
-
-    # ---------- 问答 ----------
-    def answer(self, question: str, fulltext: str, paper: dict) -> dict:
-        """对单篇论文全文回答问题（兼容旧接口）。"""
-        return self.answer_multi(
-            question,
-            sources=[{"label": paper.get("title", ""), "text": fulltext}],
-            paper=paper,
-        )
-
-    def answer_multi(self, question: str, sources: list[dict],
-                     paper: Optional[dict] = None,
-                     history: Optional[list] = None) -> dict:
-        """对多个数据源回答问题（非流式，兼容旧接口）。
-
-        :param sources: [{"label": str, "text": str, "context_id": int|None, ...}, ...]
-        :param paper: 当前论文元数据（可空）
-        :param history: 精简对话历史（追问上下文，不含全文）
-        :returns: {"answer", "sources": [{"index","label","context_id","text","score"}], "usage"}
-        """
-        sources_out, messages = self.prepare_answer(question, sources, paper, history)
-        result = self.client.chat(messages, temperature=0.2)
-        # 与流式路径一致：增量解析行内引用块（未决态转发），流末统一做
-        # 逐字绑定 / 上下文消歧 / 扩展模糊匹配 / 失败卡终态化
-        extractor = InlineQuoteExtractor()
-        visible = extractor.feed(result["content"])
-        tail = extractor.finish()
-        answer = finalize_inline_answer(visible + tail, sources_out)
-        return {
-            "answer": answer,
-            "sources": sources_out,
-            "usage": result["usage"],
-        }
-
+    # ---------- 问答（材料直注，见模块头注释） ----------
     def prepare_answer(self, question: str, sources: list[dict],
                        paper: Optional[dict] = None,
                        history: Optional[list] = None,
-                       grounded: bool = True) -> tuple[list[dict], list[dict]]:
-        """检索 + 组装 prompt（流式 / 非流式共用）。
+                       grounded: bool = True,
+                       tool_findings: Optional[list[dict]] = None) -> tuple[list[dict], list[dict]]:
+        """材料直注 + 组装 prompt（流式 / 非流式共用）。
+
+        材料由工具循环读取后**原样**注入（每条一个 ``[Source N]`` 段落），不再
+        分块、不再检索：旧实现在此用 BM25 挑 TOP_K 分块，词面零重合时只喂论文
+        开头几块，模型据此以为"材料里没有相关内容"（实测：中文提问「双线性
+        插值」对英文论文得分 0，于是只拿到封面与题录）。
 
         :param history: 精简对话历史（仅 user/assistant 文字，不含全文与出处详情）
-        :param grounded: True（默认）= 必须基于检索材料，材料无可用段落时抛
+        :param grounded: True（默认）= 必须基于材料作答，材料里没有正文时抛
             ValueError；False = 允许在**无任何材料**时仅凭模型通用知识作答
             （调用方负责先向用户发出"无材料"提示）。
+        :param tool_findings: ReAct 工具循环**本轮已经拿到**的检索发现
+            [{"label": str, "content": str}]。最终回答是一次无状态的新调用，
+            工具循环里的 thought/observation 不会自动延续——paper_search 明明
+            检到几十篇文献，最终模型却看不到、只能老实回答"我无法联网检索"。
+            这里把回执作为独立段落注入 user，并限定：可转述/列举/对比其中的
+            题录与摘要片段，但逐字 [Q] 引用仍只能来自下方 Sources 段落。
         :returns: (sources_out, messages)
-                  sources_out：出处分块 [{"index","label","context_id","text","score"}]
+                  sources_out：出处分块
+                  [{"index","label","context_id","paper_id","text","score","full_text"}]；
+                  ``text`` 是给前端做 PDF 定位兜底的短预览，``full_text`` 是完整
+                  材料正文、**仅供后端行内引用核对**（路由层发给前端前剔除）。
                   messages：发给 LLM 的对话（system + 历史 + user）
         """
         passages: list[dict] = []
         for src in sources:
-            text = src.get("text") or ""
+            text = (src.get("text") or "").strip()
             if not text:
                 continue
-            chunks = self.chunk_text(text)
-            if not chunks:
-                continue
-            for chunk, score in self.retrieve(question, chunks):
-                passages.append({
-                    "label": src.get("label", ""),
-                    "context_id": src.get("context_id"),
-                    "paper_id": src.get("paper_id"),
-                    "text": chunk,
-                    "score": score,
-                })
+            passages.append({
+                "label": src.get("label", ""),
+                "context_id": src.get("context_id"),
+                "paper_id": src.get("paper_id"),
+                "text": text,
+            })
 
         if not passages:
             if grounded:
-                # 仅当材料里确实没有可切分的全文段落时才报错（如全是图表/引用列表）
+                # 调用方在无材料时走 grounded=False；走到这里说明材料存在但正文全空
                 raise ValueError(tr("rag.no_readable_passages"))
-            # 无材料模式：不检索任何段落，直接组装"通用知识作答"对话
-            return self._prepare_unguided_answer(question, paper, history)
-
-        passages.sort(key=lambda p: p["score"], reverse=True)
-        passages = passages[:TOP_K]
-
-        # 弱相关：入选上下文没有在同一个块内连续覆盖问题的任何话题短语
-        # （如问"展望/局限"而节选论文无结论章，命中的只是致谢里的通用
-        # 词）——BM25 全 0 的旧信号在 CJK 分词修复后已不再触发，故改以
-        # 短语结构覆盖判定（纯单字查询仍看全 0）。这类问题往往是开放式/
-        # 跨材料联想型：词面缺失不代表材料无关，交由 LLM 判断实质相关性，
-        # 并允许它基于可用材料分析或如实指出缺口。
-        zero_scores = not any(p["score"] > 0 for p in passages)
-        weak = zero_scores or is_weak_lexical_match(
-            question, [p["text"] for p in passages]
-        )
+            # 无材料模式：组装"通用知识作答"对话
+            return self._prepare_unguided_answer(
+                question, paper, history, tool_findings=tool_findings,
+            )
 
         title = (paper or {}).get("title", "")
         year = (paper or {}).get("year")
@@ -1016,7 +513,9 @@ class RAGEngine:
             "the middle. You help the researcher think: answer grounded in the "
             "provided sources, then go further by connecting and extending them.\n\n"
             "=== ENVIRONMENT ===\n"
-            "- The currently open paper is stated in the User message (id=0).\n"
+            "- The currently open paper's metadata is stated in the User message;\n"
+            "  its full text appears in the sources below only if it was actually\n"
+            "  read this turn.\n"
             "- Other sources (tagged with a context id) come from the researcher's "
             "context library; they may be papers or web pages.\n"
             "- Earlier turns may be included as conversation history; they are "
@@ -1051,24 +550,38 @@ class RAGEngine:
             "6. Answer in the language of the question.\n"
             "7. Inline citations — the citation IS part of the sentence, not a "
             "footnote. Whenever you state a fact taken from a source, embed a "
-            "citation tag containing the supporting source sentence at that exact "
-            "spot, in EXACTLY this form:\n"
-            "[Q]<one core sentence copied VERBATIM, character for character, "
-            "from one of the sources>[/Q]\n"
+            "citation tag at that exact spot, in EXACTLY this form:\n"
+            "[Q]<one core sentence copied VERBATIM from a source>||<short "
+            "inline wording>[/Q]\n"
+            "   - The tag holds TWO parts separated by the two-character "
+            "sequence || — never write || anywhere else inside the tag:\n"
+            "     PART 1 (before ||) is a CONTINUOUS, CHARACTER-FOR-CHARACTER "
+            "copy from one source block (never rephrased, translated, "
+            "abbreviated or stitched together), in the source's own language "
+            "and punctuation, ≤80 characters, one sentence (at most two) — the "
+            "single sentence that best supports the claim at that spot. It is "
+            "what the system verifies against the sources and what the reader "
+            "sees as the exact quotation when hovering the citation. Short or "
+            "non-verbatim part 1 cannot be matched and will be shown as a "
+            "failed citation.\n"
+            "     PART 2 (after ||) is the text that ACTUALLY APPEARS in your "
+            "answer at that spot: a short clause, in the answer's language, "
+            "that restates the core of part 1 (or condenses it), written so "
+            "that the surrounding sentence reads naturally and grammatically. "
+            "≤60 characters, plain text (no markdown emphasis, no surrounding "
+            "quotation marks). Part 1 stays in the source's language; only "
+            "part 2 follows the answer's language. If part 1 already reads "
+            "perfectly in place, repeat it as part 2.\n"
             "   - NO number inside the tag: the system locates the source by "
-            "matching the quoted text itself. Never write [Source N] or [Q:N] "
+            "matching part 1 itself. Never write [Source N] or [Q:N] "
             "in your answer.\n"
             "   - The tag may sit in the MIDDLE of your sentence, right where "
-            "the fact is used, e.g. \"The model achieves [Q]We report a top-1 "
-            "accuracy of 85.3%.[/Q] on ImageNet, which suggests ...\"; it may "
-            "also sit right after the sentence. Each citation card is "
-            "independent — cite the same source as many times as you use it.\n"
-            "   - The excerpt must be a CONTINUOUS, CHARACTER-FOR-CHARACTER copy "
-            "from one source block (never rephrased, translated, abbreviated or "
-            "stitched together), in the source's own language and punctuation, "
-            "≤80 characters, one sentence (at most two) — the single sentence "
-            "that best supports the claim at that spot. Short or non-verbatim "
-            "quotes cannot be matched and will be shown as failed citations.\n"
+            "the fact is used, e.g. \"The model reaches [Q]We report a top-1 "
+            "accuracy of 85.3% on ImageNet.||85.3% top-1 accuracy on "
+            "ImageNet[/Q], which suggests ...\"; it may also sit right after "
+            "the sentence. The reader sees only part 2 inline; part 1 appears "
+            "on hover. Each citation card is independent — cite the same "
+            "source as many times as you use it.\n"
             "   - Never place a tag inside a heading or a table cell; for a "
             "fact in a table, put the tag in the sentence right after the "
             "table.\n"
@@ -1081,24 +594,14 @@ class RAGEngine:
             f"Currently open paper: \"{title}\" ({year}) by {author_str}.\n\n"
             if title else "Currently open paper: not loaded.\n\n"
         )
-        if weak:
-            user += (
-                "Note: lexical retrieval for this question is weak — the passages "
-                "below were matched only by common/generic words, while the "
-                "question's distinctive terms (specific topic words, names, or "
-                "phrases such as future-work / limitation terminology) do not "
-                "appear in them. The source text may simply not cover what is "
-                "asked (e.g. an excerpt without a conclusion/outlook section). "
-                "Read the passages critically: do not infer coverage that is not "
-                "there, and do not suggest consulting a chapter whose existence "
-                "in the material is unverified. If they do not address the "
-                "question, say so explicitly, state what is missing, and suggest "
-                "what additional material would help.\n\n"
-            )
+        findings_note = self._format_tool_findings(tool_findings)
+        if findings_note:
+            user += findings_note
         user += (
             f"Sources:\n{prompt_sources}\n\nQuestion: {question}\n\n"
-            "Embed the verbatim [Q]...[/Q] citations inline within your answer "
-            "exactly as specified in response rule 7 (no numbers, no source tags)."
+            "Embed the [Q]<verbatim sentence>||<inline wording>[/Q] citations "
+            "inline within your answer exactly as specified in response rule 7 "
+            "(both parts, no numbers, no source tags)."
         )
 
         sources_out = [
@@ -1107,8 +610,12 @@ class RAGEngine:
                 "label": p["label"],
                 "context_id": p["context_id"],
                 "paper_id": p["paper_id"],
-                "text": p["text"],
-                "score": round(p["score"], 3),
+                # text 只作为"模型没给原句时"的 PDF 定位兜底，截短以控制传输体积；
+                # full_text 是完整材料正文，仅供后端行内引用核对，路由层发给前端前剔除
+                "text": p["text"][:SOURCE_FALLBACK_CHARS],
+                "full_text": p["text"],
+                # 已取消检索打分：score 只是前端类型要求的占位（界面不展示）
+                "score": 0.0,
             }
             for i, p in enumerate(passages)
         ]
@@ -1118,16 +625,64 @@ class RAGEngine:
         messages.append({"role": "user", "content": user})
         return sources_out, messages
 
+    @staticmethod
+    def _format_tool_findings(findings: Optional[list[dict]]) -> str:
+        """把 ReAct 循环本轮的工具回执格式化为最终回答可见的"检索发现"段落。
+
+        最终回答是一次**无状态新调用**：工具循环中的 thought/observation 不会
+        自动延续，若不显式带入，paper_search 明明已检到文献，最终模型仍会如实
+        回答"我无法联网检索"（实测故障）。回执文本是给调度器看的工作记录，
+        不是可逐字引用的正文，因此段落中明确：可转述/列举/对比题录与摘要片段，
+        但 [Q] 标签只能引用 Sources 中逐字出现的句子；导图工具结果用于制止
+        "文字版思维导图"。
+        """
+        items: list[str] = []
+        for f in findings or []:
+            label = (f.get("label") or "").strip()
+            content = (f.get("content") or "").strip()
+            if label and content:
+                items.append(f"### Tool result — {label}\n{content}")
+        if not items:
+            return ""
+        return (
+            "=== TOOL FINDINGS ALREADY RETRIEVED THIS TURN ===\n"
+            "The agent loop already executed the tools below in THIS SAME turn and "
+            "obtained these results. They are real, current evidence available to you:\n"
+            "- Where they list retrieved papers, treat them as external literature "
+            "you genuinely have access to. NEVER claim that you cannot search, "
+            "cannot access the internet, or have no retrieved papers — that would "
+            "directly contradict this turn's actual tool results.\n"
+            "- You may summarize, list, compare and reason over the titles, authors, "
+            "years, venues, citation counts and abstract snippets, attributing each "
+            "item by its title, year and source.\n"
+            "- This digest is an operational transcript, NOT a quotation target. "
+            "PART 1 of a [Q] tag may contain ONLY a sentence copied verbatim from "
+            "the Sources blocks below; never wrap digest text in a [Q] tag (digest "
+            "material may still be paraphrased in your own prose, without a tag).\n"
+            "- If a mindmap tool result says a map was created or updated, tell the "
+            "user the map is ready in the mindmap view (use its real title); NEVER "
+            "draw a text / ASCII / Markdown tree as a substitute for the actual map. "
+            "If the map is only an empty root skeleton, say so honestly and offer to "
+            "fill it on request.\n\n"
+            + "\n\n".join(items)
+            + "\n\n"
+        )
+
     def _prepare_unguided_answer(self, question: str,
                                  paper: Optional[dict],
-                                 history: Optional[list]) -> tuple[list[dict], list[dict]]:
+                                 history: Optional[list],
+                                 tool_findings: Optional[list[dict]] = None,
+                                 ) -> tuple[list[dict], list[dict]]:
         """组装"无检索材料"的回答对话：仅凭模型通用知识作答，并明确标注未核实。
 
         与 :meth:`prepare_answer` 的 grounded 路径共用 persona 与历史规整，
         但不包含任何 [Source N] 段落；若用户当前打开着论文（仅拿到元数据、
         全文不可读），把标题/作者/年份告知模型——它可能凭公开知识认识该论文，
-        但必须显式标注不确定性。
+        但必须显式标注不确定性。``tool_findings`` 非空时（本轮工具确有检索
+        回执，只是没有可切分的全文段落），不能对模型谎称"外部工具什么也没
+        检索到"。
         """
+        findings_note = self._format_tool_findings(tool_findings)
         title = (paper or {}).get("title", "")
         year = (paper or {}).get("year")
         authors = (paper or {}).get("authors", []) or []
@@ -1135,20 +690,32 @@ class RAGEngine:
         if len(authors) > 3:
             author_str += " et al."
 
+        if findings_note:
+            no_material_clause = (
+                "No readable full-text source blocks are available this turn, BUT "
+                "the tool findings below DO contain real results retrieved this "
+                "turn — use them as instructed there and never deny their existence; "
+                "only verbatim quotations are unavailable because no source blocks "
+                "were retrieved."
+            )
+        else:
+            no_material_clause = (
+                "No readable source material is available: the open paper's full text "
+                "could not be read, the context library provided nothing, and external "
+                "tools retrieved nothing usable. You must STILL answer the user's "
+                "question helpfully, using your own general knowledge."
+            )
         system = (
             "You are PaperMind, the AI research assistant embedded in a researcher's "
             "desktop (PDF reader + context library + Q&A panel).\n\n"
-            "=== IMPORTANT: NO RETRIEVED MATERIAL THIS TURN ===\n"
-            "No readable source material is available: the open paper's full text "
-            "could not be read, the context library provided nothing, and external "
-            "tools retrieved nothing usable. You must STILL answer the user's "
-            "question helpfully, using your own general knowledge.\n\n"
+            "=== IMPORTANT: NO RETRIEVED SOURCE BLOCKS THIS TURN ===\n"
+            f"{no_material_clause}\n\n"
             "=== RESPONSE RULES ===\n"
-            "1. Answer the question directly and substantively from general "
-            "knowledge. Near the start, state in one short sentence that the answer "
-            "is based on your general knowledge rather than retrieved sources and "
-            "may be outdated or inaccurate, and that opening a paper or adding "
-            "context enables a grounded answer.\n"
+            "1. Answer the question directly and substantively. If (and only if) no "
+            "tool findings are present, state near the start in one short sentence "
+            "that the answer is based on your general knowledge rather than retrieved "
+            "sources and may be outdated or inaccurate, and that opening a paper or "
+            "adding context enables a grounded answer.\n"
             "2. Never fabricate citations, [Source N] tags, quotes, figures, or "
             "claims that you pretend came from a specific paper. If the open paper "
             "is identified in the User message, you may share what you generally "
@@ -1163,7 +730,9 @@ class RAGEngine:
             f"Currently open paper: \"{title}\" ({year}) by {author_str}.\n"
             if title else "Currently open paper: not loaded.\n"
         )
-        user += "No retrieved sources are available for this turn.\n\n"
+        user += "No retrieved source blocks are available for this turn.\n\n"
+        if findings_note:
+            user += findings_note
         user += f"Question: {question}"
 
         messages = [{"role": "system", "content": system}]
@@ -1175,17 +744,21 @@ class RAGEngine:
     def stream_answer(self, question: str, sources: list[dict],
                       paper: Optional[dict] = None,
                       history: Optional[list] = None,
-                      grounded: bool = True):
+                      grounded: bool = True,
+                      tool_findings: Optional[list[dict]] = None):
         """流式问答生成器（供 SSE 使用）。
 
         :param grounded: False 时允许 sources 为空（或全部不可切分），走通用
             知识作答路径（首帧 sources 为空列表）。
+        :param tool_findings: 本轮 ReAct 工具循环已获得的检索发现，透传至
+            prompt 组装（见 :meth:`prepare_answer`）。
         :yields: dict 事件：
             {"type": "sources", "sources": [...]}  首帧，出处分块（无材料时为 []）
             {"type": "delta", "delta": str}        每个回答文本增量
         """
         sources_out, messages = self.prepare_answer(
-            question, sources, paper, history, grounded=grounded,
+            question, sources, paper, history,
+            grounded=grounded, tool_findings=tool_findings,
         )
         yield {"type": "sources", "sources": sources_out}
         for delta in self.client.chat_stream(messages, temperature=0.2):

@@ -28,6 +28,11 @@ export default {
   title: {
     generating: '生成标题中…',
   },
+  workspaceRequired: {
+    title: '请先选择工作区',
+    desc: '问答与对话历史归属于具体工作区。进入一个工作区后即可开始提问，历史记录将随该工作区保存。',
+    choose: '选择或创建工作区',
+  },
   focus: {
     reading: '阅读焦点：{{title}}',
     readingEmpty: '阅读焦点：未打开论文',

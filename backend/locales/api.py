@@ -20,8 +20,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ReAct 工具展示名
         "api.tool_label.paper_search": "学术论文检索",
         "api.tool_label.read_paper": "读取论文全文",
+        "api.tool_label.read_context": "读取上下文材料",
         "api.tool_label.read_document": "读取当前文档",
-        "api.tool_label.read_materials": "读取候选材料",
         "api.tool_label.list_mindmaps": "列出思维导图",
         "api.tool_label.create_mindmap": "新建思维导图",
         "api.tool_label.read_mindmap": "读取思维导图",
@@ -29,44 +29,43 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.tool_label.attach_paper_to_mindmap": "论文加入导图",
         # 列表 / 省略拼接
         "api.separator.list": "、",
-        "api.separator.reason": "；",
-        "api.more_items": " 等 {n} 项",
         # SSE 阶段与错误提示
         "api.stopped": "已停止生成",
-        "api.stage.fetch_current_fulltext": "正在获取当前论文全文...",
-        "api.stage.reading_context": "正在读取上下文「{title}」...",
-        "api.stage.selecting_materials": "正在判断需要阅读哪些材料...",
         "api.stage.thinking_next": "AI 正在思考下一步...",
         "api.stage.thought_failed": "思考过程出错，将基于已有材料回答：{exc}",
         "api.stage.unknown_tool": "AI 请求了未知工具 {name}，已停止工具循环",
         "api.stage.no_progress": "AI 连续请求同一工具，判定无进展，停止工具循环...",
-        "api.stage.retrieving": "正在检索相关内容...",
+        "api.stage.preparing_material": "正在整理材料...",
         "api.stage.generating": "正在生成回答...",
+        "api.stage.mindmap_filling": "检测到新建导图尚未填充，AI 正在补全导图节点...",
+        # 导图轮次兜底：create 后未填充即达到轮次上限 / 提前 READY 时的系统提醒
+        "api.mindmap.fill_reminder":
+            "系统提醒：你本轮新建的思维导图「{titles}」目前只有根节点，尚未填充任何"
+            "内容，不能就这样交付给用户。请立即继续完成：在接下来最多 {turns} 个工具"
+            "步骤内，用 edit_mindmap 批量添加完整的分支与子节点（内容必须基于本轮已"
+            "检索/阅读的材料和用户问题）；若结构已在你心中成型，也可用 from_mermaid "
+            "一次重建成完整导图。不要再次创建空白导图，不要删除重建，也不要用文字版"
+            "思维导图代替。导图填充完成后再回复 READY。",
+        # 最终回答可见的导图工具成果（以 DB 最终状态为准）
+        "api.mindmap.finding_skeleton":
+            "本轮 create_mindmap 新建了思维导图「{title}」（id: {map_id}），但截至工具"
+            "循环结束它仍只有根节点、没有任何分支（edit_mindmap 填充未完成或未执行）。"
+            "必须如实告知用户该导图已创建但尚未填充，不得谎称导图已完成，也不要再画"
+            "文字版思维导图；可以提议让用户确认后继续补全。",
+        "api.mindmap.finding_filled":
+            "本轮思维导图工具已成功创建/更新导图「{title}」（id: {map_id}），当前共有 "
+            "{nodes} 个节点，导图已在思维导图视图中就绪。回答中用一句话告知用户导图已"
+            "生成即可，严禁再用 Markdown 列表/缩进/符号画一张文字版思维导图来代替它。",
         "api.tool_exec_failed": "{tool_label} 执行失败: {exc}",
         "api.rag.failed": "RAG 问答失败: {exc}",
-        # 候选材料读取失败原因
-        "api.reason.fulltext_missing": "未获取到全文",
+        # 上下文条目读取失败原因（工具层共用）
         "api.reason.no_usable_content": "没有可用的正文内容",
-        "api.read_fail.paper": "「{title}」：{reason}",
-        "api.read_fail.paper_abstract_only": "「{title}」全文不可得（{reason}），已降级为仅依据摘要",
-        "api.read_fail.context": "上下文「{title}」：{reason}",
         "api.read_fail.context_gone": "上下文项 #{sid}：已不存在，可能被删除",
-        # 候选材料读取结果（observation / 内部读取情况）
-        "api.read_materials.select_failed": "判断需要阅读的材料失败: {exc}",
-        "api.read_materials.read_ok": "已读取 {n} 项候选材料：{shown}",
-        "api.read_materials.empty": "内容为空",
-        "api.read_materials.some_failed": "；{n} 项未能读取：{reasons}",
-        "api.read_materials.some_degraded": "；{n} 项降级使用（如仅有摘要）：{reasons}",
-        "api.read_materials.none_usable": "所选材料均无可用正文",
-        "api.read_materials.all_failed": "候选材料均未能读取：{reasons}",
         # 回答生成
         "api.answer.no_material_notice":
-            "当前没有可引用的文献材料（未打开论文、上下文库为空，也未检索到可读文献）。"
-            "以下回答由 AI 基于通用知识生成，未经材料核实，请注意甄别；"
-            "打开论文或添加上下文后即可获得有据可依的回答。",
-        "api.answer.no_material_with_note":
-            "材料未能成功读取（{note}）。以下回答未引用任何文献，"
-            "由 AI 基于通用知识生成，请注意甄别；可尝试刷新论文 PDF 或添加上下文。",
+            "本轮没有读到可用于回答的材料（AI 未读取当前论文或上下文条目，也未检索到"
+            "可读文献）。以下回答由 AI 基于通用知识生成，未经材料核实，请注意甄别；"
+            "打开论文、把材料加入上下文库或明确要求 AI 阅读后，即可获得有据可依的回答。",
         "api.answer.no_passages_notice":
             "已有材料中没有可解析的正文段落（{note}）。以下回答由 AI 基于通用知识生成，请注意甄别。",
         # 材料兜底展示名
@@ -82,9 +81,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.pdf.not_available": "该论文没有可下载的 PDF",
         "api.pdf.download_failed": "无法下载该论文的 PDF：{reason}",
         # RAG 问答参数
-        "api.rag.missing_paper_id": "缺少 paper_id",
         "api.rag.missing_question": "缺少 question",
-        "api.rag.no_evidence": "该问题与当前论文和上下文库均不相关，未找到可用于回答的依据",
         # state / 笔记 / 上下文库 / 数据块
         "api.title_required": "title 不能为空",
         "api.state.invalid": "state 必须是 JSON 对象",
@@ -113,55 +110,61 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ReAct tool display names
         "api.tool_label.paper_search": "Academic paper search",
         "api.tool_label.read_paper": "Read paper full text",
+        "api.tool_label.read_context": "Read context material",
         "api.tool_label.read_document": "Read current document",
-        "api.tool_label.read_materials": "Read candidate materials",
         "api.tool_label.list_mindmaps": "List mind maps",
         "api.tool_label.create_mindmap": "Create mind map",
         "api.tool_label.read_mindmap": "Read mind map",
         "api.tool_label.edit_mindmap": "Edit mind map",
         "api.tool_label.attach_paper_to_mindmap": "Attach paper to mind map",
-        # List / truncation joining
+        # List joining
         "api.separator.list": ", ",
-        "api.separator.reason": "; ",
-        "api.more_items": " and {n} more",
         # SSE stages and error hints
         "api.stopped": "Generation stopped",
-        "api.stage.fetch_current_fulltext": "Fetching full text of the current paper...",
-        "api.stage.reading_context": "Reading context \"{title}\"...",
-        "api.stage.selecting_materials": "Determining which materials to read...",
         "api.stage.thinking_next": "AI is thinking about the next step...",
         "api.stage.thought_failed": "Error during reasoning; answering from existing material: {exc}",
         "api.stage.unknown_tool": "AI requested an unknown tool {name}; stopping the tool loop",
         "api.stage.no_progress": "AI requested the same tool repeatedly with no progress; stopping the tool loop...",
-        "api.stage.retrieving": "Retrieving relevant content...",
+        "api.stage.preparing_material": "Preparing material...",
         "api.stage.generating": "Generating answer...",
+        "api.stage.mindmap_filling": "Newly created mind map is still empty; AI is filling its nodes...",
+        # Mindmap turn-budget safety net: reminder when create happened but the
+        # loop hit its turn cap (or READY) before any edit filled the map
+        "api.mindmap.fill_reminder":
+            "System reminder: the mind map you created this turn, \u201c{titles}\u201d, "
+            "currently contains ONLY its root node and no branches — it cannot be "
+            "delivered like this. Finish it now: within at most {turns} more tool "
+            "steps, use edit_mindmap to add complete branches and child nodes in "
+            "batch (grounded strictly in the materials retrieved/read this turn and "
+            "in the user's request); if the structure is already clear in your mind, "
+            "you may rebuild it fully in one shot with from_mermaid. Do NOT create "
+            "another empty map, do not delete and recreate it, and do not substitute "
+            "a text-based mind map. Reply READY only after the map is filled.",
+        # Mindmap tool outcome visible to the final answer (DB state is authoritative)
+        "api.mindmap.finding_skeleton":
+            "create_mindmap created the mind map \u201c{title}\u201d (id: {map_id}) this "
+            "turn, but by the end of the tool loop it still has only a root node and "
+            "no branches (edit_mindmap filling was not completed or not executed). "
+            "You must honestly tell the user the map was created but is not yet "
+            "filled in; do not claim it is complete, do not draw a text-based mind "
+            "map instead, and offer to fill it on the user's confirmation.",
+        "api.mindmap.finding_filled":
+            "The mindmap tools successfully created/updated the mind map "
+            "\u201c{title}\u201d (id: {map_id}) this turn; it now contains {nodes} nodes "
+            "and is ready in the mindmap view. Tell the user in one sentence that "
+            "the map is ready; NEVER replace it with a Markdown/indented/text tree.",
         "api.tool_exec_failed": "{tool_label} failed: {exc}",
         "api.rag.failed": "RAG Q&A failed: {exc}",
-        # Candidate material read failure reasons
-        "api.reason.fulltext_missing": "Full text not retrieved",
+        # Context item read failure reasons (shared by the tool layer)
         "api.reason.no_usable_content": "No usable body content",
-        "api.read_fail.paper": "\"{title}\": {reason}",
-        "api.read_fail.paper_abstract_only": "\"{title}\": full text unavailable ({reason}); fell back to the abstract only",
-        "api.read_fail.context": "Context \"{title}\": {reason}",
         "api.read_fail.context_gone": "Context item #{sid}: no longer exists; it may have been deleted",
-        # Candidate material read result (observation / internal read note)
-        "api.read_materials.select_failed": "Failed to determine materials to read: {exc}",
-        "api.read_materials.read_ok": "Read {n} candidate material item(s): {shown}",
-        "api.read_materials.empty": "no content",
-        "api.read_materials.some_failed": "; {n} item(s) could not be read: {reasons}",
-        "api.read_materials.some_degraded": "; {n} item(s) used in degraded form (e.g. abstract only): {reasons}",
-        "api.read_materials.none_usable": "None of the selected materials has usable body content",
-        "api.read_materials.all_failed": "No candidate material could be read: {reasons}",
         # Answer generation
         "api.answer.no_material_notice":
-            "No citable material is available right now (no paper is open, the context library is "
-            "empty, and no readable literature was retrieved). The answer below is generated from the "
-            "AI's general knowledge without source verification — please judge it carefully. Open a "
-            "paper or add context to get a source-grounded answer.",
-        "api.answer.no_material_with_note":
-            "The material could not be read ({note}). The answer below cites no literature and is "
-            "generated from the AI's general knowledge; please judge it carefully. Try refreshing the "
-            "paper's PDF or adding context.",
+            "No usable material was read this turn (the AI did not read the current paper or "
+            "context items, and no readable literature was retrieved). The answer below is "
+            "generated from the AI's general knowledge without source verification — please judge "
+            "it carefully. Open a paper, add material to the context library, or explicitly ask the "
+            "AI to read it to get a source-grounded answer.",
         "api.answer.no_passages_notice":
             "The available material contains no parseable body passages ({note}). The answer below is "
             "generated from the AI's general knowledge; please judge it carefully.",
@@ -178,9 +181,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api.pdf.not_available": "No downloadable PDF is available for this paper",
         "api.pdf.download_failed": "Failed to download the paper PDF: {reason}",
         # RAG question params
-        "api.rag.missing_paper_id": "Missing paper_id",
         "api.rag.missing_question": "Missing question",
-        "api.rag.no_evidence": "The question is unrelated to both the current paper and the context library; no evidence was found to answer it",
         # state / notes / context library / data blocks
         "api.title_required": "title cannot be empty",
         "api.state.invalid": "state must be a JSON object",

@@ -37,6 +37,8 @@ const AiMindmapEditBar: React.FC<AiMindmapEditBarProps> = ({ edits, locked = fal
   }, [mindmapsByScope, t]);
 
   const handleUndo = useCallback(async (edit: ChatMindmapEdit) => {
+    // AI 新建（无编辑事务）不提供撤销：删除整张图请走图库管理
+    if (!edit.transactionId) return;
     setBusyId(edit.mapId);
     setErrorMap((m) => {
       const next = { ...m };
@@ -92,19 +94,25 @@ const AiMindmapEditBar: React.FC<AiMindmapEditBarProps> = ({ edits, locked = fal
               </span>
             ) : (
               <>
-                <span className="min-w-0 flex-1 truncate">{t('ai.edited', { title })}</span>
+                <span className="min-w-0 flex-1 truncate">
+                  {edit.transactionId
+                    ? t('ai.edited', { title })
+                    : t('ai.created', { title })}
+                </span>
                 <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => void handleUndo(edit)}
-                    disabled={busyId === edit.mapId}
-                    className="flex items-center gap-1 rounded-md bg-primary/15 px-2 py-1 font-medium text-primary ring-1 ring-primary/30 transition-colors hover:bg-primary/25 disabled:opacity-50"
-                  >
-                    {busyId === edit.mapId
-                      ? <Loader2 size={12} className="animate-spin" />
-                      : <Undo2 size={12} />}
-                    {t('ai.undo')}
-                  </button>
+                  {edit.transactionId && (
+                    <button
+                      type="button"
+                      onClick={() => void handleUndo(edit)}
+                      disabled={busyId === edit.mapId}
+                      className="flex items-center gap-1 rounded-md bg-primary/15 px-2 py-1 font-medium text-primary ring-1 ring-primary/30 transition-colors hover:bg-primary/25 disabled:opacity-50"
+                    >
+                      {busyId === edit.mapId
+                        ? <Loader2 size={12} className="animate-spin" />
+                        : <Undo2 size={12} />}
+                      {t('ai.undo')}
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => onChange(edit.mapId, { kept: true })}

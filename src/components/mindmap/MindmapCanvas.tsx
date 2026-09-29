@@ -1,9 +1,8 @@
 /**
  * 思维导图几何画布（React Flow）。
  *
- * - 文档单向派生：doc → RF nodes/edges；拖拽位置仅在拖动期间用本地 override 渲染，
- *   dragStop 才合成动作落文档（避免每个拖动帧产生历史/请求）；
- * - 拖到另一节点上（data-mm-node-id 命中）= reparent，落点绿色高亮，自身/后代拒绝；
+ * - 文档单向派生：doc → RF nodes/edges；节点位置完全由 mermaid 同源布局决定，
+ *   节点不可拖拽（几何不是用户数据），结构编辑走工具栏/键盘/代码面板/AI；
  * - 滚轮上滑放大（React Flow 默认方向，显式声明）；
  * - 键盘：Tab 子主题 / Enter 同级 / Delete 删除（promote）/ F2、双击编辑 /
  *   Ctrl+Z、Ctrl+Shift+Z 撤销重做；
@@ -28,7 +27,6 @@ import {
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
-  type Edge,
   type EdgeChange,
   type NodeChange,
 } from '@xyflow/react';
@@ -46,16 +44,26 @@ import {
   Wand2,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import type { XYPosition } from '@xyflow/system';
 import type { MindmapAction, MindmapDoc, MindmapInfo, MindmapNode } from '../../types';
-import { descendantIds } from '../../lib/mindmap';
+import {
+  descendantIds,
+  edgeWidthForLevel,
+  fillForSection,
+  orderedChildren,
+  sectionOfNodes,
+} from '../../lib/mindmap';
+import { MindmapConflictError } from '../../api';
 import { usePaperMindStore } from '../../store';
+import { MINDMAP_TYPE } from '../../lib/mindmap';
 import MindmapNodeView, {
   MindmapNodeHandlersContext,
   type MindmapFlowNode,
 } from './MindmapNode';
+import MindmapEdgeView, { type MindmapFlowEdge } from './MindmapEdge';
 import { useMindmapEditor } from './useMindmapEditor';
 import MindmapCodePanel from './MindmapCodePanel';
+import MermaidSourceView from './MermaidSourceView';
+import MermaidSourcePanel from './MermaidSourcePanel';
 
 /** 画布对外的命令式入口：代码面板、AI SSE diff 与页面工具栏通过它驱动编辑器 */
 export interface MindmapCanvasHandle {
@@ -75,15 +83,7 @@ export interface MindmapCanvasHandle {
 }
 
 const NODE_TYPES = { mindmap: MindmapNodeView };
-
-/** React Flow 回传原生事件（鼠标或触摸），统一取出触点坐标 */
-function pointOf(event: MouseEvent | TouchEvent): { x: number; y: number } {
-  if ('touches' in event) {
-    const touch = event.touches[0] ?? event.changedTouches[0];
-    return { x: touch?.clientX ?? 0, y: touch?.clientY ?? 0 };
-  }
-  return { x: event.clientX, y: event.clientY };
-}
+const EDGE_TYPES = { mindmap: MindmapEdgeView };
 
 export interface MindmapCanvasProps {
   mapId: string;
@@ -149,6 +149,22 @@ const MindmapCanvas = forwardRef<MindmapCanvasHandle, MindmapCanvasProps>(functi
     );
   }
 
+  // 类型分流：mindmap=可编辑树画布；其他 mermaid 图=官方渲染只读视图（源码面板编辑）
+  if (cached.diagramType !== MINDMAP_TYPE) {
+    return (
+      <ReadonlySurface
+        key={`${mapId}:${reloadKey}`}
+        ref={ref}
+        mapId={mapId}
+        info={cached}
+        showCodePanel={showCodePanel}
+        onToggleCodePanel={onToggleCodePanel}
+        codePanelWidthClass={codePanelWidthClass}
+        className={className}
+      />
+    );
+  }
+
   return (
     <ReactFlowProvider>
       <EditorSurface
@@ -187,11 +203,31 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
   const editor = useMindmapEditor({ mapId, workspaceId, info, readOnly });
   const wrapperRef = useRef<HTMLDivElement>(null);
   const reactFlow = useReactFlow();
-  const [dragOverrides, setDragOverrides] = useState<Record<string, XYPosition>>({});
 
   const focusFitView = useCallback(() => {
     void reactFlow.fitView({ padding: 0.2, duration: 200, maxZoom: 1 });
   }, [reactFlow]);
+
+  // mermaid 布局落图后坐标整体切换：自动/手动布局结束后重新适应画布一次
+  const wasLayoutingRef = useRef(false);
+  useEffect(() => {
+    if (wasLayoutingRef.current && !editor.layouting && editor.nodeGeom.size > 0) {
+      focusFitView();
+    }
+    wasLayoutingRef.current = editor.layouting;
+  }, [editor.layouting, editor.nodeGeom.size, focusFitView]);
+
+  // mindmap 代码面板确认「转换成其他 mermaid 图」：整段源码替换，成功后外层按
+  // 新 diagramType 自动切只读视图；冲突落服务端最新文档并提示
+  const handleReplaceSource = useCallback(async (src: string) => {
+    const store = usePaperMindStore.getState();
+    try {
+      await store.replaceMindmapSource(mapId, src);
+    } catch (e) {
+      if (e instanceof MindmapConflictError) store.cacheMindmapDoc(e.currentMindmap);
+      window.alert(e instanceof Error ? e.message : String(e));
+    }
+  }, [mapId]);
 
   // 对外命令式入口（代码面板 / AI SSE / 页面工具栏）
   useImperativeHandle(ref, () => ({
@@ -221,41 +257,78 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
     return parents;
   }, [editor.doc]);
 
+  // ---------- section 配色与树层级（结构推导，不依赖 mermaid 离屏渲染） ----------
+  const sectionMap = useMemo(() => sectionOfNodes(editor.doc), [editor.doc]);
+  const depthMap = useMemo(() => {
+    const map = new Map<string, number>();
+    const root = editor.doc.nodes.find((n) => n.parentId === null);
+    if (!root) return map;
+    map.set(root.id, 0);
+    const walk = (parentId: string, depth: number) => {
+      for (const child of orderedChildren(editor.doc.nodes, parentId)) {
+        map.set(child.id, depth);
+        walk(child.id, depth + 1);
+      }
+    };
+    walk(root.id, 1);
+    return map;
+  }, [editor.doc]);
+
   // ---------- RF nodes / edges ----------
   const nodes: MindmapFlowNode[] = useMemo(() => {
     return editor.doc.nodes
       .filter((n) => !hiddenIds.has(n.id))
-      .map((n) => ({
-        id: n.id,
-        type: 'mindmap',
-        position: dragOverrides[n.id] ?? { x: n.x, y: n.y },
-        selected: editor.selectedId === n.id,
-        draggable: !readOnly,
-        data: {
-          node: n,
-          hasChildren: childParentSet.has(n.id),
+      .map((n) => {
+        const measured = editor.nodeGeom.get(n.id);
+        return {
+          id: n.id,
+          type: 'mindmap',
+          position: { x: n.x, y: n.y },
           selected: editor.selectedId === n.id,
-          editing: editor.editingId === n.id,
-          dropTarget: editor.dropTargetId === n.id,
-          readOnly,
-        },
-      }));
+          // 几何锁定：节点不可拖拽，位置只由 mermaid 布局决定
+          draggable: false,
+          // mermaid 实测尺寸存在时严格按官方宽高渲染，保证边 path 端点对齐
+          style: measured
+            ? { width: measured.width, height: measured.height }
+            : undefined,
+          data: {
+            node: n,
+            hasChildren: childParentSet.has(n.id),
+            selected: editor.selectedId === n.id,
+            editing: editor.editingId === n.id,
+            readOnly,
+            section: sectionMap.get(n.id) ?? null,
+            measured,
+          },
+        };
+      });
   }, [
-    editor.doc, editor.selectedId, editor.editingId, editor.dropTargetId,
-    hiddenIds, childParentSet, dragOverrides, readOnly,
+    editor.doc, editor.selectedId, editor.editingId, editor.nodeGeom,
+    hiddenIds, childParentSet, readOnly, sectionMap,
   ]);
 
-  const edges: Edge[] = useMemo(() => {
+  const edges: MindmapFlowEdge[] = useMemo(() => {
     return editor.doc.nodes
       .filter((n) => n.parentId !== null && !hiddenIds.has(n.id) && !hiddenIds.has(n.parentId))
-      .map((n) => ({
-        id: `${n.parentId}->${n.id}`,
-        source: n.parentId as string,
-        target: n.id,
-        sourceHandle: 'out',
-        targetHandle: 'in',
-      }));
-  }, [editor.doc.nodes, hiddenIds]);
+      .map((n) => {
+        const id = `${n.parentId}->${n.id}`;
+        const childSection = sectionMap.get(n.id) ?? 0;
+        return {
+          id,
+          type: 'mindmap',
+          source: n.parentId as string,
+          target: n.id,
+          sourceHandle: 'out',
+          targetHandle: 'in',
+          data: {
+            // 节点不可拖：mermaid 官方 path 始终有效；tidy 降级期间为空走贝塞尔兜底
+            geom: editor.edgeGeom.get(id),
+            fallbackStroke: fillForSection(childSection),
+            fallbackWidth: edgeWidthForLevel(depthMap.get(n.id) ?? 1),
+          },
+        };
+      });
+  }, [editor.doc.nodes, editor.edgeGeom, hiddenIds, sectionMap, depthMap]);
 
   const nodeHandlers = useMemo(() => ({
     onStartEdit: editor.startEdit,
@@ -268,47 +341,18 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
     editor.toggleCollapsed, onOpenPaper,
   ]);
 
-  // ---------- 受控变更：选择与拖拽中间帧 ----------
+  // ---------- 受控变更：仅选择（位置锁定，不接受 position 变更） ----------
   const onNodesChange = useCallback((changes: NodeChange<MindmapFlowNode>[]) => {
     for (const change of changes) {
       if (change.type === 'select') {
         if (change.selected) editor.setSelectedId(change.id);
         else if (editor.selectedId === change.id) editor.setSelectedId(null);
-      } else if (change.type === 'position' && change.dragging && change.position) {
-        setDragOverrides((cur) => ({ ...cur, [change.id]: change.position as XYPosition }));
       }
     }
   }, [editor]);
 
   // RF 要求 edges 引用存在以接受变更；本画布边完全派生，空实现即可
   const onEdgesChange = useCallback((_changes: EdgeChange[]) => undefined, []);
-
-  const dropCandidateFromPoint = useCallback((clientX: number, clientY: number, draggedId: string): string | null => {
-    const el = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
-    const wrap = el?.closest('[data-mm-node-id]') as HTMLElement | null;
-    const candidate = wrap?.dataset.mmNodeId ?? null;
-    if (!candidate || candidate === draggedId) return null;
-    if (descendantIds(editor.doc.nodes, draggedId).includes(candidate)) return null;
-    return candidate;
-  }, [editor.doc.nodes]);
-
-  const onNodeDrag = useCallback((event: MouseEvent | TouchEvent, node: MindmapFlowNode) => {
-    const p = pointOf(event);
-    const candidate = dropCandidateFromPoint(p.x, p.y, node.id);
-    if (candidate !== editor.dropTargetId) editor.setDropTargetId(candidate);
-  }, [dropCandidateFromPoint, editor]);
-
-  const onNodeDragStop = useCallback((event: MouseEvent | TouchEvent, node: MindmapFlowNode) => {
-    const p = pointOf(event);
-    const candidate = dropCandidateFromPoint(p.x, p.y, node.id);
-    editor.commitDrag(node.id, node.position.x, node.position.y, candidate);
-    setDragOverrides((cur) => {
-      const next = { ...cur };
-      delete next[node.id];
-      return next;
-    });
-    editor.setDropTargetId(null);
-  }, [dropCandidateFromPoint, editor]);
 
   // ---------- 键盘 ----------
   const onKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -390,7 +434,13 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
     },
     { key: 'undo', title: t('toolbar.undo'), icon: <Undo2 size={16} />, onClick: editor.undo, disabled: !editor.canUndo },
     { key: 'redo', title: t('toolbar.redo'), icon: <Redo2 size={16} />, onClick: editor.redo, disabled: !editor.canRedo },
-    { key: 'layout', title: t('toolbar.relayout'), icon: <Wand2 size={16} />, onClick: editor.relayout, disabled: readOnly },
+    {
+      key: 'layout',
+      title: editor.layouting ? t('status.layingOut') : t('toolbar.relayout'),
+      icon: editor.layouting ? <Loader2 size={16} className="animate-spin" /> : <Wand2 size={16} />,
+      onClick: editor.relayout,
+      disabled: readOnly || editor.layouting,
+    },
     { key: 'fit', title: t('toolbar.fitView'), icon: <Maximize size={16} />, onClick: focusFitView, disabled: false },
   ];
 
@@ -407,10 +457,9 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
           nodes={nodes}
           edges={edges}
           nodeTypes={NODE_TYPES}
+          edgeTypes={EDGE_TYPES}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
-          onNodeDrag={onNodeDrag}
-          onNodeDragStop={onNodeDragStop}
           onNodeClick={(_e, node) => editor.setSelectedId(node.id)}
           onPaneClick={() => { editor.setSelectedId(null); focusWrapper(); }}
           // 滚轮上滑放大（deltaY<0 → zoom in）：React Flow 默认行为，显式声明确保不被 panOnScroll 翻转
@@ -421,10 +470,10 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
           maxZoom={2.5}
           fitView
           fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-          defaultEdgeOptions={{ style: { stroke: '#475569', strokeWidth: 1.5 } }}
           multiSelectionKeyCode={null}
           deleteKeyCode={null}
-          nodesDraggable={!readOnly}
+          // 几何锁定：任何模式下节点都不可拖动，排布永远以 mermaid 为准
+          nodesDraggable={false}
           nodesConnectable={false}
           elementsSelectable
           proOptions={{ hideAttribution: false }}
@@ -438,9 +487,10 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
             nodeColor={(n) => {
               const data = (n as MindmapFlowNode).data;
               const node = data?.node;
-              if (node?.parentId === null) return '#3B82F6';
-              if (node?.kind === 'paper') return '#10B981';
-              return '#475569';
+              if (!node) return '#475569';
+              if (node.parentId === null) return '#797D7D';
+              if (node.kind === 'paper') return '#10B981';
+              return fillForSection(sectionMap.get(node.id) ?? 0);
             }}
             maskColor="rgba(15,23,42,0.75)"
           />
@@ -476,6 +526,22 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
               )}
             </div>
           </Panel>
+
+          {editor.layoutNotice && (
+            <Panel position="top-center" className="!m-2">
+              <div className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200 shadow-lg backdrop-blur">
+                <AlertTriangle size={13} className="shrink-0 text-amber-400" />
+                <span>{t(`status.${editor.layoutNotice}`)}</span>
+                <button
+                  type="button"
+                  className="text-amber-300/60 hover:text-amber-200"
+                  onClick={editor.clearLayoutNotice}
+                >
+                  ×
+                </button>
+              </div>
+            </Panel>
+          )}
 
           <Panel position="bottom-left" className="!m-2">
             <div className="flex items-center gap-2 rounded-lg border border-border bg-surface/95 px-2.5 py-1 text-xs text-textSecondary shadow-lg backdrop-blur">
@@ -527,12 +593,70 @@ const EditorSurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function Edi
           <MindmapCodePanel
             doc={editor.doc}
             onApplyTarget={editor.adoptUserTarget}
+            onReplaceSource={handleReplaceSource}
             readOnly={readOnly}
           />
         </div>
       )}
       </div>
     </MindmapNodeHandlersContext.Provider>
+  );
+});
+
+/**
+ * 非 mindmap 图的只读表面：左侧 mermaid 官方渲染，右侧源码编辑面板。
+ * ref 命令仅保留兼容外壳（无节点树，结构化命令为空操作；AI 不会编辑此类图）。
+ */
+const ReadonlySurface = forwardRef<MindmapCanvasHandle, SurfaceProps>(function ReadonlySurface({
+  mapId,
+  workspaceId = null,
+  info,
+  showCodePanel = false,
+  onToggleCodePanel,
+  codePanelWidthClass = 'w-[380px]',
+  className,
+}, ref) {
+  const { t } = useTranslation('mindmap');
+  const source = info.source ?? '';
+
+  useImperativeHandle(ref, () => ({
+    getDoc: () => ({ nodes: [], diagramType: info.diagramType, source }),
+    adoptUserTarget: () => undefined,
+    applyExternalDiff: () => undefined,
+    relayout: () => undefined,
+    fitView: () => undefined,
+    reloadFromServer: async () => {
+      await usePaperMindStore.getState().loadMindmapDoc(mapId, workspaceId, true);
+    },
+  }), [info.diagramType, source, mapId, workspaceId]);
+
+  return (
+    <div className={`mm-dark flex h-full w-full overflow-hidden ${className ?? ''}`}>
+      <div className="relative h-full min-w-0 flex-1">
+        <MermaidSourceView source={source} />
+        {onToggleCodePanel && (
+          <div className="absolute left-3 top-3 z-10 flex items-center gap-0.5 rounded-lg border border-border bg-surface/95 p-1 shadow-lg backdrop-blur">
+            <button
+              type="button"
+              title={t('toolbar.codeToggle')}
+              aria-label={t('toolbar.codeToggle')}
+              aria-pressed={showCodePanel}
+              onClick={onToggleCodePanel}
+              className={`rounded-md p-1.5 transition-colors ${
+                showCodePanel ? 'bg-primary/15 text-primary' : 'text-textSecondary hover:bg-white/10 hover:text-text'
+              }`}
+            >
+              <Code2 size={16} />
+            </button>
+          </div>
+        )}
+      </div>
+      {showCodePanel && (
+        <div className={`h-full shrink-0 ${codePanelWidthClass}`}>
+          <MermaidSourcePanel mapId={mapId} source={source} />
+        </div>
+      )}
+    </div>
   );
 });
 

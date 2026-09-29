@@ -30,6 +30,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "search.openalex_id_parse_failed": "无法解析 OpenAlex work id: {url}",
         "search.arxiv_id_parse_failed": "无法从 arXiv URL 解析 id: {url}",
         "search.arxiv_not_found": "arXiv 未找到论文 {external_id}",
+        # arXiv 突发限流：连发请求会触发边缘 406/429（空响应），节流退避重试后仍失败
+        "search.arxiv_rate_limited": "arXiv 请求过于频繁被临时限流（HTTP {status}），退避重试后仍未成功，请稍后再试",
         # CORE 鉴权与限流
         "search.core_auth_failed": "CORE 鉴权失败（HTTP {status}），请检查 API Key 是否有效",
         "search.core_anonymous_rejected": "CORE 拒绝了匿名请求，请在「设置」中填写 CORE API Key",
@@ -60,6 +62,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "search.openalex_id_parse_failed": "Cannot parse OpenAlex work id: {url}",
         "search.arxiv_id_parse_failed": "Cannot parse id from arXiv URL: {url}",
         "search.arxiv_not_found": "Paper not found on arXiv: {external_id}",
+        # arXiv burst throttling: rapid requests trigger edge 406/429 (empty body)
+        "search.arxiv_rate_limited": "arXiv temporarily throttled requests as too frequent (HTTP {status}); still failing after backoff retries, please try again later",
         # CORE authentication and rate limiting
         "search.core_auth_failed": "CORE authentication failed (HTTP {status}); check that the API key is valid",
         "search.core_anonymous_rejected": "CORE rejected the anonymous request; enter a CORE API key in Settings",

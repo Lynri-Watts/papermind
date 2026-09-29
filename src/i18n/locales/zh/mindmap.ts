@@ -9,6 +9,8 @@ export default {
     saved: '已保存',
     conflict: '导图已在其他地方被修改，已自动载入最新版本',
     saveFailed: '保存失败，请检查后端服务',
+    layingOut: '正在按 mermaid 排布…',
+    layoutFailed: 'mermaid 排布失败，已使用内置布局',
   },
   toolbar: {
     addChild: '添加子主题（Tab）',
@@ -48,6 +50,52 @@ export default {
     heroDesc: '用几何画布直接拖拽，或用 mermaid 文本精确编辑——两种方式共享同一份文档；AI 的修改实时落图，并可按次撤销。',
     updatedAt: '更新于 {{time}}',
     operationFailed: '操作失败：{{message}}',
+    titleRequired: '请填写导图标题',
+    createKindUnsupported: '暂不支持所选图类型的骨架模板',
+    createTitle: '新建导图',
+    createTitleLabel: '标题',
+    createKindLabel: '图类型',
+    createSourceLabel: 'Mermaid 源码（可选）',
+    createSourcePlaceholder: '粘贴 mermaid 代码，例如：\nflowchart TD\n  A[开始] --> B[结束]',
+    createSourceHint: '留空将按所选类型创建；填写后以源码首声明的实际类型为准（支持 flowchart、sequenceDiagram、timeline 等任意 mermaid 图，创建后为只读，可在代码面板修改源码）。',
+    createCancel: '取消',
+    createSubmit: '创建',
+  },
+  // mermaid 图类型展示名（与 diagramType.ts DIAGRAM_LABEL_KEYS 对应；未知类型直接显示原始 token）
+  diagram: {
+    badgeTitle: '{{type}} 图（只读，可用代码面板修改源码）',
+    kind: {
+      mindmap: '思维导图',
+      flowchart: '流程图',
+      sequence: '时序图',
+      class: '类图',
+      state: '状态图',
+      er: 'ER 图',
+      journey: '用户旅程图',
+      gantt: '甘特图',
+      pie: '饼图',
+      timeline: '时间线',
+      gitGraph: 'Git 图',
+      quadrant: '象限图',
+      requirement: '需求图',
+      architecture: '架构图',
+    },
+  },
+  // 非 mindmap 只读 mermaid 视图
+  view: {
+    loading: '正在渲染图表…',
+    empty: '暂无图表内容',
+    renderFailed: 'Mermaid 渲染失败',
+    zoomIn: '放大',
+    zoomOut: '缩小',
+    fitWidth: '适应宽度',
+  },
+  // 非 mindmap 图的源码面板
+  source: {
+    title: 'Mermaid 源码',
+    save: '保存源码',
+    headerRequired: '缺少 mermaid 图声明（首行应为 flowchart / sequenceDiagram / mindmap 等）',
+    conflict: '导图已在其他地方被修改，已载入最新版本，请重新编辑后再保存',
   },
   dock: {
     title: '当前导图',
@@ -68,6 +116,7 @@ export default {
   },
   ai: {
     edited: 'AI 修改了导图「{{title}}」，可整次撤销',
+    created: 'AI 已为你新建导图「{{title}}」',
     editingLive: 'AI 正在编辑导图…',
     stepBadge: '思维导图',
     fallbackTitle: '思维导图',
@@ -89,6 +138,9 @@ export default {
     gotoLine: '跳转到第 {{line}} 行',
     previewFailed: 'Mermaid 渲染失败',
     previewLoading: '正在渲染…',
+    convertApply: '转换为 {{type}} 图',
+    convertHint: '当前文本声明的是 {{type}} 图：保存后本思维导图的节点树将被这段源码取代，并切换为只读图表；节点无法再恢复，但仍可随时在代码面板改回 mindmap。',
+    convertConfirm: '确定将这张思维导图转换为 {{type}} 图吗？\n\n现有节点树会被这段源码取代，图将变为只读图表（可随时再用 mindmap 源码转回）。',
   },
   err: {
     // —— 文档内核：通用 ——
@@ -111,6 +163,7 @@ export default {
     sibling_order_conflict: '同一层级存在重复的排序值',
     cycle_detected: '该操作会形成环路：{{id}}',
     text_invalid: '节点 {{id}} 的文本必须是字符串',
+    invalid_shape: '节点 {{id}} 的形状非法：{{shape}}',
     // —— 动作批处理 ——
     actions_not_list: 'actions 必须是数组',
     action_malformed: '动作格式不是对象',

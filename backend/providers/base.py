@@ -24,6 +24,10 @@ class Paper:
     external_id: str = ""        # 源内的原始 id
     url: str = ""                # 落地页
     pdf_url: Optional[str] = None
+    # 该论文全部已知的开放获取全文地址（按 provider 给出的可靠性排序，去重）：
+    # 首选镜像被反爬/限流时，下载层依次尝试后续镜像；pdf_url 恒为其中第一个，
+    # 旧调用方只取 pdf_url 时行为不变
+    pdf_candidates: list[str] = field(default_factory=list)
     citation_count: Optional[int] = None
     reference_count: Optional[int] = None
     publication_venue: Optional[str] = None

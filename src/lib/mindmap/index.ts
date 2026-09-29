@@ -3,7 +3,10 @@
  * 画布、代码面板、SSE AI diff 全部只依赖本目录，保证 GUI 与 AI 走同一套语义。
  */
 export * from './model';
+export * from './diagramType';
 export * from './mmdParser';
 export * from './mmdSerializer';
 export * from './layout';
 export * from './diffMerge';
+export * from './mermaidLoader';
+export * from './mermaidLayout';

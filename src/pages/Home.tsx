@@ -37,7 +37,7 @@ function formatTime(ts: number, t: TFunction): string {
  */
 const Home: React.FC = () => {
   const { t } = useTranslation(['home', 'common']);
-  const { workspaces, setWorkspaces, activeWorkspaceId, switchWorkspace, setActiveWorkspaceId, setCurrentView } = usePaperMindStore();
+  const { workspaces, setWorkspaces, activeWorkspaceId, switchWorkspace, leaveWorkspace, setCurrentView } = usePaperMindStore();
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -125,7 +125,9 @@ const Home: React.FC = () => {
         return next;
       });
       if (activeWorkspaceId === ws.id) {
-        setActiveWorkspaceId(null);
+        // 删除的是当前工作区：清空其页面状态（聊天历史等只属于工作区），
+        // 回到无归属状态，避免被删工作区的对话残留在面板里继续可写
+        leaveWorkspace();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : t('errors.deleteFailed'));

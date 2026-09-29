@@ -18,9 +18,10 @@
 - 序列化始终带 ID 注解，因此「导出 → 再导入」可按稳定 ID 合入，不丢手动几何；
 - 无 ID 注解的手写节点按「索引路径」（根到它的同级序号序列）做确定性哈希，
   得到 ``n_<8hex>``：同结构文本重复导入得到相同 ID；
-- 支持的形状包裹（解析时归一为 topic，形状信息 v1 丢弃）：
-  ``((x))`` / ``(x)`` / ``[x]`` / ``{{x}}``；允许 ``root((x))`` 式前置节点名；
-- 论文节点：整行为一个 Markdown 链接，链接目标以 ``paper:`` 开头；
+- 支持的形状包裹（解析后保留为节点 shape 字段）：
+  ``((x))``→circle / ``{{x}}``→hexagon / ``[x]``→rect / ``(x)``→rounded，
+  无包裹为 default；根节点规范形状恒为 circle；允许 ``root((x))`` 式前置节点名；
+- 论文节点：整行为一个 Markdown 链接（形状记 rect），链接目标以 ``paper:`` 开头；
 - 不支持：非 mindmap 图类型、自由边、``::icon()`` 类指令行（直接跳过）。
 
 解析失败抛 :class:`services.mindmap_doc.MindmapError`，参数带 ``line`` 行号（1-based）。
@@ -31,6 +32,7 @@ import hashlib
 import re
 from typing import Any
 
+from .mindmap_diagram import MINDMAP_TYPE, detect_diagram_header
 from .mindmap_doc import (
     MindmapError,
     make_node,
@@ -44,14 +46,15 @@ from .mindmap_doc import (
 PAPER_LINK_RE = re.compile(r"^\[([^\]]*)\]\(paper:([^\s)]+)\)\s*$")
 #: 注释中的稳定 ID 注解
 ID_ANNOTATION_RE = re.compile(r"(?:^|\s)id:(n_[0-9a-fA-F]{8})\b")
-#: 支持的形状包裹（长前缀优先）
-_SHAPE_WRAPPERS = (("((", "))"), ("{{", "}}"), ("[", "]"), ("(", ")"))
+#: 支持的形状包裹（长前缀优先）→ shape 枚举
+_SHAPE_WRAPPERS = (
+    ("((", "))", "circle"),
+    ("{{", "}}", "hexagon"),
+    ("[", "]", "rect"),
+    ("(", ")", "rounded"),
+)
 #: root((mindmap)) 式前置节点名（解析后丢弃，仅用于兼容官方语法）
 _PREFIX_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*")
-
-#: 占位布局（后端导入时给线性初值；前端可再 tidy-tree）
-LEVEL_X = 240.0
-ROW_Y = 72.0
 
 
 def _line_error(key: str, line: int, **params: Any) -> MindmapError:
@@ -59,20 +62,26 @@ def _line_error(key: str, line: int, **params: Any) -> MindmapError:
     return MindmapError(key, **params)
 
 
-def _strip_shape(content: str) -> str:
-    """剥离形状包裹与可选的前置节点名，返回纯文本。"""
+def _parse_shape(content: str) -> tuple[str, str]:
+    """提取形状包裹与可选前置节点名，返回 (纯文本, shape)。"""
     text = content.strip()
-    for left, right in _SHAPE_WRAPPERS:
-        if text.startswith(left) and text.endswith(right) and len(text) >= len(left) + len(right):
-            return text[len(left):len(text) - len(right)].strip()
-    # root((mindmap)) / id[Text] 形式：先剥前置名再试形状
+
+    def match_wrapper(s: str) -> tuple[str, str] | None:
+        for left, right, shape in _SHAPE_WRAPPERS:
+            if s.startswith(left) and s.endswith(right) and len(s) >= len(left) + len(right):
+                return s[len(left):len(s) - len(right)].strip(), shape
+        return None
+
+    direct = match_wrapper(text)
+    if direct is not None:
+        return direct
     match = _PREFIX_NAME_RE.match(text)
     if match:
         rest = text[match.end():].lstrip()
-        for left, right in _SHAPE_WRAPPERS:
-            if rest.startswith(left) and rest.endswith(right) and len(rest) >= len(left) + len(right):
-                return rest[len(left):len(rest) - len(right)].strip()
-    return text
+        named = match_wrapper(rest)
+        if named is not None:
+            return named
+    return text, "default"
 
 
 def _path_id(path: tuple[int, ...]) -> str:
@@ -80,8 +89,8 @@ def _path_id(path: tuple[int, ...]) -> str:
     return f"n_{digest}"
 
 
-def _parse_content(content: str, line_no: int) -> tuple[str, str, str | None]:
-    """返回 (kind, text, paperId)。"""
+def _parse_content(content: str, line_no: int) -> tuple[str, str, str, str | None]:
+    """返回 (kind, text, shape, paperId)。"""
     m = PAPER_LINK_RE.match(content)
     if m:
         text = m.group(1).strip()
@@ -90,8 +99,35 @@ def _parse_content(content: str, line_no: int) -> tuple[str, str, str | None]:
             validate_paper_id(paper_id)
         except MindmapError:
             raise _line_error("mindmap.invalid_paper_id", line_no, paper_id=paper_id)
-        return "paper", text, paper_id
-    return "topic", _strip_shape(content), None
+        # 论文节点在 mermaid 中即 [标题](paper:...) 矩形链接
+        return "paper", text, "rect", paper_id
+    text, shape = _parse_shape(content)
+    return "topic", text, shape, None
+
+
+def doc_from_mermaid_source(text: str) -> tuple[dict, str]:
+    """任意 mermaid 源码 → ``(doc, diagramType)``。
+
+    - ``mindmap`` 头：走缩进树解析器，产出节点树文档；
+    - 其他 mermaid 图（flowchart/sequenceDiagram/timeline…）：原文存储，
+      ``nodes`` 为空，diagramType 为首声明 token；其语法合法性由前端
+      mermaid 引擎负责，后端不模拟渲染。
+
+    与路由/AI 工具共用的唯一入口（前端 ``mmdParser.docFromMermaidSource``
+    为对等实现，改规则须双端同步）。
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise MindmapError("mindmap.mmd_empty")
+    header = detect_diagram_header(text)
+    if header is None:
+        raise MindmapError("mindmap.mmd_missing_header", line=1)
+    if header.kind == MINDMAP_TYPE:
+        return parse_mermaid(text), MINDMAP_TYPE
+    return {
+        "nodes": [],
+        "diagramType": header.type,
+        "source": text,
+    }, header.type
 
 
 def parse_mermaid(text: str) -> dict:
@@ -105,24 +141,19 @@ def parse_mermaid(text: str) -> dict:
 
     lines = text.splitlines()
 
-    # 1) 定位 mindmap 头（允许空行/注释先行）
-    header_line: int | None = None
-    for idx, raw in enumerate(lines, start=1):
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("%%"):
-            continue
-        if stripped.split("%%", 1)[0].strip() == "mindmap":
-            header_line = idx
-            break
-        raise _line_error("mindmap.mmd_missing_header", idx)
-    if header_line is None:
+    # 1) 定位 mindmap 头（允许空行 / %% 注释 / YAML front-matter 先行）
+    header_info = detect_diagram_header(text)
+    if header_info is None:
         raise MindmapError("mindmap.mmd_missing_header", line=1)
+    if header_info.kind != "mindmap":
+        # 首个声明是其他 mermaid 图（flowchart/sequenceDiagram…）或拼错的图头
+        raise _line_error("mindmap.mmd_missing_header", header_info.line)
+    header_line = header_info.line
 
     # 栈项：(column, node_id, sibling_index)
     stack: list[tuple[int, str, int]] = []
     level_columns: dict[int, int] = {}
     nodes: list[dict] = []
-    row_cursor = 0
 
     for line_no in range(header_line + 1, len(lines) + 1):
         raw = lines[line_no - 1]
@@ -191,12 +222,13 @@ def parse_mermaid(text: str) -> dict:
             sibling_index = sum(1 for n in nodes if n["parentId"] == parent_id)
             path = tuple(item[2] for item in stack) + (sibling_index,)
 
-        kind, text, paper_id = _parse_content(content, line_no)
+        kind, text, shape, paper_id = _parse_content(content, line_no)
         node_id = annotation or _path_id(path)
         node = make_node(node_id, parent_id, sibling_index, text,
-                         kind=kind, paper_id=paper_id,
-                         x=float(depth) * LEVEL_X, y=float(row_cursor) * ROW_Y)
-        row_cursor += 1
+                         kind=kind,
+                         # 根节点规范形状恒为 circle（与序列化器 ((x)) 对齐，往返幂等）
+                         shape="circle" if parent_id is None else shape,
+                         paper_id=paper_id)
         nodes.append(node)
 
         # 3) 入栈：新层压入；同层替换栈顶
@@ -232,6 +264,19 @@ def doc_to_mermaid(doc: dict) -> str:
     def safe_text(value: str) -> str:
         return (value or "").replace("\r", " ").replace("\n", " ").replace("%%", " ")
 
+    shape_wrappers = {
+        "circle": ("((", "))"),
+        "rect": ("[", "]"),
+        "rounded": ("(", ")"),
+        "hexagon": ("{{", "}}"),
+    }
+
+    def wrap_shape(shape: Any, text: str) -> str:
+        if not shape or shape == "default":
+            return text
+        left, right = shape_wrappers[shape]
+        return f"{left}{text}{right}"
+
     lines = ["mindmap"]
 
     def emit(node: dict, depth: int) -> None:
@@ -239,11 +284,12 @@ def doc_to_mermaid(doc: dict) -> str:
         annotation = f"%%id:{node['id']}"
         text = safe_text(node.get("text", ""))
         if depth == 0:
+            # 根恒为 circle，忽略可能的历史 shape 值
             body = f"(({text}))"
         elif node.get("kind") == "paper" and node.get("paperId"):
             body = f"[{text}](paper:{node['paperId']})"
         else:
-            body = text
+            body = wrap_shape(node.get("shape"), text)
         if body:
             lines.append(f"{indent}{body}  {annotation}")
         else:

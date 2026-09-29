@@ -36,6 +36,7 @@ interface CiteCardNodeProps {
   state: 'pending' | 'bound' | 'failed';
   sourceindex?: number;
   quote?: string;
+  display?: string;
 }
 
 const AssistantMessage: React.FC<AssistantMessageProps> = ({
@@ -80,13 +81,14 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
 
   const renderMarker = (
     key: React.Key,
-    cite: { state: 'pending' | 'bound' | 'failed'; sourceIndex?: number; quote: string },
+    cite: { state: 'pending' | 'bound' | 'failed'; sourceIndex?: number; quote: string; display?: string },
   ) => (
     <CitationMarker
       key={key}
       state={cite.state}
       sourceIndex={cite.sourceIndex}
       quote={cite.quote}
+      display={cite.display ?? ''}
       source={cite.sourceIndex != null ? sourceMap.get(cite.sourceIndex) : undefined}
       onLocate={
         cite.sourceIndex != null
@@ -97,13 +99,14 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
   );
 
   const markdownComponents = useMemo(() => ({
-    // 自定义节点：行内引用标记（可出现在句子中间、列表项、表格单元格内）
+    // 自定义节点：行内引用（可出现在句子中间、列表项、表格单元格内）
     citecard: (props: CiteCardNodeProps) => renderMarker(
-      `cite-${props.state}-${props.sourceindex ?? 'x'}-${props.quote}`,
+      `cite-${props.state}-${props.sourceindex ?? 'x'}-${props.quote}-${props.display ?? ''}`,
       {
         state: props.state,
         sourceIndex: typeof props.sourceindex === 'number' ? props.sourceindex : undefined,
         quote: props.quote ?? '',
+        display: props.display ?? '',
       },
     ),
     p: ({ children }) => <p className="text-sm leading-relaxed my-1.5">{children}</p>,

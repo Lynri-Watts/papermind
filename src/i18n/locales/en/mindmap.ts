@@ -9,6 +9,8 @@ export default {
     saved: 'Saved',
     conflict: 'This mind map was modified elsewhere. The latest version has been loaded.',
     saveFailed: 'Failed to save. Check the backend service.',
+    layingOut: 'Laying out with mermaid…',
+    layoutFailed: 'Mermaid layout failed; the built-in layout was used.',
   },
   toolbar: {
     addChild: 'Add child topic (Tab)',
@@ -48,6 +50,52 @@ export default {
     heroDesc: 'Drag nodes on the geometric canvas or edit precisely with mermaid text — both share one document. AI edits land on the canvas in real time and can be undone per turn.',
     updatedAt: 'Updated {{time}}',
     operationFailed: 'Operation failed: {{message}}',
+    titleRequired: 'Please enter a title',
+    createKindUnsupported: 'No starter template is available for the selected diagram type',
+    createTitle: 'New diagram',
+    createTitleLabel: 'Title',
+    createKindLabel: 'Diagram type',
+    createSourceLabel: 'Mermaid source (optional)',
+    createSourcePlaceholder: 'Paste mermaid code, e.g.:\nflowchart TD\n  A[Start] --> B[End]',
+    createSourceHint: 'Leave empty to create from the selected type; if provided, the actual type is taken from the source header (any mermaid type: flowchart, sequenceDiagram, timeline, …). Non-mindmap diagrams are read-only and can be edited via the source panel.',
+    createCancel: 'Cancel',
+    createSubmit: 'Create',
+  },
+  // Mermaid diagram type labels (aligned with DIAGRAM_LABEL_KEYS; unknown types show the raw token)
+  diagram: {
+    badgeTitle: '{{type}} diagram (read-only; edit the source in the code panel)',
+    kind: {
+      mindmap: 'Mind map',
+      flowchart: 'Flowchart',
+      sequence: 'Sequence diagram',
+      class: 'Class diagram',
+      state: 'State diagram',
+      er: 'ER diagram',
+      journey: 'User journey',
+      gantt: 'Gantt chart',
+      pie: 'Pie chart',
+      timeline: 'Timeline',
+      gitGraph: 'Git graph',
+      quadrant: 'Quadrant chart',
+      requirement: 'Requirement diagram',
+      architecture: 'Architecture diagram',
+    },
+  },
+  // Read-only mermaid view for non-mindmap diagrams
+  view: {
+    loading: 'Rendering diagram…',
+    empty: 'No diagram content',
+    renderFailed: 'Mermaid rendering failed',
+    zoomIn: 'Zoom in',
+    zoomOut: 'Zoom out',
+    fitWidth: 'Fit width',
+  },
+  // Source panel for non-mindmap diagrams
+  source: {
+    title: 'Mermaid source',
+    save: 'Save source',
+    headerRequired: 'Missing mermaid diagram header (the first declaration should be flowchart / sequenceDiagram / mindmap, etc.)',
+    conflict: 'The diagram was updated elsewhere. The latest version has been loaded; please edit again and save',
   },
   dock: {
     title: 'Current mind map',
@@ -68,6 +116,7 @@ export default {
   },
   ai: {
     edited: 'The AI edited mind map “{{title}}”. Undo this turn’s changes?',
+    created: 'The AI created a new mind map “{{title}}” for you',
     editingLive: 'The AI is editing the mind map…',
     stepBadge: 'Mind map',
     fallbackTitle: 'Mind map',
@@ -89,6 +138,9 @@ export default {
     gotoLine: 'Go to line {{line}}',
     previewFailed: 'Mermaid rendering failed',
     previewLoading: 'Rendering…',
+    convertApply: 'Convert to {{type}} diagram',
+    convertHint: 'The text declares a {{type}} diagram: saving replaces this mind map’s node tree with the source and switches to the read-only view. You can convert it back to a mind map at any time by pasting mindmap source.',
+    convertConfirm: 'Convert this mind map to a {{type}} diagram?\n\nThe current node tree will be replaced by this source and the diagram will become read-only (you can convert it back with mindmap source at any time).',
   },
   err: {
     // —— Document kernel: general ——
@@ -111,6 +163,7 @@ export default {
     sibling_order_conflict: 'Duplicate order values among siblings',
     cycle_detected: 'This operation would create a cycle: {{id}}',
     text_invalid: 'Text of node {{id}} must be a string',
+    invalid_shape: 'Invalid shape for node {{id}}: {{shape}}',
     // —— Action batches ——
     actions_not_list: 'actions must be an array',
     action_malformed: 'Action must be an object',

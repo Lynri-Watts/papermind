@@ -135,13 +135,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
         -- doc 为 MindmapDoc 内容 JSON（节点树带稳定 ID/父子/order/手动坐标）；
         -- title 以本表列为准（避免与 doc 内标题双重真源）。
         CREATE TABLE IF NOT EXISTS mindmaps (
-            id         TEXT PRIMARY KEY,
-            scope      TEXT NOT NULL DEFAULT '',
-            title      TEXT NOT NULL,
-            doc        TEXT NOT NULL,          -- JSON {"nodes": [...]}
-            version    INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            id           TEXT PRIMARY KEY,
+            scope        TEXT NOT NULL DEFAULT '',
+            title        TEXT NOT NULL,
+            doc          TEXT NOT NULL,        -- JSON {"nodes": [...]} 或 {"nodes":[],"diagramType":...,"source":...}
+            -- 图类型冗余列（与 doc.diagramType 一致，缺省 mindmap），供列表免解析 doc 展示徽标
+            diagram_type TEXT NOT NULL DEFAULT 'mindmap',
+            version      INTEGER NOT NULL DEFAULT 1,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_mindmaps_scope ON mindmaps(scope);
 
@@ -182,6 +184,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for name, ddl in additions.items():
         if name not in ctx_cols:
             conn.execute(f"ALTER TABLE context_items ADD COLUMN {name} {ddl}")
+
+    # mindmaps：diagram_type 冗余列（多图类型支持）。旧库补列后从 doc JSON 回填
+    mm_cols = {r[1] for r in conn.execute("PRAGMA table_info(mindmaps)")}
+    if "diagram_type" not in mm_cols:
+        conn.execute(
+            "ALTER TABLE mindmaps ADD COLUMN diagram_type TEXT NOT NULL DEFAULT 'mindmap'"
+        )
+        rows = conn.execute("SELECT id, doc FROM mindmaps").fetchall()
+        for r in rows:
+            try:
+                doc = json.loads(r["doc"]) if isinstance(r["doc"], str) else (r["doc"] or {})
+            except json.JSONDecodeError:
+                doc = {}
+            dtype = doc.get("diagramType") if isinstance(doc, dict) else None
+            if isinstance(dtype, str) and dtype and dtype != "mindmap":
+                conn.execute(
+                    "UPDATE mindmaps SET diagram_type = ? WHERE id = ?", (dtype, r["id"])
+                )
 
 
 # ---------- papers ----------
@@ -734,15 +754,17 @@ def _decode_mindmap(row: sqlite3.Row | dict) -> dict:
     return item
 
 
-def create_mindmap(map_id: str, scope: str, title: str, doc: dict) -> dict:
+def create_mindmap(map_id: str, scope: str, title: str, doc: dict,
+                   diagram_type: str = "mindmap") -> dict:
     """创建导图并写入 version=1 的首版快照。返回完整行。"""
     now = _now()
     conn = _connect()
     try:
         conn.execute(
-            "INSERT INTO mindmaps (id, scope, title, doc, version, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?)",
-            (map_id, scope, title, json.dumps(doc, ensure_ascii=False), now, now),
+            "INSERT INTO mindmaps (id, scope, title, doc, diagram_type, version, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+            (map_id, scope, title, json.dumps(doc, ensure_ascii=False),
+             diagram_type, now, now),
         )
         conn.execute(
             "INSERT INTO mindmap_revisions "
@@ -768,7 +790,7 @@ def get_mindmap(map_id: str) -> dict | None:
 def list_mindmaps(scope: str = "", include_doc: bool = False) -> list[dict]:
     """列出某作用域导图（''=全局库）。默认不含 doc，保持轻量。"""
     conn = _connect()
-    cols = "id, scope, title, version, created_at, updated_at"
+    cols = "id, scope, title, diagram_type, version, created_at, updated_at"
     if include_doc:
         cols += ", doc"
     rows = conn.execute(
@@ -814,6 +836,9 @@ def commit_mindmap_doc(map_id: str, doc: dict, actions: list, *,
     """
     now = _now()
     doc_json = json.dumps(doc, ensure_ascii=False)
+    diagram_type = doc.get("diagramType") if isinstance(doc, dict) else None
+    if not isinstance(diagram_type, str) or not diagram_type:
+        diagram_type = "mindmap"
     conn = _connect()
     try:
         row = conn.execute(
@@ -822,9 +847,9 @@ def commit_mindmap_doc(map_id: str, doc: dict, actions: list, *,
         if row is None:
             return None
         cur = conn.execute(
-            "UPDATE mindmaps SET doc = ?, version = version + 1, updated_at = ? "
-            "WHERE id = ? AND version = ?",
-            (doc_json, now, map_id, row["version"]),
+            "UPDATE mindmaps SET doc = ?, diagram_type = ?, version = version + 1, "
+            "updated_at = ? WHERE id = ? AND version = ?",
+            (doc_json, diagram_type, now, map_id, row["version"]),
         )
         if cur.rowcount == 0:
             conn.rollback()

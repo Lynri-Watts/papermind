@@ -15,11 +15,23 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, Eye, Code2, PencilLine, RotateCcw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { MindmapDoc } from '../../types';
-import { MindmapError, docToMermaid, mergeDoc, parseMermaid } from '../../lib/mindmap';
+import {
+  MindmapError,
+  detectDiagramHeader,
+  docToMermaid,
+  mergeDoc,
+  parseMermaid,
+} from '../../lib/mindmap';
+import { useMermaidRender } from '../../lib/mindmap/useMermaidRender';
 
 export interface MindmapCodePanelProps {
   doc: MindmapDoc;
   onApplyTarget: (target: MindmapDoc) => void;
+  /**
+   * 文本被改成其他 mermaid 图（flowchart/sequenceDiagram/…）并确认转换时调用：
+   * 整段源码替换文档，当前节点树将被取代（保存成功后外层按新类型切只读视图）。
+   */
+  onReplaceSource?: (source: string) => void;
   readOnly?: boolean;
   className?: string;
 }
@@ -32,24 +44,10 @@ interface LintError {
 
 type Mode = 'edit' | 'preview';
 
-/** mermaid 库只在首次切到预览时加载，所有面板实例共享同一个 Promise */
-let mermaidPromise: Promise<typeof import('mermaid').default> | null = null;
-function loadMermaid() {
-  if (!mermaidPromise) {
-    mermaidPromise = import('mermaid').then((mod) => {
-      const mermaid = mod.default;
-      mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'dark' });
-      return mermaid;
-    });
-  }
-  return mermaidPromise;
-}
-
-let previewSeq = 0;
-
 const MindmapCodePanel: React.FC<MindmapCodePanelProps> = ({
   doc,
   onApplyTarget,
+  onReplaceSource,
   readOnly = false,
   className,
 }) => {
@@ -61,11 +59,16 @@ const MindmapCodePanel: React.FC<MindmapCodePanelProps> = ({
   const dirtyRef = useRef(false);
   const [mode, setMode] = useState<Mode>('edit');
   const [lint, setLint] = useState<LintError | null>(null);
-  const [previewState, setPreviewState] = useState<
-    { status: 'idle' } | { status: 'loading' } | { status: 'ready'; svg: string } | { status: 'failed'; message: string }
-  >({ status: 'idle' });
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const previewHostRef = useRef<HTMLDivElement>(null);
+
+  // 脏文本若声明了其他 mermaid 图类型：唯一合法出路是「转换」（树被源码取代）
+  const header = useMemo(() => (dirty ? detectDiagramHeader(text) : null), [dirty, text]);
+  const otherHeader = header?.kind === 'other' ? header : null;
+  const convertible = otherHeader !== null && !!onReplaceSource && !readOnly;
+
+  // 预览：与只读 mermaid 视图共用渲染 hook（防抖/过期丢弃/错误归一）
+  const previewState = useMermaidRender(mode === 'preview' ? text : '', 400);
 
   // 外部文档变化（画布编辑 / AI diff / 对账重映射）：干净态实时镜像
   useEffect(() => {
@@ -119,6 +122,14 @@ const MindmapCodePanel: React.FC<MindmapCodePanelProps> = ({
   }, [canonical]);
 
   const handleApply = useCallback(() => {
+    // 文本声明了其他 mermaid 图：确认后以源码整段替换（节点树将被取代）
+    if (otherHeader) {
+      if (!onReplaceSource) return;
+      const ok = window.confirm(t('code.convertConfirm', { type: otherHeader.type }));
+      if (!ok) return;
+      onReplaceSource(text);
+      return;
+    }
     let parsed: MindmapDoc;
     try {
       parsed = parseMermaid(text);
@@ -140,7 +151,7 @@ const MindmapCodePanel: React.FC<MindmapCodePanelProps> = ({
     dirtyRef.current = false;
     setDirty(false);
     setLint(null);
-  }, [text, doc, onApplyTarget]);
+  }, [text, doc, onApplyTarget, onReplaceSource, otherHeader, t]);
 
   const jumpToLine = useCallback((line: number) => {
     const ta = textareaRef.current;
@@ -155,50 +166,15 @@ const MindmapCodePanel: React.FC<MindmapCodePanelProps> = ({
     ta.scrollTop = Math.max(0, approxTop - ta.clientHeight / 3);
   }, [text]);
 
-  // 预览：mermaid 动态加载 + 400ms 防抖 + 过期结果丢弃
-  useEffect(() => {
-    if (mode !== 'preview') return;
-    const seq = ++previewSeq;
-    setPreviewState({ status: 'loading' });
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      loadMermaid()
-        .then(async (mermaid) => {
-          if (cancelled || seq !== previewSeq) return;
-          try {
-            const id = `mmd-preview-${Date.now()}-${seq}`;
-            const { svg } = await mermaid.render(id, text);
-            if (!cancelled && seq === previewSeq) setPreviewState({ status: 'ready', svg });
-          } catch (e) {
-            if (!cancelled && seq === previewSeq) {
-              const message = e instanceof Error ? e.message : String(e);
-              setPreviewState({ status: 'failed', message });
-            }
-          }
-        })
-        .catch((e: unknown) => {
-          if (!cancelled && seq === previewSeq) {
-            setPreviewState({
-              status: 'failed',
-              message: e instanceof Error ? e.message : String(e),
-            });
-          }
-        });
-    }, 400);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [mode, text]);
-
-  // 预览 svg 注入
+  // 预览 svg 注入（渲染逻辑由 useMermaidRender 承担）
   useEffect(() => {
     if (previewState.status === 'ready' && previewHostRef.current) {
       previewHostRef.current.innerHTML = previewState.svg;
     }
   }, [previewState]);
 
-  const applyDisabled = readOnly || !dirty || lint !== null;
+  // 转换分支允许在 lint 为 mmd_missing_header 时点击；其余语法错误仍禁止
+  const applyDisabled = readOnly || !dirty || (!convertible && lint !== null);
 
   return (
     <aside
@@ -274,7 +250,7 @@ const MindmapCodePanel: React.FC<MindmapCodePanelProps> = ({
         </div>
       )}
 
-      {lint && mode === 'edit' && (
+      {lint && mode === 'edit' && !convertible && (
         <div className="border-t border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
           <div className="flex items-start gap-2">
             <AlertTriangle size={14} className="mt-0.5 shrink-0" />
@@ -295,6 +271,12 @@ const MindmapCodePanel: React.FC<MindmapCodePanelProps> = ({
         </div>
       )}
 
+      {convertible && mode === 'edit' && (
+        <div className="border-t border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-5 text-amber-200">
+          {t('code.convertHint', { type: otherHeader?.type ?? '' })}
+        </div>
+      )}
+
       {mode === 'edit' && !readOnly && (
         <div className="flex items-center justify-end gap-2 border-t border-border px-3 py-2">
           <button
@@ -312,7 +294,7 @@ const MindmapCodePanel: React.FC<MindmapCodePanelProps> = ({
             disabled={applyDisabled}
             className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {t('code.apply')}
+            {convertible ? t('code.convertApply') : t('code.apply')}
           </button>
         </div>
       )}

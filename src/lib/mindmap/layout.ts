@@ -12,11 +12,14 @@
  * - 工具栏「重新布局」显式对全图重排（applyFullLayout），是用户主动行为。
  */
 import type { MindmapDoc, MindmapNode } from '../../types';
-import { LEVEL_X, ROW_Y } from './mmdParser';
 import { MindmapError, descendantIds, findRoot, orderedChildren } from './model';
 
+/** tidy-tree 自身的默认间距（mermaid 同源布局不可用时的降级方案）。 */
+const DEFAULT_H_GAP = 240;
+const DEFAULT_V_GAP = 72;
+
 export interface MindmapLayoutOptions {
-  /** 层级水平间距（默认与后端线性占位一致 240） */
+  /** 层级水平间距（默认 240） */
   hGap?: number;
   /** 叶子行垂直间距（默认 72） */
   vGap?: number;
@@ -34,8 +37,8 @@ export function layoutTree(
   nodes: MindmapNode[],
   opts: MindmapLayoutOptions = {}
 ): Map<string, LayoutPoint> {
-  const hGap = opts.hGap ?? LEVEL_X;
-  const vGap = opts.vGap ?? ROW_Y;
+  const hGap = opts.hGap ?? DEFAULT_H_GAP;
+  const vGap = opts.vGap ?? DEFAULT_V_GAP;
   const honorCollapsed = opts.honorCollapsed ?? true;
 
   const root = findRoot(nodes);

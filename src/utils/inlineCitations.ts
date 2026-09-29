@@ -2,27 +2,51 @@
  * 行内引用协议（无编号，与后端 backend/llm/rag.py 对应）。
  *
  * 模型在回答的句子中间（或句末）内联输出不带编号的引用标签，标签内是
- * 从出处逐字复制的一句原文；后端靠逐字匹配/上下文消歧确定出处：
+ * **两段**内容，以 ``||`` 分隔：
  *
- *   该模型在 ImageNet 上[Q]We report a top-1 accuracy of 85.3%.[/Q]取得最佳。
+ *   段 1 = 从出处逐字复制的一句原文：只用于出处核对、悬停卡片展示与
+ *          「定位原文」，界面上不直接显示；
+ *   段 2 = 行内文字：随引用一并生成的短转述（或该出处的中心句本身），
+ *          是回答正文的一部分，直接显示在标签所在位置并以主色高亮。
+ *
+ *   该模型在 ImageNet 上[Q]We report a top-1 accuracy of 85.3% on ImageNet.
+ *   ||85.3% 的 top-1 准确率[/Q]取得最佳。
+ *
+ * 段 2 缺省（标签内只有一段，含历史消息）时界面退化为直接显示段 1。
  *
  * 三态标签：
- *   [Q]摘录[/Q]      流式未决（后端尚未绑定出处，界面显示"核对中"）
- *   [Q+2]摘录[/Q]    终态成功（绑定到第 2 个 RagSource，1-based）
- *   [Q!]摘录[/Q]     终态失败（无法在材料中核对，界面显示失败卡、不可定位）
+ *   [Q]原句||行内文字[/Q]      流式未决（后端尚未绑定出处，界面显示"核对中"）
+ *   [Q+2]原句||行内文字[/Q]    终态成功（绑定到第 2 个 RagSource，1-based）
+ *   [Q!]原句||行内文字[/Q]     终态失败（无法在材料中核对，界面显示失败卡、不可定位）
  *
- * 引用是句子的一部分：终态 markdown 渲染时标签被替换为行内标记组件，
+ * 引用是句子的一部分：终态 markdown 渲染时标签被替换为行内组件，
  * 而非把正文切成多段（markdown 的加粗/链接等语法可以跨标记成对存在）。
  */
 
 export type CitationState = 'pending' | 'bound' | 'failed';
 
+/** 标签内两段的分隔符（与后端 QUOTE_FIELD_SEP 一致）。 */
+export const CITATION_FIELD_SEP = '||';
+
 export interface InlineCitation {
   state: CitationState;
   /** bound 态：出处序号（对应 RagSource.index，1-based） */
   sourceIndex?: number;
-  /** 卡片展示文字：bound=分块真实原句；pending/failed=模型输出的摘录 */
+  /** 段 1：悬停卡片展示的逐字原句（bound=核对通过的原句；pending/failed=模型输出文字） */
   quote: string;
+  /** 段 2：行内实际显示的文字（短转述/中心句）；为空时界面回退为显示 quote */
+  display: string;
+}
+
+/** 拆标签内容为 (段 1 逐字原句, 段 2 行内文字)；单段内容时行内文字为空。 */
+export function splitCitationFields(content: string): { quote: string; display: string } {
+  const text = content.trim();
+  const at = text.indexOf(CITATION_FIELD_SEP);
+  if (at < 0) return { quote: text, display: '' };
+  return {
+    quote: text.slice(0, at).trim(),
+    display: text.slice(at + CITATION_FIELD_SEP.length).trim(),
+  };
 }
 
 export interface InlineTextSegment {
@@ -54,14 +78,14 @@ const TOKEN_RE = new RegExp(`${TOKEN_OPEN}([0-9a-z]+)${TOKEN_CLOSE}`, 'g');
 
 function citationFromMatch(m: RegExpMatchArray): InlineCitation {
   const mark = m[1];
-  const quote = (m[3] ?? '').trim();
+  const { quote, display } = splitCitationFields(m[3] ?? '');
   if (mark === '+') {
-    return { state: 'bound', sourceIndex: Number(m[2]), quote };
+    return { state: 'bound', sourceIndex: Number(m[2]), quote, display };
   }
   if (mark === '!') {
-    return { state: 'failed', quote };
+    return { state: 'failed', quote, display };
   }
-  return { state: 'pending', quote };
+  return { state: 'pending', quote, display };
 }
 
 /** 把回答正文切分为正文段与引用段（流式纯文本渲染用，保持出现顺序）。 */
@@ -83,9 +107,24 @@ export function splitInlineCitations(content: string): InlineSegment[] {
   return segments;
 }
 
-/** 剔除全部引用块与旧版 [Source N]（复制纯文本正文用）。 */
+/**
+ * 复制纯文本正文：只剔除**机器部分**——引用标签替换为它的行内文字（段 2，
+ * 即回答正文本身；段 2 缺省时用段 1），旧版 [Source N] 直接删除。
+ *
+ * 行内文字是模型写进句子的转述，属于回答内容：整块删掉会把复制的句子断成
+ * 残句。段 1（逐字原句）只服务于出处核对与悬停卡片，界面不显示它——仅在
+ * 段 2 缺省（历史消息/格式漂移）时才作为可见文字保留，与渲染保持一致。
+ */
 export function stripInlineCitations(content: string): string {
-  return content.replace(INLINE_CITE_RE, '').replace(LEGACY_SOURCE_TAG_RE, '');
+  return content
+    .replace(
+      INLINE_CITE_RE,
+      (_full, _mark?: string, _idx?: string, raw?: string) => {
+        const { quote, display } = splitCitationFields(String(raw ?? ''));
+        return display || quote;
+      },
+    )
+    .replace(LEGACY_SOURCE_TAG_RE, '');
 }
 
 /** 仅剔除旧版 [Source N]（渲染管线在引用标签被占位符替换后使用）。 */
@@ -112,15 +151,15 @@ export function protectCitations(content: string): ProtectedMarkdown {
   let seq = 0;
   const markdown = content.replace(
     INLINE_CITE_RE,
-    (_full, mark?: string, idx?: string, rawQuote?: string) => {
-      const quote = String(rawQuote ?? '').trim();
+    (_full, mark?: string, idx?: string, rawContent?: string) => {
+      const { quote, display } = splitCitationFields(String(rawContent ?? ''));
       const id = (seq++).toString(36);
       const citation: InlineCitation =
         mark === '+'
-          ? { state: 'bound', sourceIndex: Number(idx), quote }
+          ? { state: 'bound', sourceIndex: Number(idx), quote, display }
           : mark === '!'
-            ? { state: 'failed', quote }
-            : { state: 'pending', quote };
+            ? { state: 'failed', quote, display }
+            : { state: 'pending', quote, display };
       registry.set(id, citation);
       return `${TOKEN_OPEN}${id}${TOKEN_CLOSE}`;
     },
@@ -160,6 +199,7 @@ export function remarkCitationCards(registry: Map<string, InlineCitation>) {
                   ? { sourceindex: citation.sourceIndex }
                   : {}),
                 quote: citation.quote,
+                display: citation.display,
               },
             },
           });

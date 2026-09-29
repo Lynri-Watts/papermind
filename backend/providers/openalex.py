@@ -16,11 +16,15 @@ from config import HTTP_TIMEOUT
 from i18n import tr
 import settings_store
 from providers.base import Paper, PaperProvider, SearchQuery, make_paper_id, year_range
-from providers.download import PdfDownloadError, download_pdf, parse_pdf_to_text
+from providers.download import (
+    PdfDownloadError,
+    download_pdf_first_available,
+    parse_pdf_to_text,
+)
 
 BASE_URL = "https://api.openalex.org"
 
-# OpenAlex 的 filter 用逗号分隔多个条件，值内不允许出现逗号等保留字符
+# OpenAlex 的 filter 用逗号分隔多个条件，值内不允许有逗号等保留字符
 # （即使 URL 编码也会被 400 拒绝）；空格保留以便多词检索。
 _FILTER_RESERVED = re.compile(r"[,:;()\[\]{}\"'|&=+?#]")
 
@@ -41,37 +45,73 @@ def _extract_work_id(openalex_url: str) -> str:
 # arXiv 直链 PDF（100% 开放获取，最可靠），优先于出版社/仓储链接
 _ARXIV_PDF_RE = re.compile(r"arxiv\.org/pdf/", re.IGNORECASE)
 
+# PMC / EuropePMC 落地页中的 PMCID（OpenAlex 对这类 location 通常不提供
+# pdf_url，只有落地页；EBI EuropePMC 提供机器人友好的全文 PDF REST 端点）。
+# 注意 PMC 老格式 URL 用纯数字 /articles/3374500，新格式为 /articles/PMC3374500，
+# 两种都要识别并统一归一化为 PMCID（PMC + 数字）
+_PMC_LANDING_RES = (
+    re.compile(r"(?:www\.ncbi|pmc\.ncbi)\.nlm\.nih\.gov/pmc/articles/(?:PMC)?(\d+)", re.I),
+    re.compile(r"europepmc\.org/articles/(?:PMC)?(\d+)", re.I),
+)
+_EBI_PMC_PDF_TMPL = (
+    "https://www.ebi.ac.uk/europepmc/webservices/rest/articles/{pmcid}/fullTextPDF"
+)
 
-def _pick_pdf_url(work: dict) -> Optional[str]:
-    """从 OpenAlex work 里挑选「最可能直接下载成功」的 PDF 链接。
 
-    OpenAlex 的 ``open_access.oa_url`` 只是"最佳开放获取地址"，常指向出版社
-    落地页或需要登录/订阅的页面（实测 oup/jamda/ncbi 等会 403 或返回 HTML）。
-    因此按以下优先级挑选：
-    1. 任一 location 的 arXiv 直链 ``arxiv.org/pdf/...``（最可靠）
-    2. ``best_oa_location.pdf_url``
-    3. 其它 ``locations[].pdf_url``
-    4. 兜底 ``open_access.oa_url``（可能不是 PDF，交给下载层再尝试解析）
+def _pdf_candidates(work: dict) -> list[str]:
+    """从 OpenAlex work 的全部 locations 构造有序的全文候选地址列表。
+
+    ``open_access.oa_url`` 只是"最佳开放获取地址"，常指向被反爬墙拦截的出版
+    社 PDF（实测 IOP 经 Radware 返回人机验证页 HTML），而同一 work 的其它
+    location（arXiv 直链 / PMC 仓储）其实可用。单取首选 URL 会把"首选镜像
+    不可达"误判为"论文不可下载"，因此返回完整候选链，由下载层逐个尝试：
+
+    1. arXiv 直链 PDF（最可靠，100% OA）
+    2. best_oa_location.pdf_url 及其它 location 的 pdf_url（best 优先）
+    3. PMC location 合成的 EBI EuropePMC 全文 PDF 端点
+    4. 各仓储/出版社落地页本身（下载层会解析其中的 citation_pdf_url）
+    5. 兜底 open_access.oa_url
     """
-    candidates: list[str] = []
+    def _dedupe_append(seq: list[str], url: Optional[str]) -> None:
+        url = (url or "").strip()
+        if url and url not in seq:
+            seq.append(url)
 
-    def add(url: Optional[str]) -> None:
-        if url and url not in candidates:
-            candidates.append(url)
+    arxiv_urls: list[str] = []
+    direct_pdfs: list[str] = []
+    landings: list[str] = []
 
-    for loc in work.get("locations") or []:
-        add((loc or {}).get("pdf_url"))
     best = work.get("best_oa_location") or {}
-    add(best.get("pdf_url"))
+    # best_oa 直链置顶（locations 列表里通常也含它，去重保证不重复）
+    _dedupe_append(direct_pdfs, best.get("pdf_url"))
+    for loc in work.get("locations") or []:
+        loc = loc or {}
+        pu = loc.get("pdf_url")
+        if pu:
+            if _ARXIV_PDF_RE.search(pu):
+                _dedupe_append(arxiv_urls, pu)
+            _dedupe_append(direct_pdfs, pu)
+        _dedupe_append(landings, loc.get("landing_page_url"))
 
-    for url in candidates:
-        if _ARXIV_PDF_RE.search(url):
-            return url
-    if best.get("pdf_url"):
-        return best["pdf_url"]
-    if candidates:
-        return candidates[0]
-    return (work.get("open_access") or {}).get("oa_url")
+    candidates: list[str] = []
+    for url in arxiv_urls:
+        _dedupe_append(candidates, url)
+    for url in direct_pdfs:
+        _dedupe_append(candidates, url)
+
+    pmcids: list[str] = []
+    for lp in landings:
+        for pattern in _PMC_LANDING_RES:
+            m = pattern.search(lp)
+            if m:
+                # 捕获组是纯数字（URL 里 PMC 前缀可有可无），统一补全为 PMCID
+                _dedupe_append(pmcids, "PMC" + m.group(1))
+    for pmcid in pmcids:
+        _dedupe_append(candidates, _EBI_PMC_PDF_TMPL.format(pmcid=pmcid))
+    for lp in landings:
+        _dedupe_append(candidates, lp)
+    _dedupe_append(candidates, (work.get("open_access") or {}).get("oa_url"))
+    return candidates
 
 
 class OpenAlexProvider(PaperProvider):
@@ -110,6 +150,7 @@ class OpenAlexProvider(PaperProvider):
             if a.get("author", {}).get("display_name")
         ]
         loc = work.get("primary_location") or {}
+        candidates = _pdf_candidates(work)
         return Paper(
             id=make_paper_id(OpenAlexProvider.source, work_id),
             title=work.get("display_name") or "",
@@ -119,7 +160,8 @@ class OpenAlexProvider(PaperProvider):
             source=OpenAlexProvider.source,
             external_id=work_id,
             url=loc.get("landing_page_url") or work.get("id") or "",
-            pdf_url=_pick_pdf_url(work),
+            pdf_url=candidates[0] if candidates else None,
+            pdf_candidates=candidates,
             citation_count=work.get("cited_by_count"),
             reference_count=len(work.get("referenced_works", [])),
             publication_venue=(loc.get("source") or {}).get("display_name"),
@@ -187,15 +229,21 @@ class OpenAlexProvider(PaperProvider):
         return [self._to_paper(w) for w in data.get("results", [])]
 
     def get_fulltext(self, paper: Paper) -> Optional[str]:
-        """OpenAlex 不托管全文；若 oa_url 指向 PDF 则尝试解析。"""
-        if paper.pdf_url and paper.pdf_url.lower().endswith(".pdf"):
-            try:
-                content = download_pdf(paper.pdf_url, session=self.session)
-            except PdfDownloadError:
-                return None
-            if content is not None:
-                return parse_pdf_to_text(content)
-        return None
+        """OpenAlex 不托管全文；按 locations 候选链尝试各开放获取镜像。
+
+        旧实现只在 pdf_url 以 ``.pdf`` 结尾时才下载，既漏掉无扩展名的直链
+        （如 arXiv），也只试首选镜像；现统一走多镜像下载器。
+        """
+        urls = paper.pdf_candidates or ([paper.pdf_url] if paper.pdf_url else [])
+        if not urls:
+            return None
+        try:
+            content, _used = download_pdf_first_available(
+                urls, session=self.session,
+            )
+        except PdfDownloadError:
+            return None
+        return parse_pdf_to_text(content)
 
 
 def _extract_abstract(inverted_index: Optional[dict]) -> str:

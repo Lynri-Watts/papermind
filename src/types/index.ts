@@ -100,7 +100,7 @@ export interface ToolPaper {
 export interface ReactActionEvent {
   toolName: string;
   toolLabel: string;
-  /** 工具参数（人类可读展示；read_materials 为空对象） */
+  /** 工具参数（人类可读展示，如 read_paper 的 paper_ids/query） */
   arguments: Record<string, unknown>;
   /** 该步思考全文（后端冗余附上；通常已由 thought 增量累积，用作兜底） */
   thought?: string;
@@ -201,7 +201,9 @@ export interface ChatConversation {
 /** 一次回答中 AI 对某张导图的事务编辑记录（用于「撤销本次 AI 修改 / 保留」） */
 export interface ChatMindmapEdit {
   mapId: string;
-  transactionId: string;
+  /** 同一次回答共享一个事务 id，是整事务撤销的单位；
+   *  null 表示 AI 仅新建了导图（无编辑修订，不提供撤销，仅可打开/删除） */
+  transactionId: string | null;
   /** 收到最后一个 diff 后的导图版本（撤销成功前用于状态展示） */
   version: number;
   /** 编辑发生时的作用域（null=全局库；撤销请求必须带同一作用域） */
@@ -379,6 +381,15 @@ export interface WorkspaceFile {
 /** 节点类型：普通主题 / 论文引用（paper 节点必须带合法 paperId） */
 export type MindmapNodeKind = 'topic' | 'paper';
 
+/**
+ * 节点形状（与 mermaid mindmap 语法一一对应；画布据此渲染，初始布局由同源
+ * mermaid 引擎给出几何）。mermaid 不支持的形状（如 bang/cloud）不在本子集内。
+ * - default：纯文本无边框（mermaid 默认）
+ * - rect：矩形 [x]；rounded：圆角 (x)；circle：圆形 ((x))；hexagon：六边形 {{x}}
+ * 根节点规范形状恒为 circle；paper 节点在 mermaid 中即 [标题](paper:...) 矩形链接。
+ */
+export type MindmapNodeShape = 'default' | 'rect' | 'rounded' | 'circle' | 'hexagon';
+
 /** 思维导图节点（GUI 与 AI 共用的最小结构单元，v1 限定单根树、无交叉边） */
 export interface MindmapNode {
   /** 稳定 ID（n_<8hex>），一律由服务端生成；add_node 传入的 id 仅为批内临时 ID */
@@ -389,6 +400,11 @@ export interface MindmapNode {
   order: number;
   text: string;
   kind: MindmapNodeKind;
+  /**
+   * 视觉形状（对应 mermaid 形状语法）。缺省视为 'default'（旧文档无此字段）；
+   * 根节点序列化为 circle；paper 节点渲染时恒按矩形卡片处理。
+   */
+  shape?: MindmapNodeShape;
   /** kind=paper 时必填且形如 source:external_id；topic 时必须为 null */
   paperId: string | null;
   /** 几何坐标：mermaid 不表达几何；手动拖拽写回，未布局节点为 0 由前端布局引擎补位 */
@@ -398,25 +414,37 @@ export interface MindmapNode {
   collapsed?: boolean;
 }
 
-/** 导图文档（mindmaps.doc 列存储的 JSON） */
+/**
+ * 导图文档（mindmaps.doc 列存储的 JSON）。
+ * - mindmap 类型：diagramType 缺省/'mindmap'，nodes 为节点树，源码由树序列化派生；
+ * - 其他 mermaid 图（flowchart/sequenceDiagram/…）：nodes 为空，diagramType 为
+ *   mermaid 首声明 token，source 为原始源码，画布只读渲染（不可结构化编辑）。
+ */
 export interface MindmapDoc {
   nodes: MindmapNode[];
+  diagramType?: string;
+  /** 非 mindmap 图的 mermaid 源码；mindmap 类型缺省 */
+  source?: string | null;
 }
 
-/** 导图元信息（列表项，不含 nodes） */
+/** 导图元信息（列表项，不含 nodes/source） */
 export interface MindmapMeta {
   id: string;
   /** 作用域：''=全局；'ws:<工作区id>'=工作区。由后端归一化，前端只透传 workspace_id */
   scope: string;
   title: string;
   version: number;
+  /** 图类型：'mindmap' 或 mermaid 首声明 token（flowchart/sequenceDiagram/…） */
+  diagramType: string;
   created_at: string | null;
   updated_at: string | null;
 }
 
-/** 导图完整文档（后端 _serialize 将 doc.nodes 展开到顶层，避免双重嵌套） */
+/** 导图完整文档（后端 _serialize 将 doc.nodes/diagramType/source 展开到顶层） */
 export interface MindmapInfo extends MindmapMeta {
   nodes: MindmapNode[];
+  /** 非 mindmap 图的 mermaid 源码；mindmap 类型为 null */
+  source: string | null;
 }
 
 /** 删除节点策略：promote=直系孩子上提（默认）；delete_branch=整支删除 */
@@ -436,6 +464,7 @@ export type MindmapAction =
       parentId: string | null;
       text?: string;
       kind?: MindmapNodeKind;
+      shape?: MindmapNodeShape;
       paperId?: string | null;
       x?: number;
       y?: number;
@@ -447,6 +476,7 @@ export type MindmapAction =
       id: string;
       text?: string;
       kind?: MindmapNodeKind;
+      shape?: MindmapNodeShape;
       paperId?: string | null;
       x?: number;
       y?: number;
@@ -495,4 +525,13 @@ export interface MindmapDiffEvent {
   idMap: Record<string, string>;
   /** 同一次问答共享一个 transactionId，是整事务撤销的单位 */
   transactionId: string;
+}
+
+/** AI 新建导图（可能 from_mermaid 一次成图，之后没有任何 diff） */
+export interface MindmapCreatedEvent {
+  mapId: string;
+  version: number;
+  title: string;
+  /** 图类型：mindmap（可编辑树）或其他 mermaid 首声明 token（只读视图） */
+  diagramType?: string;
 }

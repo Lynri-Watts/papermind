@@ -14,8 +14,11 @@
 
 - ``scope``：''=全局，'ws:<id>'=当前工作区（工具不可跨工作区读写）；
 - ``transaction_id``：本次问答共享，落进 mindmap_revisions，供整事务撤销；
-- ``mindmap_events``：list，edit/attach 成功后追加 mindmap_diff 载荷，
-  路由层在工具返回后逐条以 SSE 推给前端。
+- ``mindmap_events``：list，写操作成功后追加事件载荷，
+  路由层在工具返回后逐条以 SSE 推给前端：edit/attach 追加 mindmap_diff
+  （增量差异），create 追加 ``{"kind": "created", ...}``（让前端感知新图、
+  刷新图库并给出「打开导图」入口；from_mermaid 一次成图时没有后续 diff，
+  若不发 created 前端将完全无感知）。
 
 可预期失败（导图不存在/不变量违反/版本冲突）返回失败型 ToolResult 文本，
 让 LLM 读到可操作原因后自我修正（FR-6.6），不抛异常打断 ReAct 循环。
@@ -29,8 +32,9 @@ import storage.db as db
 from i18n import tr
 from llm.tools import BaseTool, ToolResult
 from services import mindmap_doc as md
+from services.mindmap_diagram import MINDMAP_TYPE
 from services.mindmap_doc import MindmapError
-from services.mindmap_mmd import doc_to_mermaid, parse_mermaid
+from services.mindmap_mmd import doc_from_mermaid_source, doc_to_mermaid
 
 #: 单次 edit_mindmap 动作数上限（防止 LLM 一次提交超大批次）
 MAX_ACTIONS_PER_CALL = 200
@@ -51,6 +55,16 @@ def _load(map_id: str, scope: str) -> Optional[dict]:
     if row is None or row.get("scope") != scope:
         return None
     return row
+
+
+def _diagram_type(row: dict) -> str:
+    """行的图类型：冗余列优先，回退 doc.diagramType，缺省 mindmap。"""
+    value = row.get("diagram_type")
+    if isinstance(value, str) and value:
+        return value
+    doc = row.get("doc") or {}
+    inline = doc.get("diagramType") if isinstance(doc, dict) else None
+    return inline if isinstance(inline, str) and inline else MINDMAP_TYPE
 
 
 def _structure_error(exc: MindmapError) -> str:
@@ -87,6 +101,15 @@ def _outline(doc: dict) -> str:
 def _read_report(row: dict) -> str:
     """read_mindmap 的完整 observation：元信息 + ID 清单 + mermaid 文本。"""
     doc = row["doc"]
+    dtype = _diagram_type(row)
+    if dtype != MINDMAP_TYPE:
+        # 非 mindmap 图无节点树：返回类型与原始源码（只读，不可 edit）
+        header = tr(
+            "mindmap.ai.read_header_other",
+            title=row["title"], map_id=row["id"],
+            version=row["version"], diagram_type=dtype,
+        )
+        return f"{header}\n== mermaid source ==\n{doc.get('source') or ''}"
     header = tr(
         "mindmap.ai.read_header",
         title=row["title"], map_id=row["id"],
@@ -129,6 +152,10 @@ def commit_ai_actions(
     row = _load(map_id, scope)
     if row is None:
         return ToolResult(tr("mindmap.ai.map_not_in_scope", map_id=map_id))
+    if _diagram_type(row) != MINDMAP_TYPE:
+        # 非 mindmap 图只读：AI 不可做结构化编辑
+        return ToolResult(tr(
+            "mindmap.actions_unsupported", diagram_type=_diagram_type(row)))
     if expect_version is not None and row["version"] != expect_version:
         return ToolResult(tr(
             "mindmap.ai.version_mismatch",
@@ -217,9 +244,13 @@ class ListMindmapsTool(BaseTool):
             return ToolResult(tr("mindmap.ai.list_empty"))
         lines = [tr("mindmap.ai.list_header", n=len(items))]
         for it in items:
-            count = len(it["doc"]["nodes"])
+            dtype = _diagram_type(it)
+            if dtype == MINDMAP_TYPE:
+                detail = tr("mindmap.ai.node_count", n=len(it["doc"]["nodes"]))
+            else:
+                detail = tr("mindmap.ai.readonly_diagram", diagram_type=dtype)
             lines.append(
-                f"- [{it['id']}] 《{it['title']}》｜{tr('mindmap.ai.node_count', n=count)}｜"
+                f"- [{it['id']}] 《{it['title']}》｜{detail}｜"
                 f"{tr('mindmap.ai.updated_at')}: {it.get('updated_at') or ''}"
             )
         lines.append(tr("mindmap.ai.list_hint"))
@@ -228,23 +259,25 @@ class ListMindmapsTool(BaseTool):
 
 # ---------- 工具：create ----------
 class CreateMindmapTool(BaseTool):
-    """新建导图（空白或从 mermaid mindmap 文本导入）。"""
+    """新建导图（空白、从 mermaid mindmap 导入，或创建其他类型的只读 mermaid 图）。"""
 
     name = "create_mindmap"
     description = (
-        "新建一张思维导图并返回其 map_id。可只给根主题（root_text），"
-        "也可用 from_mermaid 传入一段 mermaid mindmap 文本直接成图。"
-        "导图创建在当前工作区（scope=\"global\" 时进全局库）。"
-        "创建后若要继续增删节点，调用 read_mindmap 取得节点 ID 再用 edit_mindmap。"
+        "新建一张导图并返回其 map_id。可只给根主题（root_text）创建思维导图；"
+        "也可用 from_mermaid 传入任意类型的 mermaid 代码直接成图：以 \"mindmap\""
+        " 开头的为可结构化编辑的思维导图（创建后用 read_mindmap/edit_mindmap 增删节点）；"
+        "其他类型（flowchart、sequenceDiagram、timeline、classDiagram、stateDiagram-v2、"
+        "erDiagram、journey、gantt、pie、gitGraph 等）保存为只读图表，不支持 edit_mindmap。"
+        "导图创建在当前工作区（scope=\"global\" 时进全局库）。title 必填。"
     )
     parameters: dict = {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "导图标题（必填）"},
-            "root_text": {"type": "string", "description": "根节点文本（空白创建时用；缺省取标题）"},
+            "root_text": {"type": "string", "description": "根节点文本（空白创建思维导图时用；缺省取标题）"},
             "from_mermaid": {
                 "type": "string",
-                "description": "可选：mermaid mindmap 代码（以 mindmap 头开始的缩进文本）",
+                "description": "可选：任意类型的 mermaid 代码（首行为图声明，如 mindmap / flowchart TD / sequenceDiagram）",
             },
             "scope": {"type": "string", "enum": ["workspace", "global"]},
         },
@@ -260,12 +293,13 @@ class CreateMindmapTool(BaseTool):
             if not isinstance(mermaid_text, str) or not mermaid_text.strip():
                 return ToolResult(tr("mindmap.mermaid_required"))
             try:
-                doc = parse_mermaid(mermaid_text)
+                doc, diagram_type = doc_from_mermaid_source(mermaid_text)
             except MindmapError as exc:
                 return ToolResult(tr("mindmap.ai.create_failed", reason=_structure_error(exc)))
-            if not title:
+            if not title and diagram_type == MINDMAP_TYPE:
                 root = md.find_root(doc["nodes"])
                 title = ((root.get("text") if root else "") or "").strip()
+            # 非 mindmap 图无法从结构推导标题：title 必填
             if not title:
                 return ToolResult(tr("mindmap.title_required"))
         else:
@@ -273,12 +307,24 @@ class CreateMindmapTool(BaseTool):
                 return ToolResult(tr("mindmap.title_required"))
             root_text = (arguments.get("root_text") or "").strip() or title
             doc = md.new_doc(root_text)
+            diagram_type = MINDMAP_TYPE
 
         map_id = "mm_" + uuid.uuid4().hex[:12]
-        row = db.create_mindmap(map_id, scope, title, doc)
+        row = db.create_mindmap(map_id, scope, title, doc, diagram_type)
+        # 通知前端新图诞生：尤其 from_mermaid 一次成图后不再有 edit/diff，
+        # 前端凭此刷新图库、选中新图并在回答上挂「打开导图」入口
+        events = (context or {}).get("mindmap_events")
+        if isinstance(events, list):
+            events.append({
+                "kind": "created",
+                "mapId": map_id,
+                "version": row["version"],
+                "title": title,
+                "diagramType": diagram_type,
+            })
         return ToolResult(
             tr("mindmap.ai.created", title=title, map_id=map_id) + f"\n{_read_report(row)}",
-            {"mapId": map_id, "version": row["version"]},
+            {"mapId": map_id, "version": row["version"], "diagramType": diagram_type},
         )
 
 
@@ -288,9 +334,11 @@ class ReadMindmapTool(BaseTool):
 
     name = "read_mindmap"
     description = (
-        "读取一张思维导图的完整结构，返回带节点 ID 的缩进树清单和等价 mermaid 文本。"
+        "读取一张导图的完整内容。mindmap 类型返回带节点 ID 的缩进树清单和等价 mermaid 文本，"
         "edit_mindmap / attach_paper_to_mindmap 需要用到清单中的节点 ID，"
         "因此编辑前必须先调用本工具；操作后工具也会回传最新结构，无需重复读取。"
+        "其他 mermaid 图类型（flowchart/sequenceDiagram 等）只返回图类型和原始源码，"
+        "且不支持 edit_mindmap / attach_paper_to_mindmap（只读）。"
     )
     parameters: dict = {
         "type": "object",
@@ -316,12 +364,15 @@ class EditMindmapTool(BaseTool):
 
     name = "edit_mindmap"
     description = (
-        "对一张思维导图原子地应用一批动作（全部成功才生效，任一非法整批不写入）。"
+        "仅适用于 mindmap 类型的思维导图；其他 mermaid 图（flowchart 等）为只读图，"
+        "调用本工具会失败。对 mindmap 原子地应用一批动作（全部成功才生效，任一非法整批不写入）。"
         "动作类型：\n"
         "1) add_node 新增节点：{op,id(临时ID,建议tmp_开头且本批唯一),parentId"
         "(已有节点ID；根用 null，仅在导图无根时),text,kind?(topic|paper),"
+        "shape?(default|rect|rounded|circle|hexagon，对应 mermaid 形状语法，"
+        "普通分类节点建议 default 或 rounded，重点节点可用 circle/hexagon；根固定 circle),"
         "paperId?(kind=paper 时必填，形如 来源:编号),order?(同级位置,缺省末尾)}；\n"
-        "2) update_node 改节点：{op,id,text?}（只允许改文本；改类型用 attach_paper）；\n"
+        "2) update_node 改节点：{op,id,text?,shape?}（改类型用 attach_paper）；\n"
         "3) move_node 移动：{op,id,newParentId,newOrder?}（不能移到根/自己/后代下）；\n"
         "4) delete_node 删除：{op,id,strategy?(promote=子节点提升(默认)|delete_branch=连后代)}"
         "（根不可删）；\n"
@@ -404,6 +455,9 @@ class AttachPaperToMindmapTool(BaseTool):
         row = _load(map_id, scope)
         if row is None:
             return ToolResult(tr("mindmap.ai.map_not_in_scope", map_id=map_id))
+        if _diagram_type(row) != MINDMAP_TYPE:
+            return ToolResult(tr(
+            "mindmap.actions_unsupported", diagram_type=_diagram_type(row)))
 
         if node_id is not None:
             if not any(n["id"] == node_id for n in row["doc"]["nodes"]):

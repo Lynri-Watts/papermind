@@ -11,9 +11,10 @@
  */
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, ChevronDown, FolderOpen, Globe, ListTree, Loader2, Plus, X } from 'lucide-react';
+import { AlertTriangle, ChevronDown, FolderOpen, Globe, ListTree, Loader2, Plus, Workflow, X } from 'lucide-react';
 import MindmapCanvas from './MindmapCanvas';
 import { useMindmapScope } from './useMindmapScope';
+import { MINDMAP_TYPE, diagramLabelKey } from '../../lib/mindmap';
 import { usePaperMindStore } from '../../store';
 
 export interface MindmapDockProps {
@@ -123,7 +124,19 @@ const MindmapDock: React.FC<MindmapDockProps> = ({ open, onClose, scopeWs, defau
                             m.id === activeId ? 'font-medium text-primary' : 'text-textSecondary'
                           }`}
                         >
-                          <ListTree size={12} className="shrink-0 opacity-60" />
+                          {m.diagramType && m.diagramType !== MINDMAP_TYPE ? (
+                            <Workflow
+                              size={12}
+                              className="shrink-0 text-primary"
+                              aria-label={t('mindmap:diagram.badgeTitle', {
+                                type: (diagramLabelKey(m.diagramType)
+                                  ? t(`mindmap:diagram.kind.${diagramLabelKey(m.diagramType)}`)
+                                  : m.diagramType),
+                              })}
+                            />
+                          ) : (
+                            <ListTree size={12} className="shrink-0 opacity-60" />
+                          )}
                           <span className="truncate">{m.title}</span>
                         </button>
                       ))}

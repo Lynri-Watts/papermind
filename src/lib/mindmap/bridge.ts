@@ -61,6 +61,34 @@ export function pruneMindmapBuffer(mapId: string, version: number): void {
 }
 
 /**
+ * 自动布局信号（一轮 AI 流式编辑结束）。
+ *
+ * 流式增补期间画布用同步 tidy-tree 即时补位（不打断打字机式落图）；一轮结束后
+ * QAPanel 对本次涉及的导图发此信号，已挂载且「本会话挂载时全节点无坐标、用户
+ * 未手动动过几何」的画布再用 mermaid 引擎做一次全量排布。不缓冲：后挂载画布
+ * 由挂载时的「全零检测」覆盖，旧导图有历史坐标不应被信号重排。
+ */
+export type MindmapAutoLayoutListener = () => void;
+
+const autoLayoutListeners = new Map<string, Set<MindmapAutoLayoutListener>>();
+
+export function emitMindmapAutoLayout(mapId: string): void {
+  autoLayoutListeners.get(mapId)?.forEach((cb) => cb());
+}
+
+export function subscribeMindmapAutoLayout(mapId: string, listener: MindmapAutoLayoutListener): () => void {
+  let set = autoLayoutListeners.get(mapId);
+  if (!set) {
+    set = new Set();
+    autoLayoutListeners.set(mapId, set);
+  }
+  set.add(listener);
+  return () => {
+    set?.delete(listener);
+  };
+}
+
+/**
  * 全量重载信号（AI 事务撤销等无法用前向动作表达的外部变更）。
  * 画布收到后强制拉取服务端文档并对账；后挂载的画布本就会读最新文档，无需缓冲。
  */

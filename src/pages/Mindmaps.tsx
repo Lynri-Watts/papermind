@@ -20,17 +20,41 @@ import {
   Plus,
   Trash2,
   Upload,
+  Workflow,
   X,
 } from 'lucide-react';
 import MindmapCanvas from '../components/mindmap/MindmapCanvas';
 import { useMindmapScope } from '../components/mindmap/useMindmapScope';
 import { ApiRequestError } from '../api';
+import {
+  MINDMAP_TYPE,
+  DIAGRAM_TYPE_CHOICES,
+  diagramLabelKey,
+  diagramStarter,
+} from '../lib/mindmap';
 import { usePaperMindStore } from '../store';
 import type { MindmapMeta } from '../types';
 
 interface Banner {
   text: string;
 }
+
+/** 列表/顶栏的图类型徽标：mindmap 不显示；经典类型显示本地化名称，未知类型显示原始 token */
+const DiagramBadge: React.FC<{ type: string }> = ({ type }) => {
+  const { t } = useTranslation('mindmap');
+  if (!type || type === MINDMAP_TYPE) return null;
+  const key = diagramLabelKey(type);
+  const label = key ? t(`diagram.kind.${key}`) : type;
+  return (
+    <span
+      title={t('diagram.badgeTitle', { type: label })}
+      className="inline-flex items-center gap-0.5 rounded bg-primary/10 px-1.5 py-px text-[9px] font-medium text-primary"
+    >
+      <Workflow size={9} />
+      {label}
+    </span>
+  );
+};
 
 export default function Mindmaps() {
   const { t, i18n } = useTranslation('mindmap');
@@ -61,6 +85,14 @@ export default function Mindmaps() {
   const [codePanelOpen, setCodePanelOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // 新建对话框：kind='mindmap' 或 DIAGRAM_TYPE_CHOICES 的 label key；
+  // source 非空时一律按源码 detect 的实际类型创建（下拉仅用于生成骨架）
+  const [showCreate, setShowCreate] = useState(false);
+  const [createTitle, setCreateTitle] = useState('');
+  const [createKind, setCreateKind] = useState<string>(MINDMAP_TYPE);
+  const [createSource, setCreateSource] = useState('');
+  const [createError, setCreateError] = useState<string | null>(null);
+
   // 切作用域时关闭横幅与重命名态
   useEffect(() => {
     setBanner(null);
@@ -83,21 +115,47 @@ export default function Mindmaps() {
     return String(e);
   }, []);
 
-  const handleCreate = useCallback(async () => {
+  const openCreate = useCallback(() => {
+    setCreateTitle(t('gallery.newMapTitle'));
+    setCreateKind(MINDMAP_TYPE);
+    setCreateSource('');
+    setCreateError(null);
+    setShowCreate(true);
+  }, [t]);
+
+  const submitCreate = useCallback(async () => {
+    const title = createTitle.trim();
+    if (!title) {
+      setCreateError(t('gallery.titleRequired'));
+      return;
+    }
     setBusy(true);
-    setBanner(null);
+    setCreateError(null);
     try {
-      await createMindmap({
-        workspaceId: scopeWs,
-        title: t('gallery.newMapTitle'),
-        rootText: t('gallery.newMapTitle'),
-      });
+      const src = createSource.trim();
+      if (src) {
+        // 粘贴了源码：图类型以源码首声明为准（下拉只作骨架生成，不参与提交）
+        await importMindmap({ mermaid: createSource, title, workspaceId: scopeWs });
+      } else if (createKind === MINDMAP_TYPE) {
+        await createMindmap({ title, rootText: title, workspaceId: scopeWs });
+      } else {
+        const starter = diagramStarter(createKind, title);
+        if (!starter) {
+          setCreateError(t('gallery.createKindUnsupported'));
+          return;
+        }
+        await importMindmap({ mermaid: starter, title, workspaceId: scopeWs });
+      }
+      setShowCreate(false);
     } catch (e) {
-      setBanner({ text: t('gallery.operationFailed', { message: failMessage(e) }) });
+      setCreateError(t('gallery.operationFailed', { message: failMessage(e) }));
     } finally {
       setBusy(false);
     }
-  }, [createMindmap, scopeWs, t, failMessage]);
+  }, [
+    createTitle, createSource, createKind, createMindmap, importMindmap,
+    scopeWs, t, failMessage,
+  ]);
 
   const handleImportFile = useCallback(async (file: File) => {
     setBusy(true);
@@ -197,7 +255,7 @@ export default function Mindmaps() {
           <div className="mt-3 flex gap-2">
             <button
               type="button"
-              onClick={handleCreate}
+              onClick={openCreate}
               disabled={busy}
               className="flex flex-1 items-center justify-center gap-1 rounded-md bg-primary px-2 py-1.5 text-xs font-medium text-white hover:bg-primary/90 disabled:opacity-50"
             >
@@ -286,6 +344,7 @@ export default function Mindmaps() {
                     </div>
                   ) : (
                     <div className="flex items-center gap-1.5">
+                      <DiagramBadge type={m.diagramType} />
                       <span className={`min-w-0 flex-1 truncate text-xs font-medium ${isActive ? 'text-primary' : 'text-text'}`}>
                         {m.title}
                       </span>
@@ -326,6 +385,9 @@ export default function Mindmaps() {
             <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-surface px-4">
               <ListTree size={15} className="text-textSecondary" />
               <span className="truncate text-sm font-medium text-text">{selectedMeta.title}</span>
+              {selectedMeta.diagramType !== MINDMAP_TYPE && (
+                <DiagramBadge type={selectedMeta.diagramType} />
+              )}
               <span className="flex items-center gap-1 rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-textSecondary">
                 {scopeWs === null ? <Globe size={10} /> : <FolderOpen size={10} />}
                 {scopeWs === null ? t('gallery.scopeGlobal') : (activeWorkspaceName ?? t('gallery.scopeWs'))}
@@ -352,7 +414,7 @@ export default function Mindmaps() {
             <div className="mt-6 flex gap-3">
               <button
                 type="button"
-                onClick={handleCreate}
+                onClick={openCreate}
                 disabled={busy}
                 className="flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary/90 disabled:opacity-50"
               >
@@ -372,6 +434,111 @@ export default function Mindmaps() {
           </div>
         )}
       </main>
+
+      {/* ---------- 新建导图对话框 ---------- */}
+      {showCreate && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={() => { if (!busy) setShowCreate(false); }}
+        >
+          <div
+            className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <h3 className="text-sm font-semibold text-text">{t('gallery.createTitle')}</h3>
+              <button
+                type="button"
+                onClick={() => { if (!busy) setShowCreate(false); }}
+                className="rounded p-1 text-textSecondary hover:text-text"
+              >
+                <X size={15} />
+              </button>
+            </div>
+            <div className="space-y-3 px-4 py-4">
+              <div>
+                <label className="mb-1 block text-xs font-medium text-textSecondary">
+                  {t('gallery.createTitleLabel')}
+                </label>
+                <input
+                  autoFocus
+                  value={createTitle}
+                  onChange={(e) => setCreateTitle(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void submitCreate(); }}
+                  className="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-sm text-text outline-none focus:border-primary/50"
+                  placeholder={t('gallery.newMapTitle')}
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-textSecondary">
+                  {t('gallery.createKindLabel')}
+                </label>
+                <select
+                  value={createKind}
+                  onChange={(e) => {
+                    const kind = e.target.value;
+                    setCreateKind(kind);
+                    if (kind === MINDMAP_TYPE) {
+                      setCreateSource('');
+                    } else {
+                      setCreateSource(
+                        diagramStarter(kind, createTitle.trim() || t('gallery.newMapTitle')) ?? ''
+                      );
+                    }
+                  }}
+                  className="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-sm text-text outline-none focus:border-primary/50"
+                >
+                  <option value={MINDMAP_TYPE}>{t('diagram.kind.mindmap')}</option>
+                  {DIAGRAM_TYPE_CHOICES.map(([key]) => (
+                    <option key={key} value={key}>{t(`diagram.kind.${key}`)}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-textSecondary">
+                  {t('gallery.createSourceLabel')}
+                </label>
+                <textarea
+                  value={createSource}
+                  onChange={(e) => setCreateSource(e.target.value)}
+                  spellCheck={false}
+                  rows={8}
+                  placeholder={t('gallery.createSourcePlaceholder')}
+                  className="w-full resize-y rounded-md border border-border bg-background px-2.5 py-2 font-mono text-xs leading-5 text-text outline-none focus:border-primary/50"
+                />
+                <p className="mt-1 text-[11px] leading-4 text-textSecondary/70">
+                  {t('gallery.createSourceHint')}
+                </p>
+              </div>
+              {createError && (
+                <div className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-xs text-red-300">
+                  <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+                  <span className="break-words">{createError}</span>
+                </div>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 border-t border-border px-4 py-3">
+              <button
+                type="button"
+                onClick={() => setShowCreate(false)}
+                disabled={busy}
+                className="rounded-md border border-border px-3 py-1.5 text-xs text-textSecondary transition-colors hover:bg-white/5 hover:text-text disabled:opacity-50"
+              >
+                {t('gallery.createCancel')}
+              </button>
+              <button
+                type="button"
+                onClick={() => void submitCreate()}
+                disabled={busy}
+                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary/90 disabled:opacity-50"
+              >
+                {busy && <Loader2 size={12} className="animate-spin" />}
+                {t('gallery.createSubmit')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

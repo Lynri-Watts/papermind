@@ -90,9 +90,15 @@ class LLMClient:
         :param tools: OpenAI tools schema；None 表示不带工具
         :yields: dict 事件：
             {"type": "thought", "delta": str}    思考文本增量（边生成边输出）
-            {"type": "decision", "tool": {"name","arguments"}|None, "thought": str}
+            {"type": "decision", "tool": {"name","arguments"}|None, "thought": str,
+             "reasoning": str}
                 流结束：tool=None 表示不再需要工具（直接进入回答）；
-                否则为请求的下一个工具（本实现只取第一个完整工具调用）
+                否则为请求的下一个工具（本实现只取第一个完整工具调用）。
+
+        ``reasoning`` 为思考模式模型（如 deepseek-v4-flash）经独立字段
+        ``reasoning_content`` 输出的隐藏思维链：不向用户展示，但多轮工具
+        对话时服务商要求把它随上一条 assistant 消息**原样回传**，否则
+        下一轮请求直接 400（"reasoning_content must be passed back"）。
         """
         kwargs: dict = {
             "model": model or self._model,
@@ -105,6 +111,7 @@ class LLMClient:
         stream = self._client.chat.completions.create(**kwargs)
 
         thought_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_acc: dict[int, dict] = {}
 
         for chunk in stream:
@@ -115,6 +122,14 @@ class LLMClient:
             if content:
                 thought_parts.append(content)
                 yield {"type": "thought", "delta": content}
+            # 思考模型的隐藏思维链：优先读声明属性，兼容服务商把它放在额外字段
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning is None:
+                reasoning = (getattr(delta, "model_extra", None) or {}).get(
+                    "reasoning_content"
+                )
+            if reasoning:
+                reasoning_parts.append(reasoning)
             for tc in (getattr(delta, "tool_calls", None) or []):
                 cur = tool_acc.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
                 if getattr(tc, "id", None):
@@ -126,6 +141,7 @@ class LLMClient:
                         cur["arguments"] += tc.function.arguments
 
         thought = "".join(thought_parts)
+        reasoning_text = "".join(reasoning_parts)
         # 取第一个带完整名称的工具调用（多工具并行请求不在本项目交互语义内）
         for _, tc in sorted(tool_acc.items()):
             if tc.get("name"):
@@ -138,6 +154,8 @@ class LLMClient:
                     "tool": {"name": tc["name"], "arguments": arguments,
                              "call_id": tc.get("id") or ""},
                     "thought": thought,
+                    "reasoning": reasoning_text,
                 }
                 return
-        yield {"type": "decision", "tool": None, "thought": thought}
+        yield {"type": "decision", "tool": None,
+               "thought": thought, "reasoning": reasoning_text}

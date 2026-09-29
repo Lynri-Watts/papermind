@@ -9,6 +9,7 @@ import {
   getMindmap as getMindmapApi,
   renameMindmap as renameMindmapApi,
   deleteMindmapApi,
+  saveMindmapSource as saveMindmapSourceApi,
 } from '../api';
 import i18n from '../i18n';
 
@@ -255,6 +256,9 @@ interface PaperMindStore {
   /** 当前活跃工作区 id；null=尚未选择（显示主页引导） */
   activeWorkspaceId: string | null;
   setActiveWorkspaceId: (id: string | null) => void;
+  /** 离开当前工作区（删除活跃工作区/回到无工作区态）：置空活跃 id 并清空
+   *  全部工作区页面状态——聊天记录/历史会话只属于工作区，绝不在无归属状态残留 */
+  leaveWorkspace: () => void;
   /** 切换工作区：先保存当前写作文件，再加载新工作区的 main.tex */
   switchWorkspace: (id: string) => Promise<void>;
   /** 把当前 latexContent 保存到活跃工作区的 main.tex */
@@ -281,8 +285,10 @@ interface PaperMindStore {
   importMindmap: (input: { mermaid: string; title?: string; workspaceId?: string | null }) => Promise<MindmapInfo>;
   /** 读取导图完整文档（命中缓存不重复请求；force=true 强制拉服务端版本对账） */
   loadMindmapDoc: (mapId: string, workspaceId?: string | null, force?: boolean) => Promise<MindmapInfo>;
-  /** 写入/更新文档缓存，并同步列表元信息（version/title/updated_at）；画布提交/AI diff 后统一入口 */
+  /** 写入/更新文档缓存，并同步列表元信息（version/title/diagramType/updated_at）；画布提交/AI diff 后统一入口 */
   cacheMindmapDoc: (info: MindmapInfo) => void;
+  /** 以整段 mermaid 源码替换导图（支持 mindmap↔其他图互转）；乐观锁依据缓存 version，冲突抛 MindmapConflictError */
+  replaceMindmapSource: (mapId: string, source: string) => Promise<MindmapInfo>;
   /** 重命名导图（作用域自动解析：文档缓存 → 列表缓存 → 当前作用域） */
   renameMindmap: (mapId: string, title: string) => Promise<MindmapInfo>;
   /** 删除导图：清文档缓存、从列表移除；若当前选中它则清空选中 */
@@ -344,13 +350,27 @@ function mindmapScopeToWs(scope: string): string | null {
   return typeof scope === 'string' && scope.startsWith('ws:') ? scope.slice(3) : null;
 }
 
-/** 完整文档 → 列表元信息（去 nodes）。 */
+/**
+ * 归一化导图文档：旧缓存/旧后端响应可能缺 diagramType/source，
+ * 统一补齐（diagramType 缺省即 mindmap；mindmap 的 source 恒为 null）。
+ */
+function normalizeMindmapInfo(raw: MindmapInfo): MindmapInfo {
+  const diagramType = raw.diagramType || 'mindmap';
+  return {
+    ...raw,
+    diagramType,
+    source: diagramType === 'mindmap' ? null : (raw.source ?? null),
+  };
+}
+
+/** 完整文档 → 列表元信息（去 nodes/source）。 */
 function toMindmapMeta(info: MindmapInfo): MindmapMeta {
   const meta: MindmapMeta = {
     id: info.id,
     scope: info.scope,
     title: info.title,
     version: info.version,
+    diagramType: info.diagramType || 'mindmap',
     created_at: info.created_at,
     updated_at: info.updated_at,
   };
@@ -850,6 +870,12 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
   setWorkspaces: (items) => set({ workspaces: items }),
   activeWorkspaceId: null,
   setActiveWorkspaceId: (id) => set({ activeWorkspaceId: id }),
+  leaveWorkspace: () => set({
+    activeWorkspaceId: null,
+    // 复用快照归一化的默认值：聊天/会话/选中论文/标签/上下文等一并清空，
+    // 避免被删（或离开）工作区的对话历史在无归属状态下继续可见、可写入
+    ...applyWsState({}),
+  }),
   saveLatexToWorkspace: async () => {
     const { activeWorkspaceId, latexContent } = usePaperMindStore.getState();
     if (!activeWorkspaceId) return;
@@ -937,16 +963,17 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
       rootText: input.rootText,
       workspaceId: ws,
     });
+    const normalized = normalizeMindmapInfo(info);
     const key = mindmapScopeKey(ws);
     set((state) => ({
       mindmapsByScope: {
         ...state.mindmapsByScope,
-        [key]: [toMindmapMeta(info), ...(state.mindmapsByScope[key] ?? [])],
+        [key]: [toMindmapMeta(normalized), ...(state.mindmapsByScope[key] ?? [])],
       },
-      mindmapDocs: { ...state.mindmapDocs, [info.id]: info },
-      ...(ws ? { activeWsMindmapId: info.id } : { activeGlobalMindmapId: info.id }),
+      mindmapDocs: { ...state.mindmapDocs, [normalized.id]: normalized },
+      ...(ws ? { activeWsMindmapId: normalized.id } : { activeGlobalMindmapId: normalized.id }),
     }));
-    return info;
+    return normalized;
   },
   importMindmap: async (input) => {
     const ws = input.workspaceId === undefined ? get().activeWorkspaceId : input.workspaceId;
@@ -955,26 +982,28 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
       title: input.title,
       workspaceId: ws,
     });
+    const normalized = normalizeMindmapInfo(info);
     const key = mindmapScopeKey(ws);
     set((state) => ({
       mindmapsByScope: {
         ...state.mindmapsByScope,
-        [key]: [toMindmapMeta(info), ...(state.mindmapsByScope[key] ?? [])],
+        [key]: [toMindmapMeta(normalized), ...(state.mindmapsByScope[key] ?? [])],
       },
-      mindmapDocs: { ...state.mindmapDocs, [info.id]: info },
-      ...(ws ? { activeWsMindmapId: info.id } : { activeGlobalMindmapId: info.id }),
+      mindmapDocs: { ...state.mindmapDocs, [normalized.id]: normalized },
+      ...(ws ? { activeWsMindmapId: normalized.id } : { activeGlobalMindmapId: normalized.id }),
     }));
-    return info;
+    return normalized;
   },
   loadMindmapDoc: async (mapId, workspaceId, force = false) => {
     const cached = get().mindmapDocs[mapId];
     if (cached && !force) return cached;
     const ws = workspaceId === undefined ? get().activeWorkspaceId : workspaceId;
-    const info = await getMindmapApi(mapId, ws ?? undefined);
+    const info = normalizeMindmapInfo(await getMindmapApi(mapId, ws ?? undefined));
     get().cacheMindmapDoc(info);
     return info;
   },
-  cacheMindmapDoc: (info) => set((state) => {
+  cacheMindmapDoc: (raw) => set((state) => {
+    const info = normalizeMindmapInfo(raw);
     const key = mindmapScopeKey(mindmapScopeToWs(info.scope));
     const byScope = { ...state.mindmapsByScope };
     const list = byScope[key];
@@ -989,10 +1018,20 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
       mindmapsByScope: byScope,
     };
   }),
+  replaceMindmapSource: async (mapId, source) => {
+    const cached = get().mindmapDocs[mapId];
+    if (!cached) throw new Error('mindmap doc not loaded');
+    const ws = mindmapScopeToWs(cached.scope);
+    const info = normalizeMindmapInfo(
+      await saveMindmapSourceApi(mapId, source, cached.version, ws ?? undefined)
+    );
+    get().cacheMindmapDoc(info);
+    return info;
+  },
   renameMindmap: async (mapId, title) => {
     const ws = resolveMindmapWs(get(), mapId);
     const info = await renameMindmapApi(mapId, title, ws ?? undefined);
-    get().cacheMindmapDoc(info);
+    get().cacheMindmapDoc(normalizeMindmapInfo(info));
     return info;
   },
   deleteMindmap: async (mapId) => {

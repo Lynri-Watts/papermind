@@ -10,7 +10,7 @@ import { submitMindmapActions } from '../../api';
 import { usePaperMindStore } from '../../store';
 import type { MindmapAction } from '../../types';
 import { findRoot } from './model';
-import { emitMindmapCommitted } from './bridge';
+import { emitMindmapAutoLayout, emitMindmapCommitted } from './bridge';
 
 export interface MindmapPaperInput {
   /** 论文标识（local:<ws>:<path> 或 arxiv:xxx 等 source:external_id） */
@@ -89,6 +89,9 @@ export async function addPaperToActiveMindmap(
     idMap: result.idMap,
     origin: 'user',
   });
+  // 出生态画布（挂载时全零且用户未接管几何）借此把新增论文节点纳入 mermaid 官方排布；
+  // 旧导图/手动排过的画布在订阅侧直接忽略该信号
+  emitMindmapAutoLayout(mapId);
 
   return { mapId, mapTitle: result.mindmap.title, created, duplicated: false };
 }

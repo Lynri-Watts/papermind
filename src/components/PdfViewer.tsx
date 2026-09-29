@@ -60,6 +60,12 @@ interface FloatMenu {
 
 const HIGHLIGHT_COLORS = ['#FDE68A', '#A7F3D0', '#BFDBFE', '#FBCFE8'];
 
+/** locateText 等待文档加载完成的上限：切换标签会以新 key 重挂载本组件并
+ *  重新 getDocument，这期间 docRef 为 null，必须等而不是直接判定位失败 */
+const LOCATE_DOC_WAIT_MS = 8000;
+/** locateText 等待目标页占位 wrapper / 文本层就绪的上限（惰性渲染） */
+const LOCATE_PAGE_WAIT_MS = 5000;
+
 /**
  * 在某个 span[data-pdf-text] 内，把 [localStart, localEnd) 字符区间包裹为高亮 span。
  * 兼容该 div 因先前定位/高亮拆分而存在多个相邻文本节点的情况。
@@ -188,6 +194,9 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   const pageRunsRef = useRef<Map<number, PageRun[]>>(new Map());
   // 惰性渲染：每页 PDFPageProxy 对象（分片并行预取，避免串行 getPage 卡顿）
   const pagesRef = useRef<Map<number, pdfjsLib.PDFPageProxy>>(new Map());
+  // 当前文档代理的镜像：locateText 是命令式句柄，切标签重挂载时闭包里的 doc
+  // state 可能还是 null / 旧文档，必须经 ref 读最新值
+  const docRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   // 渲染中的页集合（防止 IntersectionObserver 对同一页重复触发渲染）
   const renderInFlightRef = useRef<Set<number>>(new Set());
   // 供定位（locateText）主动触发某页渲染（目标页可能在视口外）
@@ -223,6 +232,7 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     setLoading(true);
     setError(null);
     setDoc(null);
+    docRef.current = null;
     setNumPages(0);
     setRenderedCount(0);
 
@@ -233,6 +243,7 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     task.promise
       .then((loadedDoc) => {
         if (cancelled) return;
+        docRef.current = loadedDoc;
         setDoc(loadedDoc);
         setNumPages(loadedDoc.numPages);
         setLoading(false);
@@ -764,20 +775,36 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
 
   // 暴露精确定位接口：先在整篇文档（逐页拼接纯文本）中定位命中范围，
   // 再把命中范围按页切分、映射到每页 DOM span 的精确字符区间，连续包裹高亮。
+  // 返回 false 表示"确实无法定位"；文档/目标页尚未就绪时会内部等待，不提前判失败。
   useImperativeHandle(ref, () => ({
     paperId,
     locateText: async (rawText: string): Promise<boolean> => {
       const target = normalizeText(rawText);
-      const docRef = doc;
+      if (!target) return false;
+
+      // 切标签会以 key=activeTabId 重挂载本组件并重新加载文档，这期间 docRef
+      // 仍是 null：必须等待，否则跨论文点「定位原文」会拿到"未就绪"直接报失败。
+      const docWaitUntil = Date.now() + LOCATE_DOC_WAIT_MS;
+      while (!docRef.current && Date.now() < docWaitUntil) {
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      const pdfDoc = docRef.current;
       const scroll = scrollRef.current;
-      if (!target || !docRef || !scroll) return false;
+      if (!pdfDoc || !scroll) return false;
 
       try {
         // 全文定位 → 页码 + 命中范围（跨页连续）
-        const hit = await locateInDocument(docRef, target);
+        const hit = await locateInDocument(pdfDoc, target);
         if (!hit) return false;
 
-        const wrap = pageWrapRefs.current.get(hit.page);
+        // 等该页占位 wrapper 建成（换文档后由渲染 effect 一次性全部建好；
+        // 未建成时提前 return 会让紧随换文档的首次定位无谓失败）
+        const pageWaitUntil = Date.now() + LOCATE_PAGE_WAIT_MS;
+        let wrap = pageWrapRefs.current.get(hit.page);
+        while (!wrap && Date.now() < pageWaitUntil) {
+          await new Promise((r) => setTimeout(r, 80));
+          wrap = pageWrapRefs.current.get(hit.page);
+        }
         if (!wrap) return false;
 
         // 先滚动目标页到视口中部
@@ -786,8 +813,7 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
         scroller.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
 
         // 等待该页渲染完成（惰性渲染下目标页可能在视口外：主动触发其渲染）
-        const waitMs = Date.now() + 5000;
-        while (Date.now() < waitMs) {
+        while (Date.now() < pageWaitUntil) {
           if (!pageReadyRef.current[hit.page] && renderPageRef.current) {
             void renderPageRef.current(hit.page);
           }
@@ -808,9 +834,9 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
         let localStart = hit.start - hit.pageStart;
         let remaining = hit.length;
         let any = false;
-        while (page <= docRef.numPages && remaining > 0) {
+        while (page <= pdfDoc.numPages && remaining > 0) {
           const pageStartOff = offsets[page - 1];
-          const pageEndOff = page < docRef.numPages ? offsets[page] : Number.MAX_SAFE_INTEGER;
+          const pageEndOff = page < pdfDoc.numPages ? offsets[page] : Number.MAX_SAFE_INTEGER;
           const take = Math.min(remaining, Math.max(0, pageEndOff - pageStartOff - localStart));
           if (take > 0) {
             const pWrap = pageWrapRefs.current.get(page);
@@ -833,7 +859,7 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
         return false;
       }
     },
-  }), [doc, paperId]);
+  }), [paperId]);
 
   if (loading) {
     return (

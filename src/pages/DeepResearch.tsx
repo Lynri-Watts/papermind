@@ -39,6 +39,10 @@ function makePlaceholderPaper(id: string, title: string): Paper {
   };
 }
 
+/** 等「目标论文的阅读器就位」的上限：新标签要先 ensurePdfReady（网络请求），
+ *  这段窗口内 PdfViewer 尚未挂载，不能据此判定位失败 */
+const LOCATE_VIEWER_WAIT_MS = 15000;
+
 /**
  * 纯阅读器：多标签 PDF 阅读 + 选中文本（高亮/笔记/存摘录/提问）。
  * 问答已上移到全局 QAPanel（src/components/QAPanel.tsx），
@@ -263,27 +267,40 @@ const DeepResearch: React.FC = () => {
       .finally(() => setUploading(false));
   }, [activeWorkspaceId, openTabByMeta, showNotification, t]);
 
-  // 消费全局 PDF 引用定位请求（QAPanel 点击 [Source N] / 定位链接时发出）
+  // 消费全局 PDF 引用定位请求（QAPanel 点击引用卡「定位原文」时发出）
   useEffect(() => {
     if (!pdfLocateRequest) return;
     const { paperId, text } = pdfLocateRequest;
     // 打开/激活对应论文标签
     const title = storeReaderTabs.find((t) => t.paperId === paperId)?.title ?? t('tabs.untitled');
     openTabByMeta(paperId, title);
-    // 等待标签切换 & PDF 加载后定位（PDF 未就绪时可能一次定位失败，稍作重试）
-    const attempt = (retries: number) => {
-      if (pdfViewerRef.current && pdfViewerRef.current.paperId === paperId) {
-        pdfViewerRef.current.locateText(text).then((ok) => {
-          if (!ok) {
-            const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 60);
-            showNotification(t('notice.locateFailed', { snippet: `${snippet}${text.length > 60 ? '…' : ''}` }), 'error');
-          }
-        });
+
+    // 新标签要先过 ensurePdfReady（其中 pdfChecking 阶段 PdfViewer 尚未挂载），
+    // 这里只负责"等到目标论文的阅读器就位"；文档加载与目标页渲染由
+    // PdfViewer.locateText 内部等待，因此它的 false 才是真正的"定位不到"。
+    let cancelled = false;
+    const deadline = Date.now() + LOCATE_VIEWER_WAIT_MS;
+    const failed = () => {
+      const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 60);
+      showNotification(t('notice.locateFailed', { snippet: `${snippet}${text.length > 60 ? '…' : ''}` }), 'error');
+    };
+    const attempt = () => {
+      if (cancelled) return;
+      const viewer = pdfViewerRef.current;
+      if (!viewer || viewer.paperId !== paperId) {
+        if (Date.now() < deadline) setTimeout(attempt, 250);
+        else failed();
         return;
       }
-      if (retries > 0) setTimeout(() => attempt(retries - 1), 250);
+      viewer.locateText(text).then((ok) => {
+        if (!cancelled && !ok) failed();
+      });
     };
-    setTimeout(() => attempt(8), 300);
+    const timer = setTimeout(attempt, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pdfLocateRequest]);
 

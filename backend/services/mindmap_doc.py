@@ -12,6 +12,7 @@
         "order": 0,                  # 同级位置（每次动作后规范化为 0..n-1）
         "text": "节点文本",
         "kind": "topic" | "paper",
+        "shape": "default" | "rect" | "rounded" | "circle" | "hexagon",  # 可选
         "paperId": "source:ext" | "local:..." | null,  # 仅 kind=paper
         "x": 0.0, "y": 0.0,          # 手动几何坐标（mermaid 不表达几何）
         "collapsed": false           # 可选；折叠分支
@@ -34,6 +35,8 @@ from typing import Any
 PAPER_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+:[^\s]+$")
 
 VALID_KINDS = ("topic", "paper")
+#: 节点形状（与前端 VALID_SHAPES 一致；缺省/旧文档按 default 处理，根规范为 circle）
+VALID_SHAPES = ("default", "rect", "rounded", "circle", "hexagon")
 
 
 class MindmapError(Exception):
@@ -62,7 +65,8 @@ def new_node_id(existing: set[str] | None = None) -> str:
 
 
 def make_node(node_id: str, parent_id: str | None, order: int,
-              text: str = "", *, kind: str = "topic", paper_id: str | None = None,
+              text: str = "", *, kind: str = "topic",
+              shape: str | None = None, paper_id: str | None = None,
               x: float = 0.0, y: float = 0.0, collapsed: bool = False) -> dict:
     return {
         "id": node_id,
@@ -70,6 +74,7 @@ def make_node(node_id: str, parent_id: str | None, order: int,
         "order": order,
         "text": text,
         "kind": kind,
+        "shape": shape if shape is not None else ("circle" if parent_id is None else "default"),
         "paperId": paper_id,
         "x": x,
         "y": y,
@@ -152,6 +157,8 @@ def validate_doc(doc: Any) -> None:
         kind = n.get("kind")
         if kind not in VALID_KINDS:
             raise MindmapError("mindmap.invalid_kind", id=n["id"], kind=str(kind))
+        if "shape" in n and n["shape"] not in VALID_SHAPES:
+            raise MindmapError("mindmap.invalid_shape", id=n["id"], shape=str(n.get("shape")))
         if kind == "paper":
             pid_val = n.get("paperId")
             if not isinstance(pid_val, str) or not pid_val:
@@ -303,6 +310,7 @@ def _op_add(doc: dict, action: dict, id_map: dict[str, str]) -> None:
     text = action.get("text", "")
     if not isinstance(text, str):
         raise MindmapError("mindmap.text_invalid", id=node_id)
+    shape = _as_shape(action.get("shape"), node_id, parent_id is None)
     x = _as_coord(action.get("x", 0.0), node_id)
     y = _as_coord(action.get("y", 0.0), node_id)
 
@@ -312,7 +320,7 @@ def _op_add(doc: dict, action: dict, id_map: dict[str, str]) -> None:
         raise MindmapError("mindmap.order_invalid", id=node_id)
 
     nodes.append(make_node(node_id, parent_id, order, text,
-                           kind=kind, paper_id=paper_id, x=x, y=y))
+                           kind=kind, shape=shape, paper_id=paper_id, x=x, y=y))
     normalize_orders(doc)
 
 
@@ -320,6 +328,15 @@ def _as_coord(value: Any, node_id: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise MindmapError("mindmap.coordinate_invalid", id=node_id)
     return float(value)
+
+
+def _as_shape(value: Any, node_id: str, is_root: bool = False) -> str:
+    """形状缺省：根 circle（规范序列化恒为 ((x))），其余 default；非法值拒绝。"""
+    if value is None or value == "":
+        return "circle" if is_root else "default"
+    if not isinstance(value, str) or value not in VALID_SHAPES:
+        raise MindmapError("mindmap.invalid_shape", id=node_id, shape=str(value))
+    return value
 
 
 def _op_update(node: dict, action: dict) -> None:
@@ -340,6 +357,8 @@ def _op_update(node: dict, action: dict) -> None:
             paper_id = None
         node["kind"] = kind
         node["paperId"] = paper_id
+    if "shape" in action:
+        node["shape"] = _as_shape(action["shape"], node["id"], node.get("parentId") is None)
     if "x" in action:
         node["x"] = _as_coord(action["x"], node["id"])
     if "y" in action:

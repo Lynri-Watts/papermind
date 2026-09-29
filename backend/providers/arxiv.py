@@ -9,6 +9,8 @@ arXiv 不提供结构化引用数据，references/citations 返回空列表
 from __future__ import annotations
 
 import re
+import threading
+import time
 import xml.etree.ElementTree as ET
 from typing import Optional
 
@@ -17,9 +19,38 @@ import requests
 from config import HTTP_TIMEOUT
 from i18n import tr
 from providers.base import Paper, PaperProvider, SearchQuery, make_paper_id
-from providers.download import PdfDownloadError, download_pdf, parse_pdf_to_text
+from providers.download import (
+    PdfDownloadError,
+    download_pdf_first_available,
+    parse_pdf_to_text,
+)
 
 QUERY_URL = "https://export.arxiv.org/api/query"
+
+# arXiv 官方使用条款建议请求间隔 ≥ 3 秒。实测短时间连发 export.arxiv.org 会
+# 触发边缘突发限流：返回 **406 空响应且不带任何响应头**（非标准速率错误码），
+# 持续约 20 秒冷却窗，窗内 search / structured / get_paper 的每个请求都失败
+# （ReAct 一轮里多源 paper_search 再叠加 read_paper 极易踩中）；arxiv.org 的
+# PDF 下载同属 arXiv 服务，突发时同样会 503。用进程级节流 + 对 406/429/5xx
+# 的退避重试，把单源抖动挡在聚合层之内。
+_ARXIV_MIN_INTERVAL = 3.0
+_ARXIV_RETRY_STATUSES = {406, 429, 500, 502, 503, 504}
+# 最多 2 次重试：第 1 次重试前基础等待 5s，第 2 次 15s（实测冷却约 20s，
+# 多数情况下 5~15s 后首个请求即恢复 200）
+_ARXIV_BACKOFF = (5.0, 15.0)
+_arxiv_rate_lock = threading.Lock()
+_arxiv_last_request_at = 0.0
+
+
+def _arxiv_throttle() -> None:
+    """保证距上一次 arXiv API 请求至少 ``_ARXIV_MIN_INTERVAL`` 秒（进程级）。"""
+    global _arxiv_last_request_at
+    with _arxiv_rate_lock:
+        wait = _ARXIV_MIN_INTERVAL - (time.monotonic() - _arxiv_last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _arxiv_last_request_at = time.monotonic()
+
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -50,9 +81,33 @@ class ArxivProvider(PaperProvider):
 
     # ---------- 内部工具 ----------
     def _query(self, params: dict) -> bytes:
-        resp = self.session.get(QUERY_URL, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        return resp.content
+        """GET arXiv API：进程级 ≥3s 节流；遇 406/429/5xx 退避重试最多 2 次。
+
+        突发限流的 406 响应不带 Retry-After（甚至无任何响应头），按固定退避
+        等待；429/503 若给出 Retry-After 则优先尊重（上限 30s）。
+        """
+        resp: Optional[requests.Response] = None
+        for attempt in range(len(_ARXIV_BACKOFF) + 1):
+            _arxiv_throttle()
+            resp = self.session.get(QUERY_URL, params=params, timeout=HTTP_TIMEOUT)
+            if (
+                resp.status_code in _ARXIV_RETRY_STATUSES
+                and attempt < len(_ARXIV_BACKOFF)
+            ):
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else _ARXIV_BACKOFF[attempt]
+                except (TypeError, ValueError):
+                    delay = _ARXIV_BACKOFF[attempt]
+                time.sleep(min(max(delay, 1.0), 30.0))
+                continue
+            resp.raise_for_status()
+            return resp.content
+        # 理论不可达：最后一次 attempt 不会 continue，由 raise_for_status 收尾
+        raise RuntimeError(tr(
+            "search.arxiv_rate_limited",
+            status=resp.status_code if resp is not None else "?",
+        ))
 
     @staticmethod
     def _parse_entries(xml_bytes: bytes) -> list[Paper]:
@@ -87,6 +142,7 @@ class ArxivProvider(PaperProvider):
                 external_id=ext_id,
                 url=abs_url,
                 pdf_url=pdf_url,
+                pdf_candidates=[pdf_url] if pdf_url else [],
             ))
         return papers
 
@@ -171,9 +227,15 @@ class ArxivProvider(PaperProvider):
 
     def get_fulltext(self, paper: Paper) -> Optional[str]:
         """从 arXiv PDF 下载并解析纯文本（arXiv 100% OA）。"""
-        pdf_url = paper.pdf_url or f"https://arxiv.org/pdf/{paper.external_id}"
+        fallback = f"https://arxiv.org/pdf/{paper.external_id}"
+        urls = list(paper.pdf_candidates) or []
+        if fallback not in urls:
+            urls.append(fallback)
+        _arxiv_throttle()
         try:
-            content = download_pdf(pdf_url, session=self.session)
+            content, _used = download_pdf_first_available(
+                urls, session=self.session,
+            )
         except PdfDownloadError:
             return None
         return parse_pdf_to_text(content)

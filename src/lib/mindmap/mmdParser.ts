@@ -15,13 +15,15 @@
  * - ``%%`` 到行尾是注释；其中 ``id:n_xxxxxxxx`` 是节点稳定 ID 注解
  *   （真实 mermaid 当普通注释忽略；序列化始终带注解，导出再导入不丢几何）；
  * - 无注解的手写节点按「索引路径」（根到它的同级序号序列）做 sha1[:8] 确定性 ID；
- * - 形状 ((x))/{{x}}/[x]/(x) 归一为 topic（v1 丢弃形状）；允许 root((x)) 式前置名；
- * - 论文节点整行为 [文本](paper:<paperId>)；
+ * - 形状 ((x))→circle / {{x}}→hexagon / [x]→rect / (x)→rounded，无包裹为 default；
+ *   根节点规范形状恒为 circle（允许 root((x)) 式前置名）；
+ * - 论文节点整行为 [文本](paper:<paperId>)（形状记 rect）；
  * - ::icon() 类指令行直接跳过。
  *
  * 解析失败抛 MindmapError，params.line 为 1-based 行号。
  */
-import type { MindmapDoc, MindmapNodeKind } from '../../types';
+import type { MindmapDoc, MindmapNodeKind, MindmapNodeShape } from '../../types';
+import { MINDMAP_TYPE, detectDiagramHeader } from './diagramType';
 import { sha1Hex } from './sha1';
 import {
   MindmapError,
@@ -35,42 +37,43 @@ import {
 const PAPER_LINK_RE = /^\[([^\]]*)\]\(paper:([^\s)]+)\)\s*$/;
 /** 注释中的稳定 ID 注解。 */
 const ID_ANNOTATION_RE = /(?:^|\s)id:(n_[0-9a-fA-F]{8})\b/;
-/** 支持的形状包裹（长前缀优先）。 */
-const SHAPE_WRAPPERS: ReadonlyArray<readonly [string, string]> = [
-  ['((', '))'],
-  ['{{', '}}'],
-  ['[', ']'],
-  ['(', ')'],
+/** 支持的形状包裹（长前缀优先）→ shape 枚举，与后端一致。 */
+const SHAPE_WRAPPERS: ReadonlyArray<readonly [string, string, MindmapNodeShape]> = [
+  ['((', '))', 'circle'],
+  ['{{', '}}', 'hexagon'],
+  ['[', ']', 'rect'],
+  ['(', ')', 'rounded'],
 ];
 /** root((mindmap)) 式前置节点名（解析后丢弃，仅兼容官方语法）。 */
 const PREFIX_NAME_RE = /^[A-Za-z][A-Za-z0-9_]*/;
-
-/** 占位布局（与后端线性初值一致；前端画布可再 tidy-tree）。 */
-export const LEVEL_X = 240;
-export const ROW_Y = 72;
 
 function lineError(key: string, line: number, params: Record<string, unknown> = {}): MindmapError {
   return new MindmapError(key, { line, ...params });
 }
 
-/** 剥离形状包裹与可选前置节点名，返回纯文本。 */
-function stripShape(content: string): string {
+/**
+ * 提取形状包裹与可选前置节点名，返回纯文本与形状。
+ * 无包裹（default）时文本原样返回（仅 trim）。
+ */
+function parseShape(content: string): { text: string; shape: MindmapNodeShape } {
   const text = content.trim();
-  for (const [left, right] of SHAPE_WRAPPERS) {
-    if (text.startsWith(left) && text.endsWith(right) && text.length >= left.length + right.length) {
-      return text.slice(left.length, text.length - right.length).trim();
-    }
-  }
-  const match = PREFIX_NAME_RE.exec(text);
-  if (match) {
-    const rest = text.slice(match[0].length).trimStart();
-    for (const [left, right] of SHAPE_WRAPPERS) {
-      if (rest.startsWith(left) && rest.endsWith(right) && rest.length >= left.length + right.length) {
-        return rest.slice(left.length, rest.length - right.length).trim();
+  const matchWrapper = (s: string): { text: string; shape: MindmapNodeShape } | null => {
+    for (const [left, right, shape] of SHAPE_WRAPPERS) {
+      if (s.startsWith(left) && s.endsWith(right) && s.length >= left.length + right.length) {
+        return { text: s.slice(left.length, s.length - right.length).trim(), shape };
       }
     }
+    return null;
+  };
+  const direct = matchWrapper(text);
+  if (direct) return direct;
+  const prefix = PREFIX_NAME_RE.exec(text);
+  if (prefix) {
+    const rest = text.slice(prefix[0].length).trimStart();
+    const named = matchWrapper(rest);
+    if (named) return named;
   }
-  return text;
+  return { text, shape: 'default' };
 }
 
 /** 索引路径 → 确定性 ID：sha1(序号以 / 连接) 前 8 位。与 Python _path_id 一致。 */
@@ -78,11 +81,11 @@ function pathId(path: number[]): string {
   return `n_${sha1Hex(path.map(String).join('/')).slice(0, 8)}`;
 }
 
-/** 解析一行正文，返回 (kind, text, paperId)。 */
+/** 解析一行正文，返回 (kind, text, shape, paperId)。 */
 function parseContent(
   content: string,
   lineNo: number
-): { kind: MindmapNodeKind; text: string; paperId: string | null } {
+): { kind: MindmapNodeKind; text: string; shape: MindmapNodeShape; paperId: string | null } {
   const m = PAPER_LINK_RE.exec(content);
   if (m) {
     const text = m[1].trim();
@@ -92,9 +95,11 @@ function parseContent(
     } catch {
       throw lineError('mindmap.invalid_paper_id', lineNo, { paper_id: paperId });
     }
-    return { kind: 'paper', text, paperId };
+    // 论文节点在 mermaid 中即 [标题](paper:...) 矩形链接
+    return { kind: 'paper', text, shape: 'rect', paperId };
   }
-  return { kind: 'topic', text: stripShape(content), paperId: null };
+  const { text, shape } = parseShape(content);
+  return { kind: 'topic', text, shape, paperId: null };
 }
 
 interface StackItem {
@@ -103,33 +108,55 @@ interface StackItem {
   siblingIndex: number;
 }
 
-/** 把 mermaid mindmap 文本解析为 MindmapDoc。 */
+/**
+ * 任意 mermaid 源码 → (doc, diagramType)，后端 doc_from_mermaid_source 的对等实现。
+ *
+ * - mindmap 头：解析为节点树文档（{nodes}，与既有导入语义一致）；
+ * - 其他 mermaid 图：nodes 为空、diagramType 为首声明 token、source 存原文。
+ *
+ * 语法合法性交给 mermaid 引擎；此处只做结构识别与 mindmap 子集解析。
+ */
+export function docFromMermaidSource(text: unknown): {
+  doc: MindmapDoc;
+  diagramType: string;
+} {
+  if (typeof text !== 'string' || text.trim() === '') {
+    throw new MindmapError('mindmap.mmd_empty');
+  }
+  const header = detectDiagramHeader(text);
+  if (!header) {
+    throw new MindmapError('mindmap.mmd_missing_header', { line: 1 });
+  }
+  if (header.kind === 'mindmap') {
+    return { doc: parseMermaid(text), diagramType: MINDMAP_TYPE };
+  }
+  return {
+    doc: { nodes: [], diagramType: header.type, source: text },
+    diagramType: header.type,
+  };
+}
+
 export function parseMermaid(text: unknown): MindmapDoc {
   if (typeof text !== 'string' || text.trim() === '') {
     throw new MindmapError('mindmap.mmd_empty');
   }
   const lines = text.split(/\r\n|\r|\n/);
 
-  // 1) 定位 mindmap 头（允许空行/注释先行）
-  let headerLine: number | null = null;
-  for (let idx = 1; idx <= lines.length; idx++) {
-    const stripped = lines[idx - 1].trim();
-    if (!stripped || stripped.startsWith('%%')) continue;
-    if (stripped.split('%%', 1)[0].trim() === 'mindmap') {
-      headerLine = idx;
-      break;
-    }
-    throw lineError('mindmap.mmd_missing_header', idx);
-  }
-  if (headerLine === null) {
+  // 1) 定位 mindmap 头（允许空行 / %% 注释 / YAML front-matter 先行）
+  const headerInfo = detectDiagramHeader(text);
+  if (!headerInfo) {
     throw new MindmapError('mindmap.mmd_missing_header', { line: 1 });
   }
+  if (headerInfo.kind !== 'mindmap') {
+    // 首个声明是其他 mermaid 图（flowchart/sequenceDiagram…）或拼错的图头
+    throw lineError('mindmap.mmd_missing_header', headerInfo.line);
+  }
+  const headerLine = headerInfo.line;
 
   // 栈项：(列号, 节点 ID, 该节点在兄弟中的序号)
   const stack: StackItem[] = [];
   const levelColumns = new Map<number, number>();
   const nodes: MindmapDoc['nodes'] = [];
-  let rowCursor = 0;
 
   for (let lineNo = headerLine + 1; lineNo <= lines.length; lineNo++) {
     const raw = lines[lineNo - 1];
@@ -208,12 +235,11 @@ export function parseMermaid(text: unknown): MindmapDoc {
     nodes.push(
       makeNode(nodeId, parentId, siblingIndex, parsed.text, {
         kind: parsed.kind,
+        // 根节点规范形状恒为 circle（与序列化器 ((x)) 对齐，保证往返幂等）
+        shape: parentId === null ? 'circle' : parsed.shape,
         paperId: parsed.paperId,
-        x: depth * LEVEL_X,
-        y: rowCursor * ROW_Y,
       })
     );
-    rowCursor += 1;
 
     // 3) 入栈：新层压入；同层替换栈顶
     const top = stack[stack.length - 1];

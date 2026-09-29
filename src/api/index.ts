@@ -1,4 +1,4 @@
-import { Paper, SearchResponse, SearchSourceStatus, RagQueryRequest, RagQueryResponse, RagSource, Note, ContextItem, ReactActionEvent, ReactObservationEvent, ToolPaper, WorkspaceInfo, WorkspaceFile, SettingsSnapshot, SettingsUpdate, SettingsTestResult, MindmapMeta, MindmapInfo, MindmapAction, MindmapActionsResult, MindmapDiffEvent, MindmapUndoResult } from '../types';
+import { Paper, SearchResponse, SearchSourceStatus, RagQueryRequest, RagQueryResponse, RagSource, Note, ContextItem, ReactActionEvent, ReactObservationEvent, ToolPaper, WorkspaceInfo, WorkspaceFile, SettingsSnapshot, SettingsUpdate, SettingsTestResult, MindmapMeta, MindmapInfo, MindmapAction, MindmapActionsResult, MindmapDiffEvent, MindmapCreatedEvent, MindmapUndoResult } from '../types';
 import i18n, { normalizeLanguage } from '../i18n';
 
 // 后端 API 网关地址（Flask，见 backend/app.py）
@@ -224,6 +224,8 @@ export interface RagStreamHandlers {
   onObservation?: (obs: ReactObservationEvent) => void;
   /** AI 编辑思维导图成功：增量差异（打开的画布实时落图；一问一事务可整组撤销） */
   onMindmapDiff?: (event: MindmapDiffEvent) => void;
+  /** AI 新建思维导图成功（刷新图库/选中新图；一次成图时这是唯一通知） */
+  onMindmapCreated?: (event: MindmapCreatedEvent) => void;
   /** 非阻断提示：如本次问答没有可引用材料、已降级为通用知识回答（不替代回答正文） */
   onNotice?: (message: string) => void;
   /** 出处分块（先于回答增量到达）：生成中即可拿到来源名/可定位目标，渲染行内引用卡片 */
@@ -293,6 +295,16 @@ function parseRagSseFrame(frame: string, handlers: RagStreamHandlers): void {
           actions: payload.actions as MindmapAction[],
           idMap: asRecord(payload.idMap) as Record<string, string>,
           transactionId: str(payload.transactionId),
+        });
+      }
+      break;
+    case 'mindmap_created':
+      if (typeof payload.mapId === 'string' && typeof payload.version === 'number') {
+        handlers.onMindmapCreated?.({
+          mapId: payload.mapId,
+          version: payload.version,
+          title: str(payload.title),
+          diagramType: str(payload.diagramType) || 'mindmap',
         });
       }
       break;
@@ -787,7 +799,7 @@ export const submitMindmapActions = async (
   }
 };
 
-/** 导出导图为 mermaid mindmap 文本（节点带稳定 ID 注解） */
+/** 导出导图为 mermaid 文本（mindmap 为序列化树；其他图为原始源码） */
 export const exportMindmapMermaid = async (
   mapId: string,
   workspaceId?: string | null
@@ -796,6 +808,44 @@ export const exportMindmapMermaid = async (
     `/mindmaps/${encodeURIComponent(mapId)}/mermaid${mindmapWsQuery(workspaceId)}`
   );
   return data.mermaid;
+};
+
+/**
+ * 以整段 mermaid 源码替换导图内容（支持 mindmap↔其他图互转）。
+ * - 成功：返回替换后的完整导图（类型可能已变化）；
+ * - 版本过期：抛 MindmapConflictError（携带服务端最新文档），同 submitMindmapActions；
+ * - 语法/结构非法：抛 ApiRequestError(400)，文案由后端本地化。
+ */
+export const saveMindmapSource = async (
+  mapId: string,
+  source: string,
+  baseVersion: number,
+  workspaceId?: string | null
+): Promise<MindmapInfo> => {
+  try {
+    const data = await request<{ mindmap: MindmapInfo }>(
+      `/mindmaps/${encodeURIComponent(mapId)}/source`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          source,
+          baseVersion,
+          workspace_id: workspaceId ?? undefined,
+        }),
+      }
+    );
+    return data.mindmap;
+  } catch (err) {
+    if (err instanceof ApiRequestError && err.status === 409) {
+      const body = err.body as
+        | { currentVersion?: number; mindmap?: MindmapInfo }
+        | null;
+      if (body && typeof body.currentVersion === 'number' && body.mindmap) {
+        throw new MindmapConflictError(body.currentVersion, body.mindmap, err.message);
+      }
+    }
+    throw err;
+  }
 };
 
 /** 撤销一次 AI 编辑事务（字段级逆向）；transactionId 缺省=最近一次未撤销的 AI 事务 */

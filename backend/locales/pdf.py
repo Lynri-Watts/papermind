@@ -10,12 +10,18 @@ MESSAGES: dict[str, dict[str, str]] = {
     "zh": {
         # 下载层（providers/download.py）：内容/状态码/网络
         "pdf.not_a_pdf": "下载到的内容不是有效 PDF（宿主可能返回了网页错误页）",
+        "pdf.bot_wall": "PDF 地址被网站的人机验证/反爬保护拦截（无法通过浏览器式校验，并非论文不存在）",
         "pdf.http_401": "PDF 需要登录或访问凭证",
         "pdf.http_403": "PDF 访问受限（需要登录或订阅权限）",
         "pdf.http_404": "PDF 地址不存在或论文已被移除",
         "pdf.http_410": "PDF 地址已失效",
+        "pdf.http_429": "下载请求过于频繁被限流（429），退避重试后仍未成功",
+        "pdf.http_503": "文件服务器暂时不可用（503），退避重试后仍未成功",
         "pdf.http_rejected": "下载被服务器拒绝（HTTP {code}）",
         "pdf.network_retry_exhausted": "网络连接失败，多次重试后仍无法下载",
+        # 多开放获取镜像依次尝试后仍全部失败
+        "pdf.all_mirrors_failed": "已尝试 {n} 个开放获取地址（出版社/仓储/arXiv 等）均未成功；最后失败原因：{last}",
+        "pdf.no_candidate_url": "该论文没有登记任何可下载的全文地址",
         # PdfDownloadError 消息里拼在 reason 后的 URL 后缀
         "pdf.url_suffix": "（{url}）",
         # 全文服务（services/fulltext.py）：标识解析/本地/缓存/远程
@@ -37,12 +43,18 @@ MESSAGES: dict[str, dict[str, str]] = {
     "en": {
         # Download layer (providers/download.py): content / status code / network
         "pdf.not_a_pdf": "Downloaded content is not a valid PDF (the host may have returned a web error page)",
+        "pdf.bot_wall": "The PDF address is protected by a human-verification/anti-bot wall (browser-style check cannot be passed; this does not mean the paper is missing)",
         "pdf.http_401": "PDF requires sign-in or access credentials",
         "pdf.http_403": "PDF access restricted (sign-in or subscription required)",
         "pdf.http_404": "PDF address not found or the paper has been removed",
         "pdf.http_410": "PDF address is no longer available",
+        "pdf.http_429": "Downloads are rate limited (429); still failing after backoff retries",
+        "pdf.http_503": "The file server is temporarily unavailable (503); still failing after backoff retries",
         "pdf.http_rejected": "Download rejected by the server (HTTP {code})",
         "pdf.network_retry_exhausted": "Network connection failed; still unable to download after multiple retries",
+        # All open-access mirrors tried without success
+        "pdf.all_mirrors_failed": "Tried {n} open-access locations (publisher/repository/arXiv, etc.) without success; last failure reason: {last}",
+        "pdf.no_candidate_url": "No downloadable full-text URL is registered for this paper",
         # URL suffix appended after reason in the PdfDownloadError message
         "pdf.url_suffix": " ({url})",
         # Full-text service (services/fulltext.py): identifier / local / cache / remote

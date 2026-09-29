@@ -10,7 +10,7 @@ import { queryRAGStream, cancelRagRun, RagStreamHandlers } from '../api';
 import { ChatMessage, ChatMindmapEdit, ContextItem, DataBlock, ReactStep, ToolPaper } from '../types';
 import { usePaperMindStore } from '../store';
 import { addPaperContextItem, isPaperInContext } from '../lib/context';
-import { emitMindmapCommitted } from '../lib/mindmap/bridge';
+import { emitMindmapAutoLayout, emitMindmapCommitted } from '../lib/mindmap/bridge';
 import AssistantMessage from '../components/AssistantMessage';
 import AddContextModal from '../components/AddContextModal';
 import ContextItemCard from '../components/ContextItemCard';
@@ -57,6 +57,8 @@ const QAPanel: React.FC = () => {
   // ---- 当前焦点（板块 + 论文/文档） ----
   const currentView = usePaperMindStore((s) => s.currentView);
   const setCurrentView = usePaperMindStore((s) => s.setCurrentView);
+  // 问答/历史与工作区绑定：无活跃工作区时 QA 禁用（对话必须有归属）
+  const activeWorkspaceId = usePaperMindStore((s) => s.activeWorkspaceId);
   const readerTabs = usePaperMindStore((s) => s.readerTabs);
   const activeTabId = usePaperMindStore((s) => s.activeTabId);
   const openReaderTab = usePaperMindStore((s) => s.openReaderTab);
@@ -295,6 +297,23 @@ const QAPanel: React.FC = () => {
           });
           syncMindmapEdits();
         },
+        onMindmapCreated: (ev) => {
+          // AI 新建导图（from_mermaid 一次成图时之后不会再有 diff）：
+          // 刷新图库列表并选中新图（与界面手动新建后的状态一致），
+          // 同时在回答上挂记录，让「打开导图」入口出现（无编辑事务→不可撤销）
+          const wsId = usePaperMindStore.getState().activeWorkspaceId ?? null;
+          void usePaperMindStore.getState().refreshMindmaps(wsId)
+            .then(() => usePaperMindStore.getState().setActiveMindmapId(wsId, ev.mapId));
+          const existing = mindmapEditMap.get(ev.mapId);
+          mindmapEditMap.set(ev.mapId, {
+            mapId: ev.mapId,
+            // 若后续 diff 已先到（正常时序相反），保留其事务 id
+            transactionId: existing?.transactionId ?? null,
+            version: ev.version,
+            workspaceId: wsId,
+          });
+          syncMindmapEdits();
+        },
         onNotice: (message) => {
           // 非阻断提示（如无材料降级通用知识回答）：挂消息上持久化展示，不替换正文
           if (message) updateChatMessage(assistantId, { notice: message });
@@ -308,6 +327,9 @@ const QAPanel: React.FC = () => {
             sourceDetails: result.sourceDetails,
             streaming: false,
           });
+          // 一轮结束：打开中的出生态画布用 mermaid 引擎补一次官方排布（信号不缓冲，
+          // 未挂载的导图下次打开时由挂载全零检测接管）
+          for (const mapId of mindmapEditMap.keys()) emitMindmapAutoLayout(mapId);
         },
         onError: (message) => {
           commit();
@@ -405,6 +427,8 @@ const QAPanel: React.FC = () => {
   const handleSubmitWithText = async (query: string) => {
     // 同步防重入：回车键连发、回车+点发送、阅读器选区提问的 setTimeout 都汇聚于此
     if (!query.trim() || submittingRef.current) return;
+    // 对话历史与工作区绑定：没有活跃工作区时禁止提问，消息不允许无归属
+    if (!activeWorkspaceId) return;
     submittingRef.current = true;
     // 不等网络：先给输入框即时反馈（发送按钮随输入为空变灰），消除重复提交窗口
     setInput('');
@@ -767,8 +791,9 @@ const QAPanel: React.FC = () => {
           {activeTab === 'qa' && (
             <>
               <button
-                onClick={() => setShowHistory((v) => !v)}
-                className={`relative flex items-center gap-1 px-2 py-1.5 rounded-lg transition-colors text-xs ${
+                onClick={() => activeWorkspaceId && setShowHistory((v) => !v)}
+                disabled={!activeWorkspaceId}
+                className={`relative flex items-center gap-1 px-2 py-1.5 rounded-lg transition-colors text-xs disabled:opacity-35 ${
                   showHistory
                     ? 'text-text bg-background border border-border'
                     : 'text-textSecondary hover:text-text border border-transparent'
@@ -834,22 +859,26 @@ const QAPanel: React.FC = () => {
       {/* ---------- Q&A ---------- */}
       {activeTab === 'qa' && (
         <>
-          <div className="px-3 py-2 bg-background/50 border-b border-border">
-            <p className="text-[11px] text-textSecondary mb-1.5">{t('quick.heading')}</p>
-            <div className="flex flex-wrap gap-1.5">
-              {quickQuestions.map((question, index) => (
-                <button
-                  key={index}
-                  onClick={() => setInput(question)}
-                  className="px-2 py-0.5 bg-surface border border-border rounded-md text-[11px] text-textSecondary hover:text-text hover:border-primary transition-colors"
-                >
-                  {question}
-                </button>
-              ))}
+          {activeWorkspaceId && (
+            <div className="px-3 py-2 bg-background/50 border-b border-border">
+              <p className="text-[11px] text-textSecondary mb-1.5">{t('quick.heading')}</p>
+              <div className="flex flex-wrap gap-1.5">
+                {quickQuestions.map((question, index) => (
+                  <button
+                    key={index}
+                    onClick={() => setInput(question)}
+                    className="px-2 py-0.5 bg-surface border border-border rounded-md text-[11px] text-textSecondary hover:text-text hover:border-primary transition-colors"
+                  >
+                    {question}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
 
           <div className="flex-1 flex flex-col min-h-0 relative">
+            {activeWorkspaceId ? (
+              <>
             {/* 当前会话标题条（首问建档后显示，AI 标题生成中带指示） */}
             {activeConversation && (
               <div className="flex items-center gap-1.5 px-3 py-1.5 bg-surface border-b border-border min-w-0">
@@ -995,8 +1024,28 @@ const QAPanel: React.FC = () => {
                 </div>
               </div>
             )}
+              </>
+            ) : (
+              /* 无活跃工作区：对话必须归属工作区，展示引导而非空聊天 */
+              <div className="flex-1 flex flex-col items-center justify-center px-6 text-center">
+                <div className="w-11 h-11 mb-3.5 rounded-2xl bg-primary/10 border border-primary/25 flex items-center justify-center">
+                  <FileText className="w-5 h-5 text-primary" />
+                </div>
+                <p className="text-sm font-medium text-text mb-1.5">{t('workspaceRequired.title')}</p>
+                <p className="text-[11px] text-textSecondary leading-relaxed mb-4 max-w-[240px]">
+                  {t('workspaceRequired.desc')}
+                </p>
+                <button
+                  onClick={() => setCurrentView('home')}
+                  className="px-3.5 py-1.5 rounded-lg bg-gradient-to-br from-primary to-primary/80 text-white text-xs hover:shadow-lg hover:shadow-primary/30 transition-all"
+                >
+                  {t('workspaceRequired.choose')}
+                </button>
+              </div>
+            )}
           </div>
 
+          {activeWorkspaceId ? (
           <div className="px-3 py-2.5 border-t border-border bg-surface">
             {/* 上下文控制条 */}
             <div className="flex items-center gap-2.5 mb-2">
@@ -1121,6 +1170,17 @@ const QAPanel: React.FC = () => {
               )}
             </div>
           </div>
+          ) : (
+            /* 无工作区时输入区替换为操作条：引导前往主页选择/创建工作区 */
+            <div className="px-3 py-3 border-t border-border bg-surface">
+              <button
+                onClick={() => setCurrentView('home')}
+                className="w-full px-3 py-2 rounded-lg bg-surface border border-border text-textSecondary hover:text-text hover:border-primary/50 text-xs transition-colors"
+              >
+                {t('workspaceRequired.choose')}
+              </button>
+            </div>
+          )}
         </>
       )}
 

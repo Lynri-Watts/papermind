@@ -14,7 +14,11 @@ import storage.workspace as ws
 from config import PDF_DIR
 from i18n import tr
 from providers import get_provider
-from providers.download import PdfDownloadError, download_pdf, parse_pdf_to_text
+from providers.download import (
+    PdfDownloadError,
+    download_pdf_first_available,
+    parse_pdf_to_text,
+)
 
 
 def split_paper_id(paper_id: str) -> tuple[str, str] | None:
@@ -218,10 +222,13 @@ def _download_and_parse(paper_id: str, cache_path: Path,
         paper = get_provider(source).get_paper(external_id)
     except Exception as exc:
         return "", tr("pdf.metadata_fetch_failed", exc=exc)
-    if not paper.pdf_url:
+    # 同一论文可能有多个开放获取镜像（arXiv / 出版社 / PMC）：首选被反爬或
+    # 限流时依次尝试后续地址，而不是单 URL 失败即判定论文不可下载
+    candidates = paper.pdf_candidates or ([paper.pdf_url] if paper.pdf_url else [])
+    if not candidates:
         return "", tr("pdf.no_pdf_available", source=source)
     try:
-        content = download_pdf(paper.pdf_url)
+        content, _used_url = download_pdf_first_available(candidates)
     except PdfDownloadError as exc:
         return "", str(exc)
     except Exception as exc:

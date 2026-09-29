@@ -24,7 +24,11 @@ import settings_store
 from config import HTTP_TIMEOUT
 from i18n import tr
 from providers.base import Paper, PaperProvider, SearchQuery, make_paper_id
-from providers.download import PdfDownloadError, download_pdf, parse_pdf_to_text
+from providers.download import (
+    PdfDownloadError,
+    download_pdf_first_available,
+    parse_pdf_to_text,
+)
 
 BASE_URL = "https://api.core.ac.uk/v3"
 
@@ -101,6 +105,7 @@ class CoreProvider(PaperProvider):
             a["name"] for a in (work.get("authors") or [])
             if isinstance(a, dict) and a.get("name")
         ]
+        download_url = work.get("downloadUrl")
         return Paper(
             id=make_paper_id(cls.source, work_id),
             title=(work.get("title") or "").strip(),
@@ -110,7 +115,8 @@ class CoreProvider(PaperProvider):
             source=cls.source,
             external_id=work_id,
             url=_landing_url(work, work_id),
-            pdf_url=work.get("downloadUrl"),
+            pdf_url=download_url,
+            pdf_candidates=[download_url] if download_url else [],
             citation_count=work.get("citationCount"),
             publication_venue=_venue(work),
             doi=work.get("doi"),
@@ -167,12 +173,13 @@ class CoreProvider(PaperProvider):
 
     def get_fulltext(self, paper: Paper) -> Optional[str]:
         """下载 CORE 托管的开放获取 PDF 并解析纯文本。"""
-        if not paper.pdf_url:
+        urls = paper.pdf_candidates or ([paper.pdf_url] if paper.pdf_url else [])
+        if not urls:
             return None
         try:
-            content = download_pdf(paper.pdf_url, session=self.session)
+            content, _used = download_pdf_first_available(
+                urls, session=self.session,
+            )
         except PdfDownloadError:
-            return None
-        if content is None:
             return None
         return parse_pdf_to_text(content)

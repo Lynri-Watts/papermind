@@ -18,7 +18,11 @@ import settings_store
 from config import HTTP_TIMEOUT
 from i18n import tr
 from providers.base import Paper, PaperProvider, SearchQuery, make_paper_id, year_range
-from providers.download import PdfDownloadError, download_pdf, parse_pdf_to_text
+from providers.download import (
+    PdfDownloadError,
+    download_pdf_first_available,
+    parse_pdf_to_text,
+)
 
 BASE_URL = "https://api.semanticscholar.org/graph/v1"
 
@@ -71,10 +75,16 @@ class SemanticScholarProvider(PaperProvider):
         authors = [a["name"] for a in (entry.get("authors") or [])]
         arxiv_id = cls._extract_arxiv_id(entry)
         oa = entry.get("openAccessPdf") or {}
-        # pdf 优先使用 arXiv（100% OA），否则用 openAccessPdf
+        # pdf 优先使用 arXiv（100% OA），否则用 openAccessPdf；两者不同时都
+        # 收入候选链，首选镜像失败可换另一个
+        oa_url = oa.get("url")
         pdf_url = (
-            f"https://arxiv.org/pdf/{arxiv_id}" if arxiv_id else oa.get("url")
+            f"https://arxiv.org/pdf/{arxiv_id}" if arxiv_id else oa_url
         )
+        candidates: list[str] = []
+        for u in (pdf_url, oa_url):
+            if u and u not in candidates:
+                candidates.append(u)
         return Paper(
             id=make_paper_id(cls.source, paper_id),
             title=entry.get("title") or "",
@@ -84,7 +94,8 @@ class SemanticScholarProvider(PaperProvider):
             source=cls.source,
             external_id=paper_id,
             url=entry.get("url") or "",
-            pdf_url=pdf_url,
+            pdf_url=candidates[0] if candidates else None,
+            pdf_candidates=candidates,
             citation_count=entry.get("citationCount"),
             reference_count=entry.get("referenceCount"),
             publication_venue=entry.get("venue"),
@@ -145,13 +156,15 @@ class SemanticScholarProvider(PaperProvider):
 
     def get_fulltext(self, paper: Paper) -> Optional[str]:
         """SS 本身不提供全文；若非空则尝试从 arXiv / openAccessPdf 下载。
-        使用统一下载工具（带 UA + 连接级重试），获取不到返回 None。"""
-        if paper.pdf_url:
-            try:
-                content = download_pdf(paper.pdf_url, session=self.session)
-            except PdfDownloadError:
-                # 无 PDF / 403 / 网络失败：此处保持 None 语义，由上层 fulltext 服务给出原因
-                return None
-            if content is not None:
-                return parse_pdf_to_text(content)
-        return None
+        使用统一下载工具（带 UA + 连接级重试 + 多镜像候选），获取不到返回 None。"""
+        urls = paper.pdf_candidates or ([paper.pdf_url] if paper.pdf_url else [])
+        if not urls:
+            return None
+        try:
+            content, _used = download_pdf_first_available(
+                urls, session=self.session,
+            )
+        except PdfDownloadError:
+            # 无 PDF / 403 / 网络失败：此处保持 None 语义，由上层 fulltext 服务给出原因
+            return None
+        return parse_pdf_to_text(content)

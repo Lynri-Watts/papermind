@@ -29,6 +29,11 @@ export default {
   title: {
     generating: 'Generating title…',
   },
+  workspaceRequired: {
+    title: 'Select a workspace first',
+    desc: 'Conversations and their history belong to a workspace. Open a workspace to start asking questions; chat history is saved with that workspace.',
+    choose: 'Select or create a workspace',
+  },
   focus: {
     reading: 'Reading focus: {{title}}',
     readingEmpty: 'Reading focus: no paper open',
