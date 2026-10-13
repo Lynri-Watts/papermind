@@ -2,10 +2,10 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Settings as SettingsIcon, Database, Server, Loader2, CheckCircle2, XCircle, ArrowUp, ArrowDown,
-  ExternalLink, Eye, EyeOff, Save, AlertCircle, KeyRound, Mail, Plug, Languages,
+  ExternalLink, Eye, EyeOff, Save, AlertCircle, KeyRound, Mail, Plug, Languages, FileSearch,
 } from 'lucide-react';
 import { getSettings, updateSettings, testSettingConnection } from '../api';
-import { SettingsSnapshot, SettingsSource, SettingsTestResult } from '../types';
+import { type ReadingScope, SettingsSnapshot, SettingsSource, SettingsTestResult } from '../types';
 import { usePaperMindStore } from '../store';
 import { SUPPORTED_LANGUAGES, LANGUAGE_LABELS, normalizeLanguage, changeLanguage } from '../i18n';
 
@@ -17,6 +17,9 @@ interface TestState {
 
 /** 该数据源是否可配置凭据（credential_label 为 null 表示无需配置，如 arXiv） */
 const hasCredential = (s: SettingsSource): boolean => s.credential_label !== null;
+
+/** 读取粒度单选项的固定顺序（与 settings_store.READING_SCOPES 对应） */
+const READING_SCOPE_OPTIONS: ReadingScope[] = ['auto', 'full', 'passages'];
 
 /**
  * 设置页：管理论文数据源与大模型服务。
@@ -50,6 +53,8 @@ const SettingsPage: React.FC = () => {
   const [cleared, setCleared] = useState<Set<string>>(new Set());
   /** 启用中的数据源 id，按聚合优先级排列（顺序即优先级） */
   const [order, setOrder] = useState<string[]>([]);
+  /** AI 问答读取粒度草稿（auto/full/passages） */
+  const [readingScopeDraft, setReadingScopeDraft] = useState<ReadingScope>('auto');
   /** 密钥明文的显隐（按"数据源 id 或 llm"键控） */
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
   /** 连通性测试状态（键为 'llm' 或数据源 id） */
@@ -67,6 +72,7 @@ const SettingsPage: React.FC = () => {
     setCredDraft(creds);
     setCleared(new Set());
     setOrder(snap.sources.filter((s) => s.enabled).map((s) => s.id));
+    setReadingScopeDraft(snap.reading_scope);
   }, []);
 
   useEffect(() => {
@@ -120,7 +126,12 @@ const SettingsPage: React.FC = () => {
        || llmDraft.api_key.trim() !== '')
     : false;
 
-  const dirty = orderDirty || llmDirty || (snapshot?.sources ?? []).some(sourceDirty);
+  const readingDirty = snapshot ? readingScopeDraft !== snapshot.reading_scope : false;
+
+  const dirty = orderDirty
+    || llmDirty
+    || readingDirty
+    || (snapshot?.sources ?? []).some(sourceDirty);
 
   const toggleReveal = (key: string) => {
     setRevealed((prev) => {
@@ -184,6 +195,7 @@ const SettingsPage: React.FC = () => {
     }
     if (Object.keys(credentials).length > 0) payload.credentials = credentials;
     if (orderDirty) payload.source_order = order;
+    if (readingScopeDraft !== snapshot.reading_scope) payload.reading_scope = readingScopeDraft;
 
     if (Object.keys(payload).length === 0) {
       setSaveMessage({ kind: 'error', text: t('error.noChanges') });
@@ -496,6 +508,41 @@ const SettingsPage: React.FC = () => {
               </button>
               <TestResult state={tests.llm} />
             </div>
+          </div>
+        </section>
+
+        {/* AI 读取粒度：整篇 vs 关键词局部检索的偏好（写入后端，热生效） */}
+        <section className="mb-10">
+          <div className="flex items-center gap-2 mb-3">
+            <FileSearch className="w-4 h-4 text-secondary" />
+            <h2 className="font-semibold text-text">{t('reading.title')}</h2>
+          </div>
+          <p className="text-xs text-textSecondary mb-3 leading-relaxed">{t('reading.description')}</p>
+          <div className="grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label={t('reading.title')}>
+            {READING_SCOPE_OPTIONS.map((scope) => {
+              const active = readingScopeDraft === scope;
+              return (
+                <button
+                  key={scope}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  onClick={() => setReadingScopeDraft(scope)}
+                  className={`text-left px-3 py-2.5 rounded-xl border transition-colors ${
+                    active
+                      ? 'bg-primary/10 border-primary/40'
+                      : 'bg-surface border-border hover:border-primary/40'
+                  }`}
+                >
+                  <span className={`block text-xs font-medium ${active ? 'text-primary' : 'text-text'}`}>
+                    {t(`reading.${scope}.label`)}
+                  </span>
+                  <span className="block mt-1 text-[11px] leading-relaxed text-textSecondary">
+                    {t(`reading.${scope}.hint`)}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </section>
 

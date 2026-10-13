@@ -9,14 +9,14 @@
  *   颜色本身由画布经 sectionOfNodes 结构推导，不依赖一次离屏渲染；
  * - 刚完成 mermaid 同源布局时画布传入 measured（实测宽高/填充/文字色），
  *   节点严格按官方尺寸渲染；用户拖拽/增补后 measured 失效，节点回退自适应尺寸；
- * - paper 节点是强化卡片：同 section 底色 + accent 描边 + BookOpen 徽标，点击打开阅读器。
+ * - paper 节点是强化卡片：同 section 底色 + accent 描边，单击弹出论文详情。
  *
  * 右侧折叠按钮控制子树显隐；双击进入行内编辑。交互回调通过 Context 下发，
  * 避免回调进 node data 导致节点对象频繁换引用。
  */
 import React, { useContext, useEffect, useRef, useState } from 'react';
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
-import { BookOpen, ChevronDown, ChevronRight } from 'lucide-react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { MindmapNode as MindmapNodeData, MindmapNodeShape } from '../../types';
 import { ROOT_TEXT, SECTION_TEXT, fillForSection } from '../../lib/mindmap';
@@ -151,7 +151,13 @@ const MindmapNodeView: React.FC<NodeProps<MindmapFlowNode>> = ({ id, data }) => 
     <div
       data-mm-node-id={id}
       style={boxStyle}
-      className={`flex items-center justify-center gap-1.5 ${paddingClass} transition-[filter] hover:brightness-110`}
+      title={isPaper ? t('node.openPaper') : undefined}
+      className={`flex items-center justify-center gap-1.5 ${paddingClass} transition-[filter] hover:brightness-110 ${
+        isPaper ? 'cursor-pointer' : ''
+      }`}
+      onClick={isPaper ? () => {
+        if (node.paperId) handlers.onOpenPaper(node.paperId);
+      } : undefined}
       onDoubleClick={(e) => {
         if (!readOnly) {
           e.stopPropagation();
@@ -161,22 +167,6 @@ const MindmapNodeView: React.FC<NodeProps<MindmapFlowNode>> = ({ id, data }) => 
     >
       {!isRoot && (
         <Handle type="target" id="in" position={Position.Left} style={HANDLE_STYLE} />
-      )}
-
-      {isPaper && (
-        <button
-          type="button"
-          className="flex shrink-0 items-center disabled:cursor-default"
-          style={{ color: ACCENT_COLOR }}
-          disabled={readOnly}
-          title={t('node.openPaper')}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (node.paperId) handlers.onOpenPaper(node.paperId);
-          }}
-        >
-          <BookOpen size={16} />
-        </button>
       )}
 
       {editing ? (

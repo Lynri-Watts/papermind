@@ -9,7 +9,10 @@ import Explore from './pages/Explore';
 const Mindmaps = lazy(() => import('./pages/Mindmaps'));
 import SettingsPage from './pages/Settings';
 import QAPanel from './components/QAPanel';
-import { usePaperMindStore, initPersistence, WRITING_ENABLED } from './store';
+import BackendStatusBanner from './components/BackendStatusBanner';
+import { usePaperMindStore, initPersistence } from './store';
+import { API_BASE } from './api';
+import { startBackendWatch } from './lib/backendStatus';
 
 type ViewType = 'home' | 'workspace' | 'research' | 'explore' | 'mindmaps' | 'settings';
 
@@ -22,6 +25,8 @@ export default function App() {
 
   // 启动时恢复上次工作状态（后端快照）；hydrate 内部完成工作区引导
   useEffect(() => {
+    // 后端心跳：后端未启动时顶部横幅提示，恢复后自动消失
+    startBackendWatch(`${API_BASE}/health`);
     initPersistence();
   }, []);
 
@@ -38,9 +43,7 @@ export default function App() {
       id: 'workspace',
       icon: <LayoutGrid className="w-5 h-5" />,
       label: t('nav.creation'),
-      // 创作模块暂时下线：入口保留但置灰，提示维护中
-      description: WRITING_ENABLED ? t('nav.creationDesc') : t('nav.maintenance'),
-      disabled: !WRITING_ENABLED,
+      description: t('nav.creationDesc'),
     },
     {
       id: 'research',
@@ -173,7 +176,10 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="flex-1 overflow-hidden">{renderView()}</main>
+      <div className="flex-1 flex flex-col min-w-0">
+        <BackendStatusBanner />
+        <main className="flex-1 overflow-hidden min-h-0">{renderView()}</main>
+      </div>
       {/* 全局 AI 助手：贯穿阅读 / 搜索 / 写作三大板块 */}
       <QAPanel />
     </div>

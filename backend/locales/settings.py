@@ -28,6 +28,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "settings.credentials_not_object": "credentials 必须是对象",
         "settings.credentials_unknown": "credentials 含未知数据源: {sources}",
         "settings.nothing_to_save": "没有需要保存的设置项",
+        "settings.reading_scope_unknown": "未知的读取粒度: {value}（应为 auto/full/passages）",
+        "settings.reading_scope_not_string": "reading_scope 必须是字符串",
         # 数据源目录：凭据标签与说明（label 为专有名词，不在此表）
         "settings.source.semantic_scholar.credential_label": "API Key",
         "settings.source.semantic_scholar.description": "引用数据最全，检索与引用追踪主源。留空则用匿名共享池，限流很严（易 429）。",
@@ -59,6 +61,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "settings.credentials_not_object": "credentials must be an object",
         "settings.credentials_unknown": "credentials contains unknown data sources: {sources}",
         "settings.nothing_to_save": "No settings to save",
+        "settings.reading_scope_unknown": "Unknown reading scope: {value} (expected auto/full/passages)",
+        "settings.reading_scope_not_string": "reading_scope must be a string",
         # Source catalog: credential labels and descriptions (labels are proper nouns, not here)
         "settings.source.semantic_scholar.credential_label": "API Key",
         "settings.source.semantic_scholar.description": "Most complete citation data; the primary source for search and citation tracking. If left blank, the anonymous shared pool is used with strict rate limits (prone to 429).",

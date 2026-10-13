@@ -1,8 +1,27 @@
-import { Paper, SearchResponse, SearchSourceStatus, RagQueryRequest, RagQueryResponse, RagSource, Note, ContextItem, ReactActionEvent, ReactObservationEvent, ToolPaper, WorkspaceInfo, WorkspaceFile, SettingsSnapshot, SettingsUpdate, SettingsTestResult, MindmapMeta, MindmapInfo, MindmapAction, MindmapActionsResult, MindmapDiffEvent, MindmapCreatedEvent, MindmapUndoResult } from '../types';
+import { Paper, SearchResponse, SearchSourceStatus, RagQueryRequest, RagQueryResponse, RagSource, Note, ContextItem, ReactActionEvent, ReactObservationEvent, ToolPaper, WorkspaceInfo, WorkspaceFile, SettingsSnapshot, SettingsUpdate, SettingsTestResult, MindmapMeta, MindmapInfo, MindmapAction, MindmapActionsResult, MindmapDiffEvent, MindmapCreatedEvent, MindmapUndoResult, WritingDiffEvent, WritingCreatedEvent, WritingCompileEvent, WritingRevision, WritingRejectResult, WritingAcceptTxnResult, WritingRollbackResult } from '../types';
 import i18n, { normalizeLanguage } from '../i18n';
+import { notifyRequestFailed, notifyRequestSucceeded } from '../lib/backendStatus';
 
 // 后端 API 网关地址（Flask，见 backend/app.py）
 export const API_BASE = 'http://127.0.0.1:5001/api';
+
+/**
+ * 全局 fetch 包装：把网络层结果同步给后端在线状态模块。
+ * 只有连不上/中止/CORS 等 fetch reject 才算后端离线；HTTP 4xx/5xx 说明
+ * 后端进程存活，仍标记在线。
+ */
+function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  return fetch(input, init).then(
+    (resp) => {
+      notifyRequestSucceeded();
+      return resp;
+    },
+    (err) => {
+      notifyRequestFailed();
+      throw err;
+    },
+  );
+}
 
 /** 当前界面语言的 BCP-47 短码（zh/en），用于 Accept-Language 请求头。
  * 后端据此决定错误提示、设置保存/测试等文案的语言（见 backend/i18n.py）。 */
@@ -38,7 +57,7 @@ export class MindmapConflictError extends Error {
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const resp = await fetch(`${API_BASE}${path}`, {
+  const resp = await apiFetch(`${API_BASE}${path}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
@@ -199,7 +218,7 @@ export interface PdfReadyResult {
  * 而不是笼统报"无法获取 PDF"。
  */
 export const ensurePdfReady = async (paperId: string): Promise<PdfReadyResult> => {
-  const resp = await fetch(getPdfUrl(paperId), {
+  const resp = await apiFetch(getPdfUrl(paperId), {
     headers: { Range: 'bytes=0-0', 'Accept-Language': currentLanguage() },
   });
   if (resp.ok || resp.status === 206) return { ok: true };
@@ -226,6 +245,12 @@ export interface RagStreamHandlers {
   onMindmapDiff?: (event: MindmapDiffEvent) => void;
   /** AI 新建思维导图成功（刷新图库/选中新图；一次成图时这是唯一通知） */
   onMindmapCreated?: (event: MindmapCreatedEvent) => void;
+  /** AI 写作工具落盘了文件修改（编辑器内联 diff 高亮待审） */
+  onDocumentDiff?: (event: WritingDiffEvent) => void;
+  /** AI 新建了写作文件（刷新文件树） */
+  onDocumentCreated?: (event: WritingCreatedEvent) => void;
+  /** AI 调 compile_document 的编译结果（编译面板/PDF 刷新） */
+  onCompileResult?: (event: WritingCompileEvent) => void;
   /** 非阻断提示：如本次问答没有可引用材料、已降级为通用知识回答（不替代回答正文） */
   onNotice?: (message: string) => void;
   /** 出处分块（先于回答增量到达）：生成中即可拿到来源名/可定位目标，渲染行内引用卡片 */
@@ -308,6 +333,61 @@ function parseRagSseFrame(frame: string, handlers: RagStreamHandlers): void {
         });
       }
       break;
+    case 'document_diff': {
+      const hunks = Array.isArray(payload.hunks) ? payload.hunks : [];
+      if (typeof payload.path === 'string'
+        && typeof payload.transactionId === 'string'
+        && hunks.length > 0) {
+        handlers.onDocumentDiff?.({
+          kind: 'diff',
+          path: payload.path,
+          transactionId: payload.transactionId,
+          newHash: str(payload.newHash),
+          hunks: hunks.map((h) => {
+            const r = asRecord(h);
+            return {
+              id: Number(r.id),
+              kind: (['edit', 'input', 'append', 'create'].includes(str(r.kind))
+                ? str(r.kind) as WritingDiffEvent['hunks'][number]['kind'] : 'edit'),
+              oldStart: Number(r.oldStart) || 0,
+              oldLines: Number(r.oldLines) || 0,
+              newStart: Number(r.newStart) || 0,
+              newLines: Number(r.newLines) || 0,
+              oldText: str(r.oldText),
+              newText: str(r.newText),
+            };
+          }),
+        });
+      }
+      break;
+    }
+    case 'document_created':
+      if (typeof payload.path === 'string' && typeof payload.transactionId === 'string') {
+        handlers.onDocumentCreated?.({
+          kind: 'created',
+          path: payload.path,
+          transactionId: payload.transactionId,
+        });
+      }
+      break;
+    case 'compile_result':
+      handlers.onCompileResult?.({
+        kind: 'compile',
+        ok: payload.ok === true,
+        message: str(payload.message),
+        errors: (Array.isArray(payload.errors) ? payload.errors : [])
+          .map((e) => {
+            const r = asRecord(e);
+            const line = typeof r.line === 'number' ? r.line : null;
+            return {
+              file: str(r.file),
+              line: line !== null && line > 0 ? line : null,
+              kind: 'error' as const,
+              text: str(r.text),
+            };
+          }),
+      });
+      break;
     case 'delta':
       if (typeof payload.delta === 'string' && payload.delta) handlers.onDelta?.(payload.delta);
       break;
@@ -359,17 +439,41 @@ export const queryRAGStream = async (
   requestParams: RagQueryRequest,
   handlers: RagStreamHandlers
 ): Promise<void> => {
-  const resp = await fetch(`${API_BASE}/rag/stream`, {
+  const resp = await apiFetch(`${API_BASE}/rag/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept-Language': currentLanguage() },
     body: JSON.stringify({
       paper_id: requestParams.paperId ?? '',
       question: requestParams.query,
+      quote: requestParams.quote
+        ? {
+            paper_id: requestParams.quote.paperId,
+            title: requestParams.quote.title,
+            authors: requestParams.quote.authors ?? [],
+            year: requestParams.quote.year ?? null,
+            page: requestParams.quote.page ?? null,
+            text: requestParams.quote.text,
+            before: requestParams.quote.before ?? '',
+            after: requestParams.quote.after ?? '',
+          }
+        : null,
       use_context: requestParams.useContext ?? true,
       enable_tool: requestParams.enableTool ?? true,
       context_ids: requestParams.contextIds ?? [],
       exclude_ids: requestParams.excludeIds ?? [],
-      history: requestParams.history ?? [],
+      // history 内 quote 同样序列化为后端 snake_case 键
+      history: (requestParams.history ?? []).map((h) => (h.quote
+        ? {
+            role: h.role,
+            content: h.content,
+            quote: {
+              paper_id: h.quote.paperId,
+              title: h.quote.title,
+              page: h.quote.page ?? null,
+              text: h.quote.text,
+            },
+          }
+        : h)),
       document: requestParams.document ?? '',
       workspace_id: requestParams.workspaceId ?? '',
       run_id: requestParams.runId ?? '',
@@ -594,11 +698,11 @@ export const listWorkspaceFiles = async (wsId: string): Promise<WorkspaceFile[]>
   return data.files;
 };
 
-/** 上传文件到工作区（multipart）；PDF 上传后返回的 paper_id 即本地文献 id。 */
+/** 上传写作文件到工作区（multipart）；仅接受文本/图片素材，PDF 请走文献库接口。 */
 export const uploadWorkspaceFile = async (wsId: string, file: File): Promise<WorkspaceFile> => {
   const form = new FormData();
   form.append('file', file);
-  const resp = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(wsId)}/files`, {
+  const resp = await apiFetch(`${API_BASE}/workspaces/${encodeURIComponent(wsId)}/files`, {
     method: 'POST',
     headers: { 'Accept-Language': currentLanguage() },
     body: form,
@@ -650,6 +754,118 @@ export const saveLatexFile = async (wsId: string, content: string): Promise<void
     method: 'PUT',
     body: JSON.stringify({ content }),
   });
+};
+
+/** 幂等确保写作入口 main.tex 存在（旧工作区首次进入写作页时补建骨架） */
+export const ensureWritingEntry = async (wsId: string): Promise<void> => {
+  await request(`/workspaces/${encodeURIComponent(wsId)}/writing/init`, { method: 'POST' });
+};
+
+/** 服务端 xelatex 编译结果（失败时 HTTP 422，仍返回结构化错误与日志） */
+export interface CompileResult {
+  ok: boolean;
+  message: string;
+  /** main.log 末尾片段（失败排查用） */
+  log: string;
+  /** 成功时的 PDF 相对路径（main.pdf） */
+  pdf: string | null;
+  /** 解析出的 file:line 错误清单（parse_log_errors，老后端可能缺省） */
+  errors?: import('../types').WritingCompileError[];
+}
+
+/** 以 main.tex 为入口执行 xelatex 编译；非 2xx 时同样解析结果体，不直接抛裸 HTTP 错误 */
+export const compileWorkspace = async (wsId: string): Promise<CompileResult> => {
+  let resp: Response;
+  try {
+    resp = await apiFetch(`${API_BASE}/workspaces/${encodeURIComponent(wsId)}/compile`, {
+      method: 'POST',
+      headers: { 'Accept-Language': currentLanguage() },
+    });
+  } catch (err) {
+    throw new Error(err instanceof Error ? err.message : String(err));
+  }
+  let body: Partial<CompileResult> | null = null;
+  try {
+    body = await resp.json();
+  } catch {
+    // 非 JSON（如 500 HTML），走下面统一报错
+  }
+  // 422（编译失败）同样携带 {ok:false,message,log} 结构化结果，直接返回供界面展示；
+  // 只有无结构体（404/500 等）才抛错
+  if (!body || typeof body.ok !== 'boolean') {
+    throw new Error(body?.message || `HTTP ${resp.status}`);
+  }
+  return {
+    ok: body.ok, message: body.message || '', log: body.log || '',
+    pdf: body.pdf ?? null, errors: body.errors ?? [],
+  };
+};
+
+/** 工作区二进制/原始文件的可访问 URL（图片预览、编译 PDF iframe、下载） */
+export const workspaceFileUrl = (wsId: string, path: string): string =>
+  `${API_BASE}/workspaces/${encodeURIComponent(wsId)}/files/${encodeURIComponent(path)}`;
+
+/** SyncTeX 反向定位结果（双击编译后的 PDF → LaTeX 源码位置） */
+export interface SynctexLocation {
+  /** 相对工作区根的 POSIX 路径（多文件文档可能是 \input 的子文件） */
+  file: string;
+  /** 1 基行号 */
+  line: number;
+  /** 1 基列号；无法确定时 null */
+  column: number | null;
+}
+
+/**
+ * 双击 PDF 反向定位：page 为 1 基页码，x/y 为 PDF 点坐标（72dpi，左上角原点）。
+ * 失败（未编译/无 synctex 数据/未命中）时抛错，error.message 为已本地化的可读文本。
+ */
+export const synctexInverse = async (
+  wsId: string,
+  point: { page: number; x: number; y: number },
+): Promise<SynctexLocation> => {
+  return request<SynctexLocation>(
+    `/workspaces/${encodeURIComponent(wsId)}/synctex`,
+    { method: 'POST', body: JSON.stringify(point) },
+  );
+};
+
+// ---------- 本地文献库（阅读侧 PDF，与写作目录物理分离） ----------
+/** 列出文献库 PDF（每项带 paper_id，即 local:<wsId>:<path> 的本地文献 id） */
+export const listLibraryFiles = async (wsId: string): Promise<WorkspaceFile[]> => {
+  const data = await request<{ files: WorkspaceFile[] }>(
+    `/workspaces/${encodeURIComponent(wsId)}/library/files`
+  );
+  return data.files;
+};
+
+/** 上传 PDF 到文献库（multipart，仅接受 PDF）；返回项的 paper_id 即本地文献 id。 */
+export const uploadLibraryFile = async (wsId: string, file: File): Promise<WorkspaceFile> => {
+  const form = new FormData();
+  form.append('file', file);
+  const resp = await apiFetch(`${API_BASE}/workspaces/${encodeURIComponent(wsId)}/library/files`, {
+    method: 'POST',
+    headers: { 'Accept-Language': currentLanguage() },
+    body: form,
+  });
+  if (!resp.ok) {
+    let message = `HTTP ${resp.status}`;
+    try {
+      const body = await resp.json();
+      if (body?.error) message = body.error;
+    } catch {
+      // 非 JSON 错误体，保留默认消息
+    }
+    throw new Error(message);
+  }
+  const data = await resp.json();
+  return data.file as WorkspaceFile;
+};
+
+export const deleteLibraryFile = async (wsId: string, path: string): Promise<void> => {
+  await request(
+    `/workspaces/${encodeURIComponent(wsId)}/library/files/${encodeURIComponent(path)}`,
+    { method: 'DELETE' }
+  );
 };
 
 // ---------- 设置（数据源与 LLM 服务，见 backend/routes/settings.py） ----------
@@ -863,4 +1079,104 @@ export const undoMindmapAi = async (
       }),
     }
   );
+};
+
+// ---------- AI 写作修订审核（边写边审，见 backend/routes/workspaces.py） ----------
+function writingWsBase(wsId: string): string {
+  return `/workspaces/${encodeURIComponent(wsId)}/writing`;
+}
+
+interface RawWritingRevision {
+  id: number;
+  runId: string;
+  transactionId: string;
+  seq: number;
+  kind: WritingRevision['kind'];
+  path: string;
+  oldText: string;
+  newText: string;
+  baseHash: string;
+  newHash: string;
+  status: WritingRevision['status'];
+  createdAt: string;
+}
+
+/** 拉取工作区全部待审修订（跨刷新对账），按事务、seq 升序 */
+export const listWritingRevisions = async (wsId: string): Promise<WritingRevision[]> => {
+  const data = await request<{ revisions: RawWritingRevision[] }>(
+    `${writingWsBase(wsId)}/revisions`
+  );
+  return data.revisions.map((r) => ({
+    id: r.id,
+    runId: r.runId ?? '',
+    transactionId: r.transactionId,
+    seq: r.seq ?? 0,
+    kind: r.kind,
+    path: r.path,
+    oldText: r.oldText ?? '',
+    newText: r.newText ?? '',
+    baseHash: r.baseHash ?? '',
+    newHash: r.newHash ?? '',
+    status: r.status,
+    createdAt: r.createdAt ?? '',
+  }));
+};
+
+/** 接受单个审核块（仅消标记，文件不变） */
+export const acceptWritingHunk = async (
+  wsId: string, revId: number
+): Promise<{ ok: boolean; revId: number; status: 'accepted' }> => {
+  return request(`${writingWsBase(wsId)}/hunks/${revId}/accept`, { method: 'POST' });
+};
+
+/** 拒绝单个审核块（服务端物理反向还原；返回还原后的文件内容或被删路径） */
+export const rejectWritingHunk = async (
+  wsId: string, revId: number
+): Promise<WritingRejectResult> => {
+  return request(`${writingWsBase(wsId)}/hunks/${revId}/reject`, { method: 'POST' });
+};
+
+/** 全部接受一次写作事务（剩余待审块一次性消标记） */
+export const acceptWritingTransaction = async (
+  wsId: string, transactionId: string
+): Promise<WritingAcceptTxnResult> => {
+  return request(
+    `${writingWsBase(wsId)}/transactions/${encodeURIComponent(transactionId)}/accept`,
+    { method: 'POST' }
+  );
+};
+
+/**
+ * 整事务回滚（一问一撤销）。冲突时后端返回 HTTP 409 但同样带结构体
+ * （已还原文件/processedCount/error 文案），不抛裸错，由调用方展示现场。
+ */
+export const rollbackWritingTransaction = async (
+  wsId: string, transactionId: string
+): Promise<WritingRollbackResult> => {
+  const resp = await apiFetch(
+    `${API_BASE}${writingWsBase(wsId)}/transactions/${encodeURIComponent(transactionId)}/rollback`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept-Language': currentLanguage() },
+    }
+  );
+  let body: Partial<WritingRollbackResult> | null = null;
+  try {
+    body = await resp.json();
+  } catch {
+    // 非 JSON（如 500 HTML）
+  }
+  if (!body || typeof body.ok !== 'boolean') {
+    throw new Error(body?.error || `HTTP ${resp.status}`);
+  }
+  return {
+    ok: body.ok,
+    transactionId: body.transactionId ?? transactionId,
+    count: body.count ?? 0,
+    files: Array.isArray(body.files) ? body.files : [],
+    deleted: Array.isArray(body.deleted) ? body.deleted : [],
+    kept: Array.isArray(body.kept) ? body.kept : [],
+    error: body.error,
+    processedCount: body.processedCount,
+  };
 };

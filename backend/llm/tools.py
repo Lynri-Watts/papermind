@@ -9,7 +9,10 @@
 - ``ReadPaperTool``：按**标准论文 id**（``source:external_id`` /
   ``local:<ws>:<path>``）读取单篇论文的全文（PDF，三级缓存）。
 - ``ReadContextTool``：按**上下文库条目编号**读取条目内容（论文→全文，网页→正文）。
-- ``ReadDocumentTool``：读取用户当前正在编辑的 LaTeX 文档。
+
+写作工作区文稿工具（``list_files``/``read_file``/``edit_file``/``create_file``/
+``add_bib_entries``/``compile_document``）见 :mod:`llm.tools_writing`，由路由层
+注册并通过每请求 context 传入工作区作用域。
 
 ``paper_search`` 与 ``read_paper`` 是**两个互相平行、各自独立**的工具，代码不规定
 调用先后：是否调用、先调用哪个由系统提示词按任务需要决策；两者的联动只通过
@@ -333,10 +336,12 @@ class ReadPaperTool(BaseTool):
         data = {
             # 前端展示用（不携带全文，避免大体积传输）
             "papers": [{"id": p["id"], "title": p["title"]} for p in loaded],
-            # 回答依据：材料正文（整篇或命中段落），供 prepare_answer 直注材料池
+            # 回答依据：材料正文（整篇或命中段落），供 prepare_answer 直注材料池。
+            # scope 供路由层分级合并：多次 query 局部读取取段落并集，整篇覆盖局部
             "fulltexts": [
                 {"id": p["id"], "title": p["title"], "text": p["text"],
-                 "context_id": None}
+                 "context_id": None,
+                 "scope": "passages" if query else "full"}
                 for p in loaded
             ],
         }
@@ -461,52 +466,28 @@ class ReadContextTool(BaseTool):
             "contexts": [{"context_id": p["context_id"], "title": p["title"]}
                          for p in loaded],
             # 回答依据：材料正文（全部或命中段落），供 prepare_answer 直注材料池；
-            # paper 条目带 ref_id 作为 paper_id（可被前端 PDF 定位）
+            # paper 条目带 ref_id 作为 paper_id（可被前端 PDF 定位）。
+            # scope 供路由层分级合并：多次 query 局部读取取段落并集，整篇覆盖局部
             "fulltexts": [
                 {"id": p["id"], "title": p["title"], "text": p["text"],
-                 "context_id": p["context_id"]}
+                 "context_id": p["context_id"],
+                 "scope": "passages" if query else "full"}
                 for p in loaded
             ],
         }
         return ToolResult(content, data)
 
 
-class ReadDocumentTool(BaseTool):
-    """读取用户当前正在编辑的 LaTeX 文档全文。
-
-    文档内容不随提问无条件注入；是否需要读取由系统按任务决定（写作类任务）。
-    本工具与论文检索/读取互相独立：它读取的是用户的 LaTeX 文稿，不是论文库材料。
-    """
-
-    name = "read_document"
-    description = (
-        "读取用户当前正在编辑的论文（LaTeX 文档）全文，返回文档当前内容。"
-        "适用于需要针对文稿本身的任务（改写、续写、语法/结构检查、把材料插入论文等）。"
-        "与论文库无关：不检索也不读取外部论文，无参数；当前没有打开的编辑器时"
-        "会明确返回无文档。"
-    )
-    parameters: dict = {"type": "object", "properties": {}, "additionalProperties": False}
-
-    def execute(self, arguments: dict, context: Optional[dict] = None) -> ToolResult:
-        document = ((context or {}).get("document") or "").strip()
-        if not document:
-            return ToolResult(tr("rag.read_document_empty"))
-        # 截断避免 tool 消息过长（完整内容仍存于 data，供 /answer 检索使用）
-        preview = document if len(document) <= 6000 else document[:6000] + "\n" + tr("rag.read_document_truncated")
-        return ToolResult(
-            tr("rag.read_document_loaded", n=len(document)) + f"\n\n{preview}",
-            {"document": document},
-        )
-
-
-# 默认注册表：可被上层直接复用，也可另行构造并注册自定义工具
+# 默认注册表：可被上层直接复用，也可另行构造并注册自定义工具。
+# 写作工作区文稿工具（list_files/read_file/edit_file/...）由上层
+# routes.papers 调 register_writing_tools 追加（它们依赖每请求 context 中的
+# 工作区作用域与事务，不放全局单例默认表也不影响其他消费方）。
 _default_registry = ToolRegistry()
 _default_registry.register(PaperSearchTool())
 _default_registry.register(ReadPaperTool())
 _default_registry.register(ReadContextTool())
-_default_registry.register(ReadDocumentTool())
 
 
 def default_registry() -> ToolRegistry:
-    """返回内置工具的注册表（含论文搜索、全文读取、上下文条目读取与文档读取工具）。"""
+    """返回内置工具的注册表（论文搜索、论文全文读取、上下文条目读取）。"""
     return _default_registry

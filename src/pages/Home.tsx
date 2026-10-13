@@ -1,8 +1,8 @@
 import React, { useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { Plus, FolderOpen, Trash2, FileText, Folder, MessageCircle, ChevronDown, ChevronRight, FileCode2, Loader2, ArrowRight, Info, Check } from 'lucide-react';
-import { usePaperMindStore, WRITING_ENABLED } from '../store';
+import { Plus, FolderOpen, Trash2, FileText, Folder, MessageCircle, ChevronDown, ChevronRight, FileCode2, Loader2, ArrowRight, Info, Check, Image as ImageIcon } from 'lucide-react';
+import { usePaperMindStore } from '../store';
 import { createWorkspace, deleteWorkspace, listWorkspaceFiles } from '../api';
 import { WorkspaceInfo, WorkspaceFile } from '../types';
 
@@ -11,6 +11,7 @@ const KIND_ICON: Record<WorkspaceFile['kind'], React.ReactNode> = {
   pdf: <FileText className="w-3.5 h-3.5 text-red-400" />,
   latex: <FileCode2 className="w-3.5 h-3.5 text-emerald-400" />,
   text: <FileText className="w-3.5 h-3.5 text-sky-400" />,
+  image: <ImageIcon className="w-3.5 h-3.5 text-violet-400" />,
   other: <FileText className="w-3.5 h-3.5 text-textSecondary" />,
 };
 
@@ -79,7 +80,7 @@ const Home: React.FC = () => {
     setSwitchError(null);
     try {
       await switchWorkspace(wsId);
-      if (WRITING_ENABLED) setCurrentView('workspace');
+      setCurrentView('workspace');
     } catch (e) {
       setSwitchError(e instanceof Error ? e.message : t('errors.selectFailed'));
     } finally {

@@ -21,10 +21,16 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "papermind.db"
 PDF_DIR = DATA_DIR / "pdfs"          # PDF 二进制磁盘缓存
 PDF_DIR.mkdir(exist_ok=True)
-# 工作区根目录：所有工作区文件夹位于此根之下。为在线部署做准备，
-# 工作区文件统一存储在服务器端受控目录，并由 storage.workspace 层做严格路径校验。
+# 工作区根目录：写作文件（LaTeX 源码、bib、图片素材等）位于此根之下。
+# 为在线部署做准备，工作区文件统一存储在服务器端受控目录，并由
+# storage.workspace 层做严格路径校验。
 WORKSPACES_ROOT = DATA_DIR / "workspaces"
 WORKSPACES_ROOT.mkdir(exist_ok=True)
+# 本地文献库根目录：阅读侧上传的文献 PDF 与写作工作区物理分离，按工作区 id
+# 对应到 libraries/<id>/（本地文献 id 仍为 local:<ws_id>:<rel_path>，rel_path
+# 改为相对文献库根；由 storage.library 层做与工作区同等级的路径校验）。
+LIBRARIES_ROOT = DATA_DIR / "libraries"
+LIBRARIES_ROOT.mkdir(exist_ok=True)
 
 # --- 服务 ---
 HOST = os.getenv("HOST", "127.0.0.1")

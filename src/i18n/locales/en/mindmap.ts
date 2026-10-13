@@ -28,7 +28,7 @@ export default {
     paperPlaceholder: 'Paper',
     collapse: 'Collapse branch',
     expand: 'Expand branch',
-    openPaper: 'Open paper in reader',
+    openPaper: 'View paper details',
   },
   hint: 'Double-click to edit · Tab adds a child · Enter adds a sibling · Delete removes (children promoted)',
   gallery: {

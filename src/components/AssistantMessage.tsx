@@ -2,11 +2,16 @@ import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import ReactMarkdown, { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 import { Brain, Check, Copy, Info, Loader2 } from 'lucide-react';
-import { ChatMessage, ChatMindmapEdit, RagSource, ToolPaper } from '../types';
+import { ChatMessage, ChatMindmapEdit, ChatWritingEdit, RagSource, ToolPaper } from '../types';
 import ToolStepCard from './ToolStepCard';
 import AiMindmapEditBar from './mindmap/AiMindmapEditBar';
+import AiWritingEditBar from './writing/AiWritingEditBar';
 import CitationMarker from './CitationBlock';
+import StreamingMathText from './StreamingMathText';
+import { normalizeMathDelimiters } from '../utils/latexMath';
 import {
   protectCitations,
   remarkCitationCards,
@@ -29,6 +34,8 @@ interface AssistantMessageProps {
   onOpenPaper?: (paper: ToolPaper) => void;
   /** 撤销/保留本次回答对某张导图的 AI 编辑 */
   onMindmapEditChange?: (messageId: string, mapId: string, patch: Partial<ChatMindmapEdit>) => void;
+  /** 全部接受/撤销本次回答对论文文档的 AI 写作事务 */
+  onWritingEditChange?: (messageId: string, patch: Partial<ChatWritingEdit>) => void;
 }
 
 /** remark 自定义节点 <citecard> 透传来的属性（hast 属性名为全小写） */
@@ -41,7 +48,7 @@ interface CiteCardNodeProps {
 
 const AssistantMessage: React.FC<AssistantMessageProps> = ({
   message, streamStage, copiedId, onCopy, onOpenSource,
-  onAddToContext, onOpenPaper, onMindmapEditChange,
+  onAddToContext, onOpenPaper, onMindmapEditChange, onWritingEditChange,
 }) => {
   const { t } = useTranslation('assistant');
 
@@ -71,12 +78,24 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
     () => protectCitations(stripLegacySourceTags(message.content)),
     [message.content],
   );
+  // 引用保护之后再归一化数学定界符：引用卡里是逐字原文，不做任何语法改写；
+  // PUA 占位符在归一化函数内也受保护
+  const finalMarkdown = useMemo(
+    () => normalizeMathDelimiters(protectedMd.markdown),
+    [protectedMd.markdown],
+  );
   const remarkPlugins = useMemo<
     NonNullable<React.ComponentProps<typeof ReactMarkdown>['remarkPlugins']>
   >(
     // 元组形式 [plugin, options]：unified 以 registry 为参数调用 attacher
-    () => [remarkGfm, [remarkCitationCards, protectedMd.registry]],
+    () => [remarkGfm, remarkMath, [remarkCitationCards, protectedMd.registry]],
     [protectedMd.registry],
+  );
+  const rehypePlugins = useMemo<
+    NonNullable<React.ComponentProps<typeof ReactMarkdown>['rehypePlugins']>
+  >(
+    () => [[rehypeKatex, { throwOnError: false, strict: 'ignore', trust: false }]],
+    [],
   );
 
   const renderMarker = (
@@ -245,7 +264,7 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
             <div className="text-sm leading-relaxed whitespace-pre-wrap">
               {segments.map((seg, i) =>
                 seg.type === 'text' ? (
-                  <React.Fragment key={i}>{stripLegacySourceTags(seg.text)}</React.Fragment>
+                  <StreamingMathText key={i} text={stripLegacySourceTags(seg.text)} />
                 ) : (
                   renderMarker(i, seg.citation)
                 ),
@@ -254,8 +273,12 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
             </div>
           ) : (
             <div className="assistant-markdown">
-              <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
-                {protectedMd.markdown}
+              <ReactMarkdown
+                remarkPlugins={remarkPlugins}
+                rehypePlugins={rehypePlugins}
+                components={markdownComponents}
+              >
+                {finalMarkdown}
               </ReactMarkdown>
             </div>
           )}
@@ -266,6 +289,15 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
               edits={message.mindmapEdits}
               locked={Boolean(message.streaming)}
               onChange={(mapId, patch) => onMindmapEditChange(message.id, mapId, patch)}
+            />
+          )}
+
+          {/* AI 论文写作：整事务「全部接受 / 撤销本次写作」条 */}
+          {message.writingEdit && onWritingEditChange && (
+            <AiWritingEditBar
+              edit={message.writingEdit}
+              locked={Boolean(message.streaming)}
+              onChange={(patch) => onWritingEditChange(message.id, patch)}
             />
           )}
 

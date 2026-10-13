@@ -20,6 +20,24 @@ export default {
     apiKey: 'API Key',
   },
 
+  /** How the AI reads paper/context text during Q&A (cost vs. evidence completeness) */
+  reading: {
+    title: 'AI reading granularity',
+    description: 'How the AI reads paper text when answering — trade off token/time cost against evidence completeness. Passages from multiple keyword lookups are merged and de-duplicated, never overwritten.',
+    auto: {
+      label: 'Automatic',
+      hint: 'Let the model decide per question: keyword lookup for simple ones, full text for complex ones',
+    },
+    full: {
+      label: 'Completeness first',
+      hint: 'Read the whole text in one go whenever evidence is needed — most complete evidence and most reliable citation checks, at the highest token/time cost',
+    },
+    passages: {
+      label: 'Economy first',
+      hint: 'Fetch only keyword-matching passages — lowest cost; evidence spread across sections may require several follow-up lookups',
+    },
+  },
+
   /** Credential/key input placeholders (shared by data sources and LLM) */
   placeholder: {
     /** When configured, only the mask is echoed; blank means "keep unchanged" */

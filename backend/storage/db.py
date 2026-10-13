@@ -162,6 +162,35 @@ def init_db(db_path: Path = DB_PATH) -> None:
             created_at     TEXT NOT NULL,
             PRIMARY KEY (map_id, version)
         );
+
+        -- AI 写作修订：每次 edit_file / create_file / add_bib_entries 成功
+        -- 应用的一个编辑块一行。文件已直接写盘（边写边审），本表记录前/后文本
+        -- 供逐块拒绝（反向还原）与整事务回滚；status 标记审核状态。
+        --   action_kind: edit=锚点替换  create=新建文件  input=main.tex 接线
+        --                (\input/\bibliography 等) append=向 .bib 追加条目
+        --   status: pending(待审) accepted(已接受) rejected(已拒绝=已反向还原)
+        --           stale(锚点环境已变，无法干净还原) reverted(随整事务回滚)
+        CREATE TABLE IF NOT EXISTS writing_revisions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id         TEXT NOT NULL DEFAULT '',
+            transaction_id TEXT NOT NULL,
+            scope          TEXT NOT NULL,
+            rel_path       TEXT NOT NULL,
+            seq            INTEGER NOT NULL,
+            action_kind    TEXT NOT NULL,
+            old_text       TEXT NOT NULL DEFAULT '',
+            new_text       TEXT NOT NULL DEFAULT '',
+            base_hash      TEXT NOT NULL DEFAULT '',
+            new_hash       TEXT NOT NULL DEFAULT '',
+            status         TEXT NOT NULL DEFAULT 'pending',
+            actor          TEXT NOT NULL DEFAULT 'ai',
+            undo_of        TEXT,
+            created_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_writing_rev_scope
+            ON writing_revisions(scope, status);
+        CREATE INDEX IF NOT EXISTS idx_writing_rev_txn
+            ON writing_revisions(transaction_id);
         """
     )
     _migrate(conn)
@@ -710,6 +739,7 @@ def delete_workspace(ws_id: str) -> None:
             (scope,),
         )
         conn.execute("DELETE FROM mindmaps WHERE scope = ?", (scope,))
+        conn.execute("DELETE FROM writing_revisions WHERE scope = ?", (scope,))
         # 本地文献按前缀精确匹配：用 substr 而非 LIKE——ws_id 允许下划线，
         # 而 '_' 在 LIKE 中是单字符通配，会误删同名前缀的其它工作区数据
         for table, col in (
@@ -941,3 +971,101 @@ def is_transaction_undone(map_id: str, transaction_id: str) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
+
+
+# ---------- writing_revisions：AI 写作编辑修订（边写边审/事务回滚） ----------
+def next_writing_seq(transaction_id: str) -> int:
+    """事务内下一个全局顺序号（seq 从 1 开始，跨文件连续）。"""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq "
+        "FROM writing_revisions WHERE transaction_id = ?",
+        (transaction_id,),
+    ).fetchone()
+    conn.close()
+    return int(row["next_seq"])
+
+
+def insert_writing_revision(*, run_id: str, transaction_id: str, scope: str,
+                            rel_path: str, seq: int, action_kind: str,
+                            old_text: str = "", new_text: str = "",
+                            base_hash: str = "", new_hash: str = "",
+                            actor: str = "ai") -> int:
+    """落一条写作修订，返回自增 id。"""
+    conn = _connect()
+    cur = conn.execute(
+        "INSERT INTO writing_revisions "
+        "(run_id, transaction_id, scope, rel_path, seq, action_kind, "
+        "old_text, new_text, base_hash, new_hash, status, actor, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+        (run_id, transaction_id, scope, rel_path, seq, action_kind,
+         old_text, new_text, base_hash, new_hash, actor, _now()),
+    )
+    conn.commit()
+    rev_id = cur.lastrowid
+    conn.close()
+    return int(rev_id)
+
+
+def get_writing_revision(rev_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT * FROM writing_revisions WHERE id = ?", (rev_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_pending_writing_revisions(scope: str) -> list[dict]:
+    """工作区全部待审修订（跨刷新对账用），按事务、seq 升序。"""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT * FROM writing_revisions WHERE scope = ? AND status = 'pending' "
+        "ORDER BY transaction_id, seq, id",
+        (scope,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_writing_transaction(scope: str, transaction_id: str) -> list[dict]:
+    """一次 AI 写作事务的全部修订（按 seq 逆序=回滚应用顺序）。"""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT * FROM writing_revisions WHERE scope = ? AND transaction_id = ? "
+        "ORDER BY seq DESC, id DESC",
+        (scope, transaction_id),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_writing_revision_status(rev_id: int, status: str,
+                                undo_of: str | None = None) -> bool:
+    """更新单条修订状态；返回是否命中一行。"""
+    conn = _connect()
+    cur = conn.execute(
+        "UPDATE writing_revisions SET status = ?, undo_of = COALESCE(?, undo_of) "
+        "WHERE id = ?",
+        (status, undo_of, rev_id),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def mark_writing_revisions_status(rev_ids: list[int], status: str,
+                                  undo_of: str | None = None) -> int:
+    """批量置状态（整事务回滚），返回更新行数。"""
+    if not rev_ids:
+        return 0
+    conn = _connect()
+    placeholders = ",".join("?" for _ in rev_ids)
+    cur = conn.execute(
+        f"UPDATE writing_revisions SET status = ?, "
+        f"undo_of = COALESCE(?, undo_of) WHERE id IN ({placeholders})",
+        [status, undo_of, *rev_ids],
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount

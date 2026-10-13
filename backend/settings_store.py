@@ -99,6 +99,18 @@ KEY_LLM_BASE_URL = "llm_base_url"
 KEY_LLM_MODEL = "llm_model"
 KEY_LLM_API_KEY = "llm_api_key"
 KEY_SOURCE_PRIORITY = "source_priority"
+KEY_READING_SCOPE = "reading_scope"
+
+# 问答时论文/上下文正文的读取粒度（ReAct 调度提示据此偏好选择读整篇还是
+# 关键词局部检索）：
+#   auto      = 模型按问题自行决定（默认，历史行为）
+#   full      = 完整优先：省略 query 直接读整篇，证据最全、token/耗时最高
+#   passages  = 节省优先：带 query 只取命中段落，多区域问题可能需要多轮补读
+READING_SCOPE_AUTO = "auto"
+READING_SCOPE_FULL = "full"
+READING_SCOPE_PASSAGES = "passages"
+READING_SCOPES = (READING_SCOPE_AUTO, READING_SCOPE_FULL, READING_SCOPE_PASSAGES)
+DEFAULT_READING_SCOPE = READING_SCOPE_AUTO
 
 _cache: dict = {}
 
@@ -134,6 +146,16 @@ def _parse_source_priority(raw: str) -> list[str]:
     if not seen:
         raise ValueError(tr("settings.source_priority_empty"))
     return seen
+
+
+def _parse_reading_scope(raw: str | None) -> str:
+    """解析读取粒度；空值/未配置 → 默认 auto，非法值明确抛错不静默兜底。"""
+    value = (raw or "").strip().lower()
+    if not value:
+        return DEFAULT_READING_SCOPE
+    if value not in READING_SCOPES:
+        raise ValueError(tr("settings.reading_scope_unknown", value=value))
+    return value
 
 
 def _migrate_from_env() -> dict[str, str]:
@@ -224,6 +246,7 @@ def reload() -> None:
         "llm_timeout": DEFAULT_LLM_TIMEOUT,
         "credentials": credentials,
         "source_priority": _parse_source_priority(stored.get(KEY_SOURCE_PRIORITY, "")),
+        "reading_scope": _parse_reading_scope(stored.get(KEY_READING_SCOPE)),
     })
     logger.info("设置已加载：启用数据源=%s，LLM=%s",
                 ",".join(_cache["source_priority"]), _cache["llm_model"])
@@ -252,6 +275,11 @@ def source_priority() -> list[str]:
 def enabled_sources() -> list[str]:
     """仅返回启用的数据源 id（语义同 :func:`source_priority`）。"""
     return list(_cache["source_priority"])
+
+
+def reading_scope() -> str:
+    """问答正文读取粒度偏好（auto/full/passages）。"""
+    return _cache["reading_scope"]
 
 
 def _mask(value: str) -> str:
@@ -293,6 +321,7 @@ def snapshot() -> dict:
             "api_key_configured": bool(_cache["llm_api_key"]),
             "api_key_hint": _mask(_cache["llm_api_key"]),
         },
+        "reading_scope": _cache["reading_scope"],
         "sources": sources,
     }
 
@@ -364,6 +393,12 @@ def update(payload: dict) -> dict:
     order = payload.get("source_order")
     if order is not None:
         updates[KEY_SOURCE_PRIORITY] = ",".join(_validate_source_order(order))
+
+    if "reading_scope" in payload:
+        raw_scope = payload.get("reading_scope")
+        if not isinstance(raw_scope, str):
+            raise ValueError(tr("settings.reading_scope_not_string"))
+        updates[KEY_READING_SCOPE] = _parse_reading_scope(raw_scope)
 
     if not updates:
         raise ValueError(tr("settings.nothing_to_save"))

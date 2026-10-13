@@ -28,7 +28,7 @@ export default {
     paperPlaceholder: '论文',
     collapse: '折叠分支',
     expand: '展开分支',
-    openPaper: '在阅读器中打开论文',
+    openPaper: '查看论文详情',
   },
   hint: '双击编辑 · Tab 子主题 · Enter 同级 · Delete 删除（子主题上提）',
   gallery: {

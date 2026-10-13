@@ -37,10 +37,86 @@ MAX_HISTORY_CHARS = 1500
 SOURCE_FALLBACK_CHARS = 1200
 
 
+def _history_plain_text(content: str) -> str:
+    """历史 assistant 正文转纯文本：剔除行内引用块与旧版 ``[Source N]`` 标记。
+
+    历史只作对话语境；旧回答里的引用标记是机器协议痕迹，留在上下文里既浪费
+    token 又可能被模型模仿输出。
+    """
+    text = strip_inline_quote_markers(content)
+    text = _MACHINE_MARK_RE.sub("", text)
+    return text.strip()
+
+
+def _history_quote_note(quote) -> str:
+    """把历史 user 轮附带的框选引用格式化为中文语境注记（前缀在原问题之前）。
+
+    历史引用是后续轮次指代消解的锚点（"这段/它/上面那句"指的是哪里），
+    只保留标题/页码/短摘录；当前轮的可引用正文仍以本轮 Sources 为准。
+    """
+    if not isinstance(quote, dict):
+        return ""
+    text = " ".join(str(quote.get("text") or "").split())
+    if not text:
+        return ""
+    title = str(quote.get("title") or "").strip() or "某篇论文"
+    page = quote.get("page")
+    page_clause = (
+        f"第{page}页"
+        if isinstance(page, int) and not isinstance(page, bool) and page > 0
+        else ""
+    )
+    return (
+        f"（该轮提问背景：用户正在阅读《{title}》{page_clause}，并框选了原文"
+        f"片段「{text[:200]}」；该轮问题针对此片段。）"
+    )
+
+
+def format_quote_user_block(quote) -> str:
+    """最终回答 user 提示中的「用户操作语境」块（英文，与回答提示同语言）。
+
+    片段全文不在此重复：框选片段已作为一条 Sources 材料注入（其中
+    【用户框选的原文开始】/【用户框选的原文结束】两行标出用户选区）。
+    本块只负责让模型正确理解用户行为与默认意图，避免把选区原文误当成问题。
+    """
+    if not isinstance(quote, dict):
+        return ""
+    text = str(quote.get("text") or "").strip()
+    if not text:
+        return ""
+    title = str(quote.get("title") or "").strip()
+    page = quote.get("page")
+    page_clause = (
+        f" on page {page}"
+        if isinstance(page, int) and not isinstance(page, bool) and page > 0
+        else ""
+    )
+    title_clause = f' of "{title}"' if title else ""
+    return (
+        "=== WHAT THE USER JUST DID ===\n"
+        f"The user highlighted an excerpt{page_clause}{title_clause} in the PDF "
+        "reader and asked the Question below ABOUT that excerpt. The highlighted "
+        "text (plus its surrounding context) is included verbatim as one of the "
+        "Sources blocks below; the lines 【用户框选的原文开始】 and "
+        "【用户框选的原文结束】 delimit exactly what the user selected.\n"
+        "- The Question is about the excerpt — never mistake the highlighted text "
+        "itself for the question.\n"
+        "- If the question has no more specific intent (e.g. it only asks to "
+        "\"explain\"), interpret it as: explain what the excerpt means and its "
+        "role in the paper, grounded in the sources.\n"
+        "- The excerpt is already available in the sources; do not claim it is "
+        "missing, and embed verbatim [Q] citations from it exactly as for any "
+        "other source.\n\n"
+    )
+
+
 def _normalize_history(history: Optional[list]) -> list[dict]:
     """把前端传来的精简历史规整为 LLM 对话轮次：
 
     - 只保留 user / assistant 且有内容的轮次（不含全文、出处详情）；
+    - user 轮若带框选引用（quote），在问题前加一行语境注记，锚定后续追问
+      中"这段/它/上面那句"等指代的出处；
+    - assistant 旧回答剔除行内引用标记，只留纯文本对话语境；
     - 截断每轮文本长度、限制轮次数量（保留最近几轮），控制 token 用量。
     """
     if not history or not isinstance(history, list):
@@ -53,7 +129,16 @@ def _normalize_history(history: Optional[list]) -> list[dict]:
         content = h.get("content")
         if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
             continue
-        cleaned.append({"role": role, "content": content.strip()[:MAX_HISTORY_CHARS]})
+        content = content.strip()
+        if role == "assistant":
+            content = _history_plain_text(content)
+            if not content:
+                continue
+        elif role == "user":
+            note = _history_quote_note(h.get("quote"))
+            if note:
+                content = f"{note}\n{content}"
+        cleaned.append({"role": role, "content": content[:MAX_HISTORY_CHARS]})
     return cleaned[-MAX_HISTORY_MESSAGES:]
 
 
@@ -448,7 +533,8 @@ class RAGEngine:
                        paper: Optional[dict] = None,
                        history: Optional[list] = None,
                        grounded: bool = True,
-                       tool_findings: Optional[list[dict]] = None) -> tuple[list[dict], list[dict]]:
+                       tool_findings: Optional[list[dict]] = None,
+                       quote: Optional[dict] = None) -> tuple[list[dict], list[dict]]:
         """材料直注 + 组装 prompt（流式 / 非流式共用）。
 
         材料由工具循环读取后**原样**注入（每条一个 ``[Source N]`` 段落），不再
@@ -483,6 +569,8 @@ class RAGEngine:
                 "context_id": src.get("context_id"),
                 "paper_id": src.get("paper_id"),
                 "text": text,
+                # 定位兜底优先文本（如框选片段的选区原文）；缺省回退正文开头
+                "locate_hint": (src.get("locate_hint") or "").strip() or None,
             })
 
         if not passages:
@@ -492,6 +580,7 @@ class RAGEngine:
             # 无材料模式：组装"通用知识作答"对话
             return self._prepare_unguided_answer(
                 question, paper, history, tool_findings=tool_findings,
+                quote=quote,
             )
 
         title = (paper or {}).get("title", "")
@@ -501,6 +590,7 @@ class RAGEngine:
         if len(authors) > 3:
             author_str += " et al."
 
+        history_msgs = _normalize_history(history)
         prompt_sources = "\n\n".join(
             f"[Source {i + 1} - {p['label']}]\n{p['text']}"
             for i, p in enumerate(passages)
@@ -520,6 +610,17 @@ class RAGEngine:
             "context library; they may be papers or web pages.\n"
             "- Earlier turns may be included as conversation history; they are "
             "context only and do not add sources beyond the ones listed below.\n"
+            "- PROVENANCE OF THE BLOCKS BELOW: they are NOT documents the user "
+            "pasted into the chat and NOT the complete papers — they are the "
+            "observations retrieved by YOUR OWN tool calls (read_paper / "
+            "read_context / read_document) executed earlier in THIS SAME turn, "
+            "as part of this very ReAct run. Your retrieval is partial by "
+            "design: in particular a read_paper call made with a query returns "
+            "only passages matching that query. Therefore a section, heading "
+            "or claim that does not appear in the blocks below was simply not "
+            "retrieved this turn; that is NEVER evidence that the paper does "
+            "not contain it — do not mistake your own retrieval coverage for "
+            "an input boundary the user set.\n"
             "- The sources below are delimited by [Source N - ...] headers for "
             "your reading only — the numbers are NOT citation keys and must "
             "never appear in your answer. Tracing works automatically: you "
@@ -546,7 +647,15 @@ class RAGEngine:
             "and tables when useful, so the answer is easy to scan.\n"
             "5. If the materials genuinely do not support the question even after "
             "reasonable synthesis, say so explicitly, explain what is missing, and "
-            "suggest what to search for or add — never fabricate.\n"
+            "suggest what to search for or add — never fabricate. Attribute any "
+            "such gap to THIS turn's partial retrieval, never to a static input "
+            "boundary: say e.g. \"the passages retrieved this turn do not cover "
+            "X; I can read the full paper / further sections on request\". "
+            "Forbidden are phrasings that present retrieved observations as "
+            "text the user handed you (\"the text I was given covers only ...\", "
+            "\"this is outside the text available to me\", \"我当前可读到的原文"
+            "只有…\", \"这部分不在我这轮看到的文本范围内\") and any hint that "
+            "non-retrieved content does not exist in the paper.\n"
             "6. Answer in the language of the question.\n"
             "7. Inline citations — the citation IS part of the sentence, not a "
             "footnote. Whenever you state a fact taken from a source, embed a "
@@ -565,13 +674,35 @@ class RAGEngine:
             "non-verbatim part 1 cannot be matched and will be shown as a "
             "failed citation.\n"
             "     PART 2 (after ||) is the text that ACTUALLY APPEARS in your "
-            "answer at that spot: a short clause, in the answer's language, "
-            "that restates the core of part 1 (or condenses it), written so "
-            "that the surrounding sentence reads naturally and grammatically. "
-            "≤60 characters, plain text (no markdown emphasis, no surrounding "
-            "quotation marks). Part 1 stays in the source's language; only "
-            "part 2 follows the answer's language. If part 1 already reads "
-            "perfectly in place, repeat it as part 2.\n"
+            "answer at that spot, in the answer's language. Hard requirements:\n"
+            "       a) SELF-CONTAINED — write for a reader who has NEVER seen "
+            "the source documents and never will: part 2 MUST itself carry "
+            "every number, percentage, name, metric, comparison and concrete "
+            "conclusion needed to understand and trust that statement. Part 1 "
+            "is only a machine-readable quote the reader sees on hover; never "
+            "assume information that lives only in part 1 (or only in the "
+            "source text) is known to the reader. Vague pointers such as "
+            "\"the reported result\", \"as the authors state\", \"that "
+            "finding\", \"相关数据/结论/结果表明\" are forbidden unless the "
+            "concrete fact is written right there in part 2.\n"
+            "       b) GRAMMATICALLY FUSED — after mentally substituting part 2 "
+            "for the whole tag, the sentence must be complete and read naturally "
+            "on its own, in one voice with the non-citation text around it; do "
+            "not break the sentence before the tag and do not make part 2 a "
+            "sentence fragment whose meaning depends on hovering.\n"
+            "       c) FORMAT — ≤80 characters, plain text (no markdown "
+            "emphasis, no surrounding quotation marks). Part 1 stays in the "
+            "source's language; only part 2 follows the answer's language. If "
+            "part 1 already reads perfectly in place and contains no more "
+            "information than fits, repeat it as part 2.\n"
+            "       Bad:  \"The method performs [Q]Our approach achieves a "
+            "mean Dice of 0.912, outperforming the 0.887 baseline.||better "
+            "than the baseline[/Q].\" — part 2 hides the concrete scores in "
+            "the hover quote.\n"
+            "       Good: \"The method reaches [Q]Our approach achieves a "
+            "mean Dice of 0.912, outperforming the 0.887 baseline.||0.912 "
+            "mean Dice vs. the 0.887 baseline[/Q].\" — the numbers sit in "
+            "the visible text and the sentence is complete without hovering.\n"
             "   - NO number inside the tag: the system locates the source by "
             "matching part 1 itself. Never write [Source N] or [Q:N] "
             "in your answer.\n"
@@ -585,20 +716,63 @@ class RAGEngine:
             "   - Never place a tag inside a heading or a table cell; for a "
             "fact in a table, put the tag in the sentence right after the "
             "table.\n"
+            "   - READ-THROUGH CHECK before finishing (keep ALL tags, do not "
+            "remove citations): in your mind, strip each tag of its tag "
+            "nature so it becomes ordinary plain text consisting of part 2 "
+            "alone (part 1 and the [Q]||[/Q] wrappers vanish), then read the "
+            "whole answer as if you were a reader who has never opened the "
+            "source material. The text must be complete, fluent and fully "
+            "self-explanatory on its own: no dangling pronoun or vague "
+            "reference that only makes sense from the original paper, no "
+            "number or conclusion hidden in the vanished part 1, and cited "
+            "sentences must connect smoothly with the uncited ones.\n"
             "   - Do NOT append any trailing quote list or manifest, and do not "
             "output any other machine-readable block. If a claim has no "
             "verbatim source sentence worth quoting, state it as your own "
             "analysis without a tag.\n"
         )
+        if history_msgs:
+            # 多轮历史里 assistant 对自身检索范围的叙述（"我只能读到§4"）是
+            # 上一轮的过程产物，不是本轮环境事实；不拦住这一点，模型会把旧
+            # 边界当事实复读、甚至据此拒答（"左右脑互搏"）。结论可继承，范围
+            # 自述不可继承。
+            system += (
+                "\n=== EARLIER TURNS: STALE SCOPE SELF-NARRATIONS ARE NOT FACTS ===\n"
+                "Earlier assistant turns may narrate their OWN reading scope in "
+                "that turn (e.g. \"the text I could read was limited to the "
+                "abstract and section 4\", \"that part was outside the excerpts "
+                "I saw this turn\"). Such sentences are the model's past process "
+                "narration produced under THAT turn's tool results; they do NOT "
+                "describe this turn's environment and do NOT bound the current "
+                "sources — tool state resets every turn. The only material "
+                "available in THIS turn is exactly the [Source N] blocks (and "
+                "the tool-findings digest, if present) in this message.\n"
+                "- Never echo a prior turn's scope statement as a current fact, "
+                "and never answer \"I can only see ...\" based on history.\n"
+                "- A section absent from an earlier turn's excerpts is NOT "
+                "evidence that the paper lacks it; do not infer absence from a "
+                "past retrieval miss.\n"
+                "- Semantic conclusions reached in earlier turns can be "
+                "inherited, but their reading-coverage self-descriptions cannot. "
+                "If you state a retrieval limitation this turn, it must be "
+                "grounded solely in THIS turn's actual sources, in the spirit "
+                "of response rule 5.\n"
+            )
         user = (
             f"Currently open paper: \"{title}\" ({year}) by {author_str}.\n\n"
             if title else "Currently open paper: not loaded.\n\n"
         )
+        user += format_quote_user_block(quote)
         findings_note = self._format_tool_findings(tool_findings)
         if findings_note:
             user += findings_note
         user += (
-            f"Sources:\n{prompt_sources}\n\nQuestion: {question}\n\n"
+            "Observations retrieved by YOUR OWN tool calls earlier this turn — "
+            "remember these are partial retrieval results of yours in this ReAct "
+            "run, not documents the user pasted and not the complete papers; a "
+            "query-based read returns only matching passages, so anything absent "
+            "here was not retrieved this turn and is NOT proven absent:\n"
+            f"{prompt_sources}\n\nQuestion: {question}\n\n"
             "Embed the [Q]<verbatim sentence>||<inline wording>[/Q] citations "
             "inline within your answer exactly as specified in response rule 7 "
             "(both parts, no numbers, no source tags)."
@@ -611,8 +785,9 @@ class RAGEngine:
                 "context_id": p["context_id"],
                 "paper_id": p["paper_id"],
                 # text 只作为"模型没给原句时"的 PDF 定位兜底，截短以控制传输体积；
+                # 框选片段等材料可用 locate_hint 把定位点钉在选区而非正文开头；
                 # full_text 是完整材料正文，仅供后端行内引用核对，路由层发给前端前剔除
-                "text": p["text"][:SOURCE_FALLBACK_CHARS],
+                "text": (p.get("locate_hint") or p["text"])[:SOURCE_FALLBACK_CHARS],
                 "full_text": p["text"],
                 # 已取消检索打分：score 只是前端类型要求的占位（界面不展示）
                 "score": 0.0,
@@ -620,7 +795,7 @@ class RAGEngine:
             for i, p in enumerate(passages)
         ]
         messages = [{"role": "system", "content": system}]
-        for h in _normalize_history(history):
+        for h in history_msgs:
             messages.append({"role": h["role"], "content": h["content"]})
         messages.append({"role": "user", "content": user})
         return sources_out, messages
@@ -672,6 +847,7 @@ class RAGEngine:
                                  paper: Optional[dict],
                                  history: Optional[list],
                                  tool_findings: Optional[list[dict]] = None,
+                                 quote: Optional[dict] = None,
                                  ) -> tuple[list[dict], list[dict]]:
         """组装"无检索材料"的回答对话：仅凭模型通用知识作答，并明确标注未核实。
 
@@ -689,6 +865,7 @@ class RAGEngine:
         author_str = ", ".join(authors[:3])
         if len(authors) > 3:
             author_str += " et al."
+        history_msgs = _normalize_history(history)
 
         if findings_note:
             no_material_clause = (
@@ -725,18 +902,39 @@ class RAGEngine:
             "4. Use Markdown structure (short headings, bullets, bold key terms) so "
             "the answer is easy to scan.\n"
             "5. Answer in the language of the question.\n"
+            "6. If you mention what retrieval did or did not cover this turn, "
+            "attribute it to YOUR OWN tool actions (\"no passages were retrieved "
+            "this turn\"), never to a static input the user supplied, and never "
+            "imply non-retrieved content is absent from the paper.\n"
         )
+        if history_msgs:
+            # 与 grounded 路径同一问题：无材料本轮也不能把历史里的阅读范围
+            # 自述当成本轮事实复读（"上一轮我只能读到§4"≠"现在依然如此"）。
+            system += (
+                "\n=== EARLIER TURNS: STALE SCOPE SELF-NARRATIONS ARE NOT FACTS ===\n"
+                "Earlier assistant turns may narrate what they could or could not "
+                "read in THAT turn (e.g. \"the text available to me covered only "
+                "the abstract and section 4\"). Those are stale process "
+                "self-descriptions tied to that turn's tool results, not facts "
+                "about the present turn: tool state resets every turn, and a "
+                "section missing from an earlier excerpt is not evidence the "
+                "paper lacks it. Do not repeat such a statement as a current "
+                "limitation; describe only THIS turn's actual situation "
+                "(no retrieved source blocks, plus the tool findings if any). "
+                "Semantic conclusions from earlier turns can still be inherited.\n"
+            )
         user = (
             f"Currently open paper: \"{title}\" ({year}) by {author_str}.\n"
             if title else "Currently open paper: not loaded.\n"
         )
+        user += format_quote_user_block(quote)
         user += "No retrieved source blocks are available for this turn.\n\n"
         if findings_note:
             user += findings_note
         user += f"Question: {question}"
 
         messages = [{"role": "system", "content": system}]
-        for h in _normalize_history(history):
+        for h in history_msgs:
             messages.append({"role": h["role"], "content": h["content"]})
         messages.append({"role": "user", "content": user})
         return [], messages
@@ -745,7 +943,8 @@ class RAGEngine:
                       paper: Optional[dict] = None,
                       history: Optional[list] = None,
                       grounded: bool = True,
-                      tool_findings: Optional[list[dict]] = None):
+                      tool_findings: Optional[list[dict]] = None,
+                      quote: Optional[dict] = None):
         """流式问答生成器（供 SSE 使用）。
 
         :param grounded: False 时允许 sources 为空（或全部不可切分），走通用
@@ -758,7 +957,7 @@ class RAGEngine:
         """
         sources_out, messages = self.prepare_answer(
             question, sources, paper, history,
-            grounded=grounded, tool_findings=tool_findings,
+            grounded=grounded, tool_findings=tool_findings, quote=quote,
         )
         yield {"type": "sources", "sources": sources_out}
         for delta in self.client.chat_stream(messages, temperature=0.2):

@@ -10,10 +10,10 @@
 """
 from __future__ import annotations
 
-from . import api, mindmap, pdf, rag, search, settings, workspace
+from . import api, mindmap, pdf, rag, search, settings, workspace, writing
 
 # 命名空间清单（新增命名空间时在此登记）
-_NAMESPACES = (api, settings, workspace, search, pdf, rag, mindmap)
+_NAMESPACES = (api, settings, workspace, search, pdf, rag, mindmap, writing)
 
 LANGUAGES: tuple[str, ...] = ("zh", "en")
 

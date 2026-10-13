@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 import storage.db as db
-import storage.workspace as ws
+from storage import library as lib
 from config import PDF_DIR
 from i18n import tr
 from providers import get_provider
@@ -131,13 +131,18 @@ def _resolve_doi(doi: str) -> tuple[str | None, str]:
 
 
 def local_pdf_bytes(paper_id: str) -> bytes | None:
-    """读取本地文献的 PDF 字节；文件缺失或非 PDF 返回 None。"""
+    """读取本地文献的 PDF 字节；文件缺失或非 PDF 返回 None。
+
+    文献存放于文献库（``storage.library``，data/libraries/<ws_id>/），
+    与写作工作区物理分离。
+    """
     split = split_local_id(paper_id)
     if not split:
         return None
     try:
-        data = ws.read_file(*split)
-    except ws.WorkspaceError:
+        data = lib.read_library_file(*split)
+    except Exception:
+        # SafeRootError（非法 id/文件不存在）统一按"文献缺失"处理
         return None
     return data if data.startswith(b"%PDF") else None
 

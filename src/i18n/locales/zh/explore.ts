@@ -60,5 +60,6 @@ export default {
     noAbstract: '（无摘要）',
     openInReader: '在阅读器打开',
     sourceLink: '来源',
+    fetchFailed: '无法加载该论文的信息',
   },
 } as const;

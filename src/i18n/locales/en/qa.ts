@@ -40,19 +40,19 @@ export default {
     writing: 'Writing focus: AI can read the current LaTeX document',
     explore: 'Explore focus: based on the context library and external search',
   },
-  quick: {
-    heading: 'Quick prompts:',
-    q1: 'Summarize the core contributions of the current paper',
-    q2: "How does this paper's method differ from existing work?",
-    q3: 'Rewrite the LaTeX passage above in a more academic style',
-    q4: 'Search for and list the latest related research',
-  },
   empty: {
     intro: 'One AI assistant for all three areas: ask about papers you read, literature you search, or LaTeX you write.',
   },
   input: {
     placeholder: 'One assistant for reading, search and writing...',
+    placeholderWithQuote: 'Ask about the selection, or just press Send to have it explained',
     stop: 'Stop generating',
+  },
+  quote: {
+    pageShort: 'p.{{page}}',
+    remove: 'Remove citation',
+    jumpHint: 'Jump to this passage in the PDF',
+    defaultExplain: 'Please explain the passage I selected',
   },
   toggle: {
     context: 'Context',

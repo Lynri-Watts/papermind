@@ -56,7 +56,7 @@ export default {
     /** Pre-check hint for the upload entry */
     needWorkspace: 'No workspace selected — create or enter a workspace on the Home page first',
     pick: 'Click to choose a local file',
-    supported: 'Supports PDF (opens for reading), .tex / .bib (writing), .txt / .md',
+    supported: 'PDF only (stored in this workspace\u2019s library and opened for reading)',
     uploading: 'Uploading...',
     failed: 'Upload failed',
     uploaded: 'Uploaded: {{path}}',

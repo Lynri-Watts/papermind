@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import { FileText, Plus, X, Loader2, Upload, FolderOpen, BookOpen, ExternalLink, Check, BookmarkPlus, BookmarkCheck, RefreshCw } from 'lucide-react';
-import { ensurePdfReady, getPdfUrl, getPaperById, createPaperContext, uploadWorkspaceFile } from '../api';
+import { ensurePdfReady, getPdfUrl, getPaperById, createPaperContext, uploadLibraryFile } from '../api';
 import { Paper, Note, ReaderTab } from '../types';
 import { usePaperMindStore } from '../store';
 import { addPaperContextItem } from '../lib/context';
-import PdfViewer, { PdfViewerHandle } from '../components/PdfViewer';
+import PdfViewer, { type PdfViewerHandle, type SelectionQuotePayload } from '../components/PdfViewer';
 
 /** 阅读器标签页的本地状态（含 PDF 加载状态；store 只持久化 paperId+title） */
 interface ReaderTabState {
@@ -46,7 +46,7 @@ const LOCATE_VIEWER_WAIT_MS = 15000;
 /**
  * 纯阅读器：多标签 PDF 阅读 + 选中文本（高亮/笔记/存摘录/提问）。
  * 问答已上移到全局 QAPanel（src/components/QAPanel.tsx），
- * 本组件只负责：监听 pdfLocateRequest 定位原文、把 onAsk 转发为 qaInputDraft。
+ * 本组件只负责：监听 pdfLocateRequest 定位原文、把 onAsk 组装为 qaQuoteDraft（引用芯片草稿）。
  */
 const DeepResearch: React.FC = () => {
   const { t } = useTranslation('research');
@@ -64,8 +64,7 @@ const DeepResearch: React.FC = () => {
     openReaderTab: openReaderTabStore,
     closeReaderTab: closeReaderTabStore,
     setReaderTabPdfState: setReaderTabPdfStateStore,
-    setQaInputDraft,
-    setQaPanelOpen,
+    setQaQuoteDraft,
     pdfLocateRequest,
     activeWorkspaceId,
   } = usePaperMindStore();
@@ -244,7 +243,7 @@ const DeepResearch: React.FC = () => {
   }, []);
 
   // 论文搜索防抖（已移除：搜索整合到 Explore；本阅读器通过本地文件上传打开文献）
-  // 上传本地文件到当前工作区：PDF 自动注册为本地文献并打开阅读
+  // 上传本地 PDF 到当前工作区的独立文献库：自动注册为本地文献并打开阅读
   const handleUpload = useCallback((file: File) => {
     if (!activeWorkspaceId) {
       setUploadError(t('upload.needWorkspace'));
@@ -252,11 +251,11 @@ const DeepResearch: React.FC = () => {
     }
     setUploading(true);
     setUploadError(null);
-    uploadWorkspaceFile(activeWorkspaceId, file)
+    uploadLibraryFile(activeWorkspaceId, file)
       .then((info) => {
         showNotification(t('upload.uploaded', { path: info.path }), 'success');
         if (info.paper_id) {
-          // PDF：注册为本地文献并直接打开阅读
+          // 注册为本地文献并直接打开阅读
           openTabByMeta(info.paper_id, file.name.replace(/\.pdf$/i, ''));
         }
         setUploadOpen(false);
@@ -341,14 +340,23 @@ const DeepResearch: React.FC = () => {
     }
   };
 
-  const handleAskFromSelection = (text: string) => {
+  const handleAskFromSelection = (payload: SelectionQuotePayload) => {
     if (!currentPaper) {
       showNotification(t('notice.selectPaperFirst'), 'error');
       return;
     }
-    // 转发给全局 QAPanel：填入输入框并自动提问
-    setQaInputDraft(text);
-    setQaPanelOpen(true);
+    // 组装完整引用语境交给全局 QAPanel：挂引用芯片、聚焦输入框，
+    // 用户补充问题后发送（留空发送=讲解该段），由 QAPanel 自行打开面板
+    setQaQuoteDraft({
+      paperId: currentPaper.id,
+      title: currentPaper.title,
+      authors: currentPaper.authors,
+      year: currentPaper.year,
+      page: payload.page,
+      text: payload.text,
+      before: payload.before,
+      after: payload.after,
+    });
   };
 
   return (
@@ -595,7 +603,7 @@ const DeepResearch: React.FC = () => {
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept=".pdf,.tex,.bib,.txt,.md"
+                    accept="application/pdf,.pdf"
                     className="hidden"
                     onChange={(e) => {
                       const f = e.target.files?.[0];

@@ -61,5 +61,6 @@ export default {
     noAbstract: '(No abstract)',
     openInReader: 'Open in Reader',
     sourceLink: 'Source',
+    fetchFailed: 'Could not load this paper’s information',
   },
 } as const;

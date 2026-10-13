@@ -6,6 +6,7 @@ import { ZoomIn, ZoomOut, Maximize, Loader2, FileText, RotateCw, PenLine, Boxes,
 import { Highlight } from '../types';
 import { locateInDocument, normalizeText, normOffsetToRunRange, PageRun } from '../utils/pdfLocate';
 import { usePaperMindStore } from '../store';
+import { loadReadingProgress, saveReadingProgress, type ReadingAnchor } from '../lib/readingProgress';
 
 /**
  * scale/rotation 变化导致整列表拆毁重建前的滚动锚点。
@@ -47,8 +48,35 @@ interface PdfViewerProps {
   onNote?: (text: string) => void;
   /** 选中文本后回调：加入上下文库 */
   onContext?: (text: string) => void;
-  /** 选中文本后回调：对该段提问 */
-  onAsk?: (text: string) => void;
+  /** 选中文本后回调：对该段提问（携带页码与片段前后文，供组装引用语境） */
+  onAsk?: (quote: SelectionQuotePayload) => void;
+  /**
+   * 双击页面回调（写作模式反向定位 SyncTeX inverse search）。
+   * 坐标已换算为 PDF point（72dpi，页面【左上角】原点，与 synctex 约定一致，
+   * 旋转也已校正）；仅在传入此回调时启用双击监听。
+   */
+  onInverseLocate?: (loc: InverseLocatePoint) => void;
+}
+
+/** 双击 PDF 时回传的页码与 PDF 点坐标（左上角原点） */
+export interface InverseLocatePoint {
+  /** 1 基页码 */
+  page: number;
+  /** PDF point（72dpi） */
+  x: number;
+  y: number;
+}
+
+/** 阅读器框选提问时回传上层的片段信息（论文题录由上层补全） */
+export interface SelectionQuotePayload {
+  /** 框选原文（空白已折叠） */
+  text: string;
+  /** 所在页码（1 基；无法确定时 null） */
+  page: number | null;
+  /** 片段所在页的前文截选（句界截断，可能缺失） */
+  before?: string;
+  /** 片段所在页的后文截选（句界截断，可能缺失） */
+  after?: string;
 }
 
 interface FloatMenu {
@@ -164,6 +192,7 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
   onNote,
   onContext,
   onAsk,
+  onInverseLocate,
 }, ref) {
   const { t } = useTranslation('pdf');
   const outerRef = useRef<HTMLDivElement>(null);
@@ -207,6 +236,11 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
 
   // 重建（scale/rotation 变化）前后的滚动位置锚点，见 ScrollAnchor 说明
   const scrollAnchorRef = useRef<ScrollAnchor | null>(null);
+  // 本次打开文档待恢复的、跨会话持久化的阅读进度（占位 wrapper 全部建成后应用一次）
+  const savedProgressRef = useRef<ReadingAnchor | null>(null);
+  // rotation state 的镜像：滚动监听等脱离渲染闭包的场合读取当前旋转角
+  const rotationRef = useRef(rotation);
+  useEffect(() => { rotationRef.current = rotation; }, [rotation]);
   // AI 面板分隔条拖拽中：只更新容器宽度基准，fit-width 重排延迟到松手后一次应用，
   // 避免拖拽途中逐像素拆毁重建（卡顿 + 滚动位置反复跳动）
   const qaPanelResizing = usePaperMindStore((s) => s.qaPanelResizing);
@@ -224,11 +258,39 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     setScale((prev) => (Math.abs(prev - next) < 1e-6 ? prev : next));
   }, []);
 
+  /**
+   * 从当前 DOM 几何捕获滚动位置锚点（重建还原与阅读进度持久化共用）。
+   * 注意：页面列表拆毁（pageWrapRefs 被清空）期间调用会返回 null，
+   * 调用方据此跳过，避免把"塌陷后的顶部"误存为阅读进度。
+   */
+  const captureAnchorFromDom = useCallback((rot: number): ReadingAnchor | null => {
+    const el = scrollRef.current;
+    if (!el || pageWrapRefs.current.size === 0) return null;
+    const scrollable = el.scrollHeight - el.clientHeight;
+    const globalRatio = scrollable > 0 ? el.scrollTop / scrollable : 0;
+    let page = 0;
+    let ratioInPage = 0;
+    // pageWrapRefs 按页码升序插入：取第一个底边越过视口顶部的页
+    for (const [p, wrap] of pageWrapRefs.current) {
+      if (wrap.offsetTop + wrap.offsetHeight > el.scrollTop + 1) {
+        page = p;
+        ratioInPage = wrap.offsetHeight > 0
+          ? Math.min(1, Math.max(0, (el.scrollTop - wrap.offsetTop) / wrap.offsetHeight))
+          : 0;
+        break;
+      }
+    }
+    if (page === 0) return null;
+    return { page, ratioInPage, globalRatio, rotation: rot };
+  }, []);
+
   // 加载 PDF 文档
   useEffect(() => {
     let cancelled = false;
-    // 换文档：旧文档的滚动锚点失效（页码/几何不再对应），新文档从顶部开始
+    // 换文档：旧文档的重建锚点失效（页码/几何不再对应）
     scrollAnchorRef.current = null;
+    // 读取该论文跨会话保留的阅读进度（占位 wrapper 建成后应用，见渲染 effect）
+    savedProgressRef.current = paperId ? loadReadingProgress(paperId) : null;
     setLoading(true);
     setError(null);
     setDoc(null);
@@ -265,7 +327,7 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
       pageWrapRefs.current.clear();
       setRenderedCount(0);
     };
-  }, [url]);
+  }, [url, paperId]);
 
   // 监听滚动容器宽度（fit-width 基准）
   useEffect(() => {
@@ -316,44 +378,51 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
 
     // 拆毁前捕获滚动锚点（必须在 cleanup() 清空 DOM 之前）：
     // scale/rotation 变化会走 cleanup→重建，期间 scrollHeight 塌陷使浏览器
-    // 钳住 scrollTop，需记录视口顶部所在页及页内纵向比例，重建后按新几何还原
+    // 钳住 scrollTop，需记录视口顶部所在页及页内纵向比例，重建后按新几何还原。
+    // 这里是组件卸载（切标签/关标签）前的最后一个几何有效时机，同时持久化阅读进度。
     const captureScrollAnchor = () => {
-      const el = scrollRef.current;
-      if (!el) return;
-      const scrollable = el.scrollHeight - el.clientHeight;
-      const globalRatio = scrollable > 0 ? el.scrollTop / scrollable : 0;
-      let page = 0;
-      let ratioInPage = 0;
-      // pageWrapRefs 按页码升序插入：取第一个底边越过视口顶部的页
-      for (const [p, wrap] of pageWrapRefs.current) {
-        if (wrap.offsetTop + wrap.offsetHeight > el.scrollTop + 1) {
-          page = p;
-          ratioInPage = wrap.offsetHeight > 0
-            ? Math.min(1, Math.max(0, (el.scrollTop - wrap.offsetTop) / wrap.offsetHeight))
-            : 0;
-          break;
-        }
-      }
-      scrollAnchorRef.current = { page, ratioInPage, globalRatio, rotation, doc };
+      const geom = captureAnchorFromDom(rotation);
+      if (!geom) return;
+      scrollAnchorRef.current = { ...geom, doc };
+      if (paperId) saveReadingProgress(paperId, geom);
     };
 
-    // 全部 wrapper 按新几何重建后还原滚动位置
-    const restoreScrollAnchor = () => {
+    // 全部 wrapper 按新几何重建后还原滚动位置。
+    // 优先级：本次重建前捕获的锚点（同文档，几何精确对应）> 跨会话持久化的阅读进度。
+    // 返回还原后视口顶部所在页，供首屏优先渲染该页（惰性渲染下其余页交给观察器）。
+    const restoreScrollAnchor = (): number => {
       const el = scrollRef.current;
-      const anchor = scrollAnchorRef.current;
+      if (!el) return 1;
+      const rebuild = scrollAnchorRef.current;
       scrollAnchorRef.current = null;
-      if (!el || !anchor || anchor.doc !== doc) return;
-      // 同文档且未旋转：页内比例可随缩放线性映射，位置精确
+      let anchor: ReadingAnchor | null = null;
+      if (rebuild && rebuild.doc === doc) {
+        anchor = {
+          page: rebuild.page,
+          ratioInPage: rebuild.ratioInPage,
+          globalRatio: rebuild.globalRatio,
+          rotation: rebuild.rotation,
+        };
+      } else if (savedProgressRef.current) {
+        anchor = savedProgressRef.current;
+      }
+      savedProgressRef.current = null;
+      if (!anchor) return 1;
+      // 未旋转：页内比例可随缩放线性映射，位置精确（跨会话不同窗口宽度同样适用）
       if (anchor.rotation === rotation && anchor.page > 0) {
         const wrap = pageWrapRefs.current.get(anchor.page);
         if (wrap && wrap.offsetHeight > 0) {
           el.scrollTop = Math.round(wrap.offsetTop + anchor.ratioInPage * wrap.offsetHeight);
-          return;
+          return anchor.page;
         }
       }
       // 旋转后页内几何不再对应：用全局滚动比例近似还原
       const scrollable = el.scrollHeight - el.clientHeight;
       el.scrollTop = Math.round(Math.max(0, scrollable) * anchor.globalRatio);
+      for (const [p, wrap] of pageWrapRefs.current) {
+        if (wrap.offsetTop + wrap.offsetHeight > el.scrollTop + 1) return p;
+      }
+      return Math.max(1, Math.min(doc.numPages, anchor.page));
     };
 
     // 渲染单页：canvas 渲染与 getTextContent 并行，完成后建 TextLayer 并应用高亮
@@ -537,11 +606,12 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
       // 3) 预建全部占位 wrapper（高度固定 → 滚动条稳定），观察器接管后续惰性渲染
       for (let p = 1; p <= doc.numPages; p++) buildWrap(p);
 
-      // 3.5) 全部占位已就位、列表总高度已确定：还原缩放/旋转前的阅读位置
-      restoreScrollAnchor();
+      // 3.5) 全部占位已就位、列表总高度已确定：还原缩放/旋转前的阅读位置，
+      //      新打开的文档则恢复跨会话保留的阅读进度；返回视口顶部所在页
+      const firstPaintPage = restoreScrollAnchor();
 
-      // 4) 首屏立即渲染第 1 页（其余由观察器随滚动渲染）
-      void renderPage(1);
+      // 4) 首屏立即渲染当前视口页（其余由观察器随滚动渲染）
+      void renderPage(firstPaintPage);
     };
 
     setup();
@@ -556,6 +626,40 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doc, scale, rotation]);
+
+  // 阅读进度实时持久化（与几何重建 effect 解耦）：
+  // - 滚动停止 500ms 后落盘，覆盖「刷新/直接关页面时 React 卸载清理不一定执行」
+  // - 页面隐藏（切后台/关标签触发 pagehide 前的 visibilitychange）立即落盘
+  // - pagehide / 卸载时再 flush 兜底；若页面列表已被前一个 effect 的 cleanup
+  //   清空，captureAnchorFromDom 返回 null，不会用塌陷后的顶部覆盖正确进度
+  useEffect(() => {
+    if (!doc || !paperId) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    let timer: number | undefined;
+    const flush = () => {
+      if (timer !== undefined) { window.clearTimeout(timer); timer = undefined; }
+      const geom = captureAnchorFromDom(rotationRef.current);
+      if (geom) saveReadingProgress(paperId, geom);
+    };
+    const onScroll = () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(flush, 500);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', flush);
+    return () => {
+      flush();
+      if (timer !== undefined) window.clearTimeout(timer);
+      el.removeEventListener('scroll', onScroll);
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', flush);
+    };
+  }, [doc, paperId, captureAnchorFromDom]);
 
   // 高亮变化时：无需重建页面，直接对已渲染的各页重新应用高亮（含新增/删除）
   useEffect(() => {
@@ -648,6 +752,9 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
 
   // 选中文本：显示操作条
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
+    // 写作模式（只传了 onInverseLocate）没有任何选区动作，不弹操作条，
+    // 但浏览器原生文本选择/复制仍然可用。
+    if (!onAddHighlight && !onNote && !onContext && !onAsk) return;
     setTimeout(() => {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
@@ -678,7 +785,38 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
       const bottom = rect.bottom - outerRect.top;
       setFloatMenu({ x, top, bottom, text });
     }, 10);
-  }, [resolvePageFromNode]);
+  }, [resolvePageFromNode, onAddHighlight, onNote, onContext, onAsk]);
+
+  /**
+   * 双击页面 → 反向定位源码（SyncTeX inverse search）。
+   *
+   * 坐标换算链：
+   * 1) 事件 client 坐标 − 页 wrapper 边界 = 渲染 scale 下的 CSS 像素；
+   * 2) 除以 displayScale 得「含旋转、scale=1」viewport 坐标（左上角原点）；
+   * 3) viewport.convertToPdfPoint 得 PDF 原生坐标（未旋转、左下角原点）；
+   * 4) synctex 要求左上角原点，用未旋转页高反相 y。
+   * 全程使用 pdf.js 官方 API，旋转 90/270 度同样正确。
+   */
+  const handleDoubleClick = useCallback((e: React.MouseEvent) => {
+    if (!onInverseLocate) return;
+    const wrap = resolvePageFromNode(e.target as Node);
+    if (!wrap) return;
+    const pageNum = Number(wrap.dataset.page);
+    const page = pagesRef.current.get(pageNum);
+    if (!page) return;
+    const displayScale = scale || fitScaleRef.current;
+    const rect = wrap.getBoundingClientRect();
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+    if (cssX < 0 || cssY < 0 || cssX > rect.width || cssY > rect.height) return;
+    const rotatedViewport = page.getViewport({ scale: 1, rotation });
+    const [pdfX, pdfYFromBottom] = rotatedViewport.convertToPdfPoint(
+      cssX / displayScale,
+      cssY / displayScale,
+    );
+    const uprightHeight = page.getViewport({ scale: 1, rotation: 0 }).height;
+    onInverseLocate({ page: pageNum, x: pdfX, y: uprightHeight - pdfYFromBottom });
+  }, [onInverseLocate, resolvePageFromNode, scale, rotation]);
 
   // 操作条位置校准（多页滚动时同样适用：菜单定位在 outer 坐标系）
   useLayoutEffect(() => {
@@ -751,13 +889,73 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
     window.getSelection()?.removeAllRanges();
   }, [computeSelectionOffsets, onContext]);
 
+  /**
+   * 从当前选区构造框选提问载荷：文本 + 页码 + 本页前后文。
+   *
+   * 页文本按 pdf.js runs 拼接，并在 hasEOL run 后补空格——与 pdfLocate
+   * （extractFullText/normOffsetToRunRange）同一规则：浏览器对跨行选区的
+   * toString() 产生 '\n'，经空白折叠后正好对应补上的空格，跨行选择才能匹配。
+   * 全部数据来自本页已渲染的 pageRunsRef，无需额外解析请求。
+   */
+  const buildAskPayloadFromSelection = useCallback((): SelectionQuotePayload | null => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+    const range = sel.getRangeAt(0);
+    const wrap = resolvePageFromNode(range.commonAncestorContainer);
+    const selectedText = normalizeText(sel.toString());
+    if (!selectedText) return null;
+
+    let page: number | null = null;
+    let before: string | undefined;
+    let after: string | undefined;
+    if (wrap) {
+      const p = Number(wrap.dataset.page);
+      const runs = pageRunsRef.current.get(p);
+      if (runs) {
+        // 与 normOffsetToRunRange 的页文本重建规则一致：hasEOL 处补空格
+        const pageNorm = normalizeText(
+          runs.map((r) => (r.hasEOL ? `${r.str} ` : r.str)).join(''),
+        );
+        const idx = pageNorm.indexOf(selectedText);
+        if (idx !== -1) {
+          page = p;
+          const end = idx + selectedText.length;
+          const WINDOW = 300;
+          if (idx > 0) {
+            const rawBefore = pageNorm.slice(Math.max(0, idx - WINDOW), idx);
+            // 尽量从一个完整句子开头展示：取窗口内首个句末标点之后
+            const m = rawBefore.match(/[。！？.!?\n][^。！？.!?\n]*$/);
+            before = (m && m.index !== undefined && idx > WINDOW
+              ? `…${rawBefore.slice(m.index + 1).trimStart()}`
+              : rawBefore.trimStart());
+          }
+          if (end < pageNorm.length) {
+            const rawAfter = pageNorm.slice(end, end + WINDOW);
+            const m = rawAfter.match(/[。！？.!?\n]/);
+            after = (m && m.index !== undefined
+              ? rawAfter.slice(0, m.index + 1)
+              : `${rawAfter.trimEnd()}…`);
+          }
+        }
+      }
+      // 文本匹配失败（罕见的跨页选区等）：页码仍可从选区节点确定
+      if (page === null) page = p;
+    }
+    return { text: selectedText, page, before, after };
+  }, [resolvePageFromNode]);
+
   const handleAsk = useCallback(() => {
-    const info = computeSelectionOffsets();
-    if (!info) return;
-    onAsk?.(info.text);
+    // 优先用当前选区构造完整载荷（含页码/前后文）；选区已被清空的极端情况
+    // 退化为菜单弹出时保存的纯文本（无来源语境也应能提问）。
+    const payload = buildAskPayloadFromSelection();
+    if (payload) {
+      onAsk?.(payload);
+    } else if (floatMenu?.text) {
+      onAsk?.({ text: floatMenu.text, page: null });
+    }
     setFloatMenu(null);
     window.getSelection()?.removeAllRanges();
-  }, [computeSelectionOffsets, onAsk]);
+  }, [onAsk, floatMenu, buildAskPayloadFromSelection]);
 
   const zoomIn = useCallback(() => {
     userZoomRef.current = true;
@@ -932,6 +1130,7 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
         ref={scrollRef}
         className="flex-1 overflow-auto bg-background/50 relative"
         onMouseUp={handleMouseUp}
+        onDoubleClick={handleDoubleClick}
       >
         <div
           ref={listRef}
@@ -953,38 +1152,46 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
           style={{ left: floatMenu.x, top: floatMenu.bottom + 6 }}
           onMouseDown={(e) => e.preventDefault()}
         >
-          <div className="flex items-center gap-1 pr-1 border-r border-border">
-            {HIGHLIGHT_COLORS.map(color => (
-              <button
-                key={color}
-                onClick={() => handleHighlight(color)}
-                className="w-5 h-5 rounded-md transition-transform hover:scale-110"
-                style={{ backgroundColor: color }}
-                title={t('selection.highlight')}
-              />
-            ))}
-          </div>
-          <button
-            onClick={handleNote}
-            className="p-1.5 rounded-lg hover:bg-background text-textSecondary hover:text-primary transition-colors"
-            title={t('selection.note')}
-          >
-            <PenLine className="w-4 h-4" />
-          </button>
-          <button
-            onClick={handleContext}
-            className="p-1.5 rounded-lg hover:bg-background text-textSecondary hover:text-primary transition-colors"
-            title={t('selection.addToContext')}
-          >
-            <Boxes className="w-4 h-4" />
-          </button>
-          <button
-            onClick={handleAsk}
-            className="p-1.5 rounded-lg hover:bg-background text-textSecondary hover:text-primary transition-colors"
-            title={t('selection.askAbout')}
-          >
-            <MessageCircleQuestion className="w-4 h-4" />
-          </button>
+          {onAddHighlight && (
+            <div className="flex items-center gap-1 pr-1 border-r border-border">
+              {HIGHLIGHT_COLORS.map(color => (
+                <button
+                  key={color}
+                  onClick={() => handleHighlight(color)}
+                  className="w-5 h-5 rounded-md transition-transform hover:scale-110"
+                  style={{ backgroundColor: color }}
+                  title={t('selection.highlight')}
+                />
+              ))}
+            </div>
+          )}
+          {onNote && (
+            <button
+              onClick={handleNote}
+              className="p-1.5 rounded-lg hover:bg-background text-textSecondary hover:text-primary transition-colors"
+              title={t('selection.note')}
+            >
+              <PenLine className="w-4 h-4" />
+            </button>
+          )}
+          {onContext && (
+            <button
+              onClick={handleContext}
+              className="p-1.5 rounded-lg hover:bg-background text-textSecondary hover:text-primary transition-colors"
+              title={t('selection.addToContext')}
+            >
+              <Boxes className="w-4 h-4" />
+            </button>
+          )}
+          {onAsk && (
+            <button
+              onClick={handleAsk}
+              className="p-1.5 rounded-lg hover:bg-background text-textSecondary hover:text-primary transition-colors"
+              title={t('selection.askAbout')}
+            >
+              <MessageCircleQuestion className="w-4 h-4" />
+            </button>
+          )}
         </div>
       )}
     </div>

@@ -1,12 +1,11 @@
-"""工作区安全文件操作层。
+"""写作工作区安全文件操作层。
 
-工作区是服务器端受控目录（``config.WORKSPACES_ROOT/<id>/``），用于存放
-用户上传的文件与正在写作的文件（如 LaTeX 源码）。为在线部署做准备，所有
-对工作区目录的读写都必须经过本层：
+工作区是服务器端受控目录（``config.WORKSPACES_ROOT/<id>/``），只存放写作
+文件（LaTeX 源码、bib、图片素材等）。阅读侧上传的文献 PDF 已物理分离到
+文献库（见 :mod:`storage.library`，``config.LIBRARIES_ROOT/<id>/``）。
 
-- 路径严格校验：拒绝绝对路径、``..`` 穿越、非法字符，确保访问范围不超出
-  对应工作区目录；
-- 工作区元数据（id/name/description）存 ``workspaces`` 表，文件存磁盘。
+本模块的路径校验/文件操作由公共层 :class:`storage.saferoot.SafeRoot` 提供，
+这里保留面向写作业务的函数签名，并负责 workspaces 表的 DB 联动。
 
 设计约束：
 - ws_id 由后端生成（uuid 短格式），不信任用户输入；
@@ -14,24 +13,17 @@
 """
 from __future__ import annotations
 
-import re
-import shutil
 import uuid
-from pathlib import Path
 
 import storage.db as db
 from config import WORKSPACES_ROOT
 from i18n import tr
+from storage.saferoot import SafeRoot, SafeRootError, check_ws_id
 
-# 允许作为文件/目录名的字符（含中文等非 ASCII）：仅禁止路径分隔、穿越与保留名
-_ILLEGAL_WS = re.compile(r"[^A-Za-z0-9_-]")
-# 禁止分隔符、穿越、控制字符与 ':'（':' 用于 local:ws:path 文献 id 解析）
-_ILLEGAL_SEGMENT = re.compile(r"[\\/]|^\.\.$|^\.$|[\x00-\x1f]|:")
-_WS_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# 兼容历史导入：业务层普遍 catch ws.WorkspaceError（即 SafeRootError）
+WorkspaceError = SafeRootError
 
-
-class WorkspaceError(Exception):
-    """工作区操作错误（携带用户可读消息）。"""
+_ROOT = SafeRoot(WORKSPACES_ROOT)
 
 
 def _new_ws_id() -> str:
@@ -39,52 +31,23 @@ def _new_ws_id() -> str:
 
 
 def _check_ws_id(ws_id: str) -> str:
-    if not _WS_ID_PATTERN.match(ws_id):
-        raise WorkspaceError(tr("workspace.invalid_id"))
-    return ws_id
+    return check_ws_id(ws_id)
 
 
-def _check_segment(seg: str) -> str:
-    """校验单段文件名/目录名，禁止分隔符、穿越与空名。"""
-    if not seg or _ILLEGAL_SEGMENT.search(seg) or seg in (".", ".."):
-        raise WorkspaceError(tr("workspace.invalid_segment", segment=repr(seg)))
-    if len(seg) > 255:
-        raise WorkspaceError(tr("workspace.segment_too_long"))
-    return seg
-
-
-def resolve(ws_id: str, rel_path: str = "") -> Path:
-    """把相对路径解析为工作区内的绝对路径，严格校验不越界。
-
-    rel_path 为空时返回工作区根目录。路径统一用 POSIX 风格传入。
-    """
-    ws_id = _check_ws_id(ws_id)
-    root = WORKSPACES_ROOT / ws_id
-    root_resolved = root.resolve()
-    if not rel_path:
-        return root_resolved
-    # 规范化：按 / 分段、丢弃空段（容错 // 与结尾 /）
-    parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
-    if not parts:
-        return root_resolved
-    for seg in parts:
-        _check_segment(seg)
-    target = root.joinpath(*parts)
-    target_resolved = target.resolve()
-    if target_resolved != root_resolved and root_resolved not in target_resolved.parents:
-        raise WorkspaceError(tr("workspace.path_escape"))
-    return target_resolved
+def resolve(ws_id: str, rel_path: str = ""):
+    return _ROOT.resolve(ws_id, rel_path)
 
 
 def create_workspace(name: str, description: str = "") -> dict:
-    """创建工作区（磁盘目录 + DB 元数据），返回工作区对象。"""
+    """创建工作区（DB 元数据 + 磁盘目录），返回工作区对象。"""
     ws_id = _new_ws_id()
-    root = WORKSPACES_ROOT / ws_id
-    try:
-        root.mkdir(parents=True, exist_ok=False)
-    except FileExistsError:
-        raise WorkspaceError(tr("workspace.create_conflict")) from None
     db.create_workspace(ws_id, name, description)
+    try:
+        _ROOT.create_container(ws_id)
+    except Exception:
+        # DB 行先建后补磁盘：磁盘失败时回滚 DB，避免元数据孤儿
+        db.delete_workspace(ws_id)
+        raise
     return get_workspace(ws_id)
 
 
@@ -109,82 +72,42 @@ def update_workspace(ws_id: str, *, name: str | None = None,
 
 
 def delete_workspace(ws_id: str) -> None:
-    """删除工作区：先删磁盘目录，再删 DB 行（目录删除失败则抛出异常）。"""
+    """删除工作区：先删磁盘目录（写作目录 + 文献库目录），再删 DB 行。"""
     _check_ws_id(ws_id)
-    root = resolve(ws_id)
-    if root.exists():
-        shutil.rmtree(root)
+    # 文献库与工作区同生命周期：一并物理删除（DB 行由 db.delete_workspace 级联）
+    from storage import library as _library
+    _library.remove_library(ws_id)
+    _ROOT.remove_container(ws_id)
     db.delete_workspace(ws_id)
 
 
 def list_files(ws_id: str) -> list[dict]:
-    """递归列出工作区文件，返回相对路径、大小、修改时间。"""
-    root = resolve(ws_id)
-    if not root.exists():
-        return []
-    result: list[dict] = []
-    for p in sorted(root.rglob("*")):
-        if p.is_file():
-            rel = p.relative_to(root).as_posix()
-            st = p.stat()
-            result.append({
-                "path": rel,
-                "size": st.st_size,
-                "mtime": int(st.st_mtime),
-            })
-    return result
+    return _ROOT.list_files(ws_id)
 
 
 def write_file(ws_id: str, rel_path: str, data: bytes) -> dict:
-    """写入（或覆盖）文件，自动创建父目录。返回文件信息。"""
-    target = resolve(ws_id, rel_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(target)  # 原子替换，避免写一半
-    st = target.stat()
-    return {
-        "path": rel_path.replace("\\", "/"),
-        "size": st.st_size,
-        "mtime": int(st.st_mtime),
-    }
+    return _ROOT.write_file(ws_id, rel_path, data)
 
 
 def read_file(ws_id: str, rel_path: str) -> bytes:
-    target = resolve(ws_id, rel_path)
-    if not target.is_file():
-        raise WorkspaceError(tr("workspace.file_not_found", rel_path=rel_path))
-    return target.read_bytes()
+    return _ROOT.read_file(ws_id, rel_path)
 
 
 def read_text(ws_id: str, rel_path: str) -> str:
-    return read_file(ws_id, rel_path).decode("utf-8", errors="replace")
+    return _ROOT.read_text(ws_id, rel_path)
 
 
 def write_text(ws_id: str, rel_path: str, text: str) -> dict:
-    return write_file(ws_id, rel_path, text.encode("utf-8"))
+    return _ROOT.write_text(ws_id, rel_path, text)
 
 
 def delete_file(ws_id: str, rel_path: str) -> None:
-    target = resolve(ws_id, rel_path)
-    if target.is_file():
-        target.unlink()
-    else:
-        raise WorkspaceError(tr("workspace.file_not_found", rel_path=rel_path))
+    _ROOT.delete_file(ws_id, rel_path)
 
 
 def exists(ws_id: str, rel_path: str) -> bool:
-    return resolve(ws_id, rel_path).is_file()
+    return _ROOT.exists(ws_id, rel_path)
 
 
 def unique_path(ws_id: str, rel_path: str) -> str:
-    """若目标文件已存在，生成 ``name (n).ext`` 形式的新路径，避免覆盖。"""
-    target = resolve(ws_id, rel_path)
-    if not target.exists():
-        return rel_path
-    stem, suffix = target.stem, target.suffix
-    for n in range(2, 1000):
-        candidate = f"{stem} ({n}){suffix}"
-        if not resolve(ws_id, candidate).exists():
-            return candidate
-    raise WorkspaceError(tr("workspace.unique_name_failed"))
+    return _ROOT.unique_path(ws_id, rel_path)

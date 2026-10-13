@@ -40,10 +40,36 @@ export interface SearchResponse {
   sources?: SearchSourceStatus[];
 }
 
+/**
+ * 用户在 PDF 阅读器中框选原文后发起提问时携带的「引用片段」语境。
+ * 让模型明确知道用户做了什么操作、片段出自哪篇论文哪一页，而不是把原文误当成问题。
+ */
+export interface QuoteContext {
+  /** 片段所属论文内部 id（source:external_id / local:工作区:路径） */
+  paperId: string;
+  /** 论文标题（展示与模型语境用） */
+  title: string;
+  authors?: string[];
+  year?: number | null;
+  /** 片段所在页码（1 基；无法确定时为 null） */
+  page?: number | null;
+  /** 用户框选的原文（已折叠空白） */
+  text: string;
+  /** 片段前文（论文原文截取，可能缺失） */
+  before?: string;
+  /** 片段后文（论文原文截取，可能缺失） */
+  after?: string;
+}
+
+/** history 中携带的精简引用语境（只保留定位与辨识信息，不含前后文，控制体积） */
+export type HistoryQuote = Pick<QuoteContext, 'paperId' | 'title' | 'page' | 'text'>;
+
 export interface RagQueryRequest {
   /** 当前论文内部 id；为空表示无论文（如写作/通用问答，仅基于上下文库/文档/检索作答） */
   paperId?: string;
   query: string;
+  /** 阅读器框选提问：用户选中的原文片段及来源语境（自动附带前后文） */
+  quote?: QuoteContext;
   /** 是否启用 context 库（默认 true） */
   useContext?: boolean;
   /** 是否允许 AI 请求调用工具补充文献（默认 true） */
@@ -52,9 +78,11 @@ export interface RagQueryRequest {
   contextIds?: number[];
   /** 用户排除的 context item id（可选） */
   excludeIds?: number[];
-  /** 精简对话历史（仅 user/assistant 文字，不含全文与出处详情），用于追问上下文 */
-  history?: { role: 'user' | 'assistant'; content: string }[];
-  /** 当前正在编辑的文档（LaTeX，写作场景）：仅作 read_document 工具的读取资源，不随提问注入 */
+  /** 精简对话历史（仅 user/assistant 文字，不含全文与出处详情），用于追问上下文；
+   *  user 轮可带 quote 标注该轮问题针对的是哪个引用片段 */
+  history?: { role: 'user' | 'assistant'; content: string; quote?: HistoryQuote }[];
+  /** 当前正在编辑的文档（LaTeX 快照，写作场景）：仅用于系统提示判断焦点，
+   *  AI 读稿一律走 read_file 直接读盘（发送前写作侧会先把缓冲区全部落盘） */
   document?: string;
   /** 当前活跃工作区 id；后端据此只检索该工作区的上下文库（缺省=全局库） */
   workspaceId?: string;
@@ -163,6 +191,8 @@ export interface ChatMessage {
   content: string;
   role: 'user' | 'assistant';
   timestamp: string;
+  /** 用户消息：该轮提问针对的阅读器选中片段（气泡上展示来源芯片，多轮历史带给模型） */
+  quote?: QuoteContext;
   // RAG 回答附带出处（供前端渲染）
   sources?: string[];
   sourceDetails?: RagSource[];
@@ -175,6 +205,8 @@ export interface ChatMessage {
   toolLog?: ToolCallLog[];
   // ---- 本次回答中 AI 对思维导图的编辑（一问一事务，可整事务撤销） ----
   mindmapEdits?: ChatMindmapEdit[];
+  // ---- 本次回答中 AI 对写作工作区文件的编辑（一问一事务，可整事务回滚） ----
+  writingEdit?: ChatWritingEdit;
   /** 非阻断提示（如本次无可用文献材料、回答未引用来源）；随消息持久化 */
   notice?: string;
 }
@@ -330,10 +362,15 @@ export interface SettingsLLM {
   api_key_hint: string;
 }
 
+/** 问答正文读取粒度偏好（后端 settings_store.reading_scope） */
+export type ReadingScope = 'auto' | 'full' | 'passages';
+
 export interface SettingsSnapshot {
   llm: SettingsLLM;
   /** 启用者按优先级在前，禁用者随后 */
   sources: SettingsSource[];
+  /** AI 问答读取论文/上下文正文的粒度偏好 */
+  reading_scope: ReadingScope;
 }
 
 /** PUT /api/settings 请求体：字段出现即更新（credentials 传空串表示清除） */
@@ -343,6 +380,8 @@ export interface SettingsUpdate {
   credentials?: Record<string, string>;
   /** 启用的数据源有序列表（顺序即聚合优先级）；至少一个 */
   source_order?: string[];
+  /** 问答正文读取粒度偏好 */
+  reading_scope?: ReadingScope;
 }
 
 /** 连通性测试结果（失败属被测对象结果，接口仍 HTTP 200） */
@@ -370,7 +409,7 @@ export interface WorkspaceFile {
   path: string;
   size: number;
   mtime: number;
-  kind: 'pdf' | 'latex' | 'text' | 'other';
+  kind: 'pdf' | 'latex' | 'text' | 'image' | 'other';
   /** PDF 文件映射的本地文献 id（local:<ws_id>:<path>），供阅读/上下文/问答复用 */
   paper_id: string | null;
 }
@@ -534,4 +573,124 @@ export interface MindmapCreatedEvent {
   title: string;
   /** 图类型：mindmap（可编辑树）或其他 mermaid 首声明 token（只读视图） */
   diagramType?: string;
+}
+
+// ---------- AI 写作工具组（边写边审 / 一问一事务回滚） ----------
+/** 修订动作类型：edit=锚点替换；input=main.tex 接线（\\input/\\bibliography 等）；
+ *  append=.bib 整块追加；create=新建整文件 */
+export type WritingRevisionKind = 'edit' | 'input' | 'append' | 'create';
+
+/** 修订状态：pending 待审 / accepted 已接受 / rejected 已逐块拒绝 /
+ *  reverted 已随事务回滚 / stale 锚点失效 */
+export type WritingRevisionStatus =
+  | 'pending' | 'accepted' | 'rejected' | 'reverted' | 'stale';
+
+/** GET /writing/revisions 返回的待审修订（跨刷新对账） */
+export interface WritingRevision {
+  id: number;
+  runId: string;
+  transactionId: string;
+  /** 事务内顺序（跨文件连续，回滚按其逆序） */
+  seq: number;
+  kind: WritingRevisionKind;
+  /** 工作区相对路径（POSIX） */
+  path: string;
+  /** 被替换/删除的旧文本（create/append 为空串） */
+  oldText: string;
+  /** 新写入的文本（create 为整个文件内容，append 为追加块） */
+  newText: string;
+  baseHash: string;
+  newHash: string;
+  status: WritingRevisionStatus;
+  createdAt: string;
+}
+
+/** SSE document_diff 事件中的单个审核块（比 REST 行多了实时行号位置） */
+export interface WritingHunk {
+  id: number;
+  kind: WritingRevisionKind;
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  oldText: string;
+  newText: string;
+}
+
+/** SSE document_diff：AI 对某文件落盘了一批可逐块审核的修改 */
+export interface WritingDiffEvent {
+  kind: 'diff';
+  path: string;
+  transactionId: string;
+  hunks: WritingHunk[];
+  /** 修改后文件 hash（LF 归一化） */
+  newHash: string;
+}
+
+/** SSE document_created：AI 新建了文件（刷新文件树） */
+export interface WritingCreatedEvent {
+  kind: 'created';
+  path: string;
+  transactionId: string;
+}
+
+/** LaTeX 编译错误（后端 parse_log_errors 解析 main.log） */
+export interface WritingCompileError {
+  file: string;
+  /** 1 基行号；无法解析时为 0/null */
+  line: number | null;
+  kind: 'error';
+  text: string;
+}
+
+/** SSE compile_result：AI 调 compile_document 的真实编译结果 */
+export interface WritingCompileEvent {
+  kind: 'compile';
+  ok: boolean;
+  errors: WritingCompileError[];
+  message: string;
+}
+
+/** POST /writing/hunks/<id>/reject 响应（文本类还原返回新内容；create 返回 deleted） */
+export interface WritingRejectResult {
+  ok: boolean;
+  revId: number;
+  status: 'rejected';
+  file: { path: string; content: string; hash: string } | null;
+  deleted: string | null;
+}
+
+/** POST /writing/transactions/<txn>/accept 响应 */
+export interface WritingAcceptTxnResult {
+  ok: boolean;
+  transactionId: string;
+  count: number;
+}
+
+/** POST /writing/transactions/<txn>/rollback 响应（409 冲突时同结构 + error） */
+export interface WritingRollbackResult {
+  ok: boolean;
+  transactionId: string;
+  /** 实际物理还原的修订数 */
+  count: number;
+  /** 被还原的文本文件（含最新内容，编辑器直接替换缓冲区） */
+  files: { path: string; content: string; hash: string }[];
+  /** 被删除的新建文件路径 */
+  deleted: string[];
+  /** 创建后又被修改而保留的文件路径（未删除，需用户手动处理） */
+  kept: string[];
+  /** 冲突时的已本地化错误文案（HTTP 409） */
+  error?: string;
+  processedCount?: number;
+}
+
+/** 一次回答中 AI 写作事务的消息挂载（回答卡片上的「全部接受 / 撤销本次写作」） */
+export interface ChatWritingEdit {
+  transactionId: string;
+  /** 编辑发生时的工作区 id */
+  workspaceId?: string | null;
+  /** 已全部接受（消标记） */
+  accepted?: boolean;
+  /** 已整事务回滚 */
+  undone?: boolean;
 }

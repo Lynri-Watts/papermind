@@ -24,4 +24,10 @@ export default {
     switchWorkspace: '切换工作区',
     createWorkspace: '去创建工作区',
   },
+  /** 后端不可达时的全局顶部横幅 */
+  backend: {
+    offline: '后端服务未连接，请先启动后端（backend 目录执行 python app.py）',
+    retry: '重试连接',
+    retrying: '正在连接后端…',
+  },
 } as const;

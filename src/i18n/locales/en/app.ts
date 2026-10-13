@@ -24,4 +24,10 @@ export default {
     switchWorkspace: 'Switch workspace',
     createWorkspace: 'Create a workspace',
   },
+  /** Global top banner shown when the backend is unreachable */
+  backend: {
+    offline: 'Backend is not connected — start it first (run python app.py in the backend folder)',
+    retry: 'Retry',
+    retrying: 'Connecting to backend…',
+  },
 } as const;

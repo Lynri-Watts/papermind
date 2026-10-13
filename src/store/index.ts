@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { Paper, ChatMessage, ChatConversation, Note, Highlight, AISuggestion, ContextItem, DataBlock, ReaderTab, WorkspaceInfo, SettingsSnapshot, MindmapMeta, MindmapInfo } from '../types';
+import { Paper, ChatMessage, ChatConversation, Note, Highlight, AISuggestion, ContextItem, DataBlock, ReaderTab, WorkspaceInfo, SettingsSnapshot, MindmapMeta, MindmapInfo, QuoteContext } from '../types';
 import {
   loadState, saveState, listContextItems, listWorkspaces, readLatexFile, saveLatexFile, getSettings,
   generateChatTitle,
@@ -13,12 +13,11 @@ import {
 } from '../api';
 import i18n from '../i18n';
 
-/** 创作模块（原 Workspace / LaTeX 写作）是否对用户开放。
+/** 创作模块（Workspace / LaTeX 写作）是否对用户开放。
  * 注意：它与「工作区」不是同一概念——工作区是文献与文件的容器（见主页工作区管理），
  * 创作模块是其下的 LaTeX 写作与预览页面。
- * 发布前该功能存在缺陷，暂时下线：侧边栏入口保留但置灰「维护中」，
- * 主页「进入」与 AI 助手跳转均被拦回主页。恢复时把此处改回 true 即可。 */
-export const WRITING_ENABLED: boolean = false;
+ * 已重新开放：main.tex 为固定编译入口，支持多文件标签页、上传与 xelatex 编译。 */
+export const WRITING_ENABLED: boolean = true;
 
 /** 高级结构化搜索筛选条件（对应后端 /api/search 字段化检索；年份用字符串输入、提交时转数字）。
  * 主搜索框的关键词不在此处——它始终作为 ``keywords`` 字段提交，避免与高级字段重复/冲突。
@@ -49,9 +48,9 @@ const CONV_PLACEHOLDER_MAX = 24;
 
 // ---------- AI 面板宽度 ----------
 /** AI 面板默认宽度（旧版默认 380；升级时把仍是旧默认值的快照迁移到新默认） */
-const QA_PANEL_DEFAULT_WIDTH = 420;
-const QA_PANEL_MIN_WIDTH = 300;
-const QA_PANEL_MAX_WIDTH = 640;
+export const QA_PANEL_DEFAULT_WIDTH = 420;
+export const QA_PANEL_MIN_WIDTH = 300;
+export const QA_PANEL_MAX_WIDTH = 640;
 /** 旧版默认宽度：快照中恰好等于该值视为"从未手动拖拽"，迁移到新默认 */
 const QA_PANEL_LEGACY_DEFAULT_WIDTH = 380;
 /**
@@ -67,6 +66,26 @@ function clampQaPanelWidth(width: unknown, migrateLegacyDefault = false): number
     return QA_PANEL_DEFAULT_WIDTH;
   }
   return Math.max(QA_PANEL_MIN_WIDTH, Math.min(QA_PANEL_MAX_WIDTH, Math.round(width)));
+}
+
+// ---------- Explore 右栏（搜索+详情）宽度 ----------
+/** 右栏默认宽度（旧版左栏默认 360；三栏重排后恰好为旧值的快照迁移到新默认 320） */
+export const EXPLORE_SEARCH_DEFAULT_WIDTH = 320;
+export const EXPLORE_SEARCH_MIN_WIDTH = 240;
+export const EXPLORE_SEARCH_MAX_WIDTH = 480;
+/** 旧版默认宽度：快照中恰好等于该值视为"从未手动拖拽" */
+const EXPLORE_SEARCH_LEGACY_DEFAULT_WIDTH = 360;
+function clampExploreSearchWidth(width: unknown, migrateLegacyDefault = false): number {
+  if (typeof width !== 'number' || !Number.isFinite(width) || width <= 0) {
+    return EXPLORE_SEARCH_DEFAULT_WIDTH;
+  }
+  if (migrateLegacyDefault && width === EXPLORE_SEARCH_LEGACY_DEFAULT_WIDTH) {
+    return EXPLORE_SEARCH_DEFAULT_WIDTH;
+  }
+  return Math.max(
+    EXPLORE_SEARCH_MIN_WIDTH,
+    Math.min(EXPLORE_SEARCH_MAX_WIDTH, Math.round(width)),
+  );
 }
 
 /** 首条用户提问的本地占位标题（AI 标题返回前即时可见；失败时永久保留） */
@@ -141,6 +160,22 @@ interface PaperMindStore {
   
   latexContent: string;
   setLatexContent: (content: string) => void;
+  /**
+   * 采纳服务端 main.tex 内容（AI 写盘/审核还原/事务回滚后）：
+   * 直接替换正文并把保存基线同步为该内容，不置 dirty、不触发再次回存。
+   */
+  adoptLatexFromServer: (content: string) => void;
+  /** main.tex 是否有尚未写盘的改动（自动/手动保存成功后清零） */
+  latexDirty: boolean;
+
+  /** 写作模块已打开的文件标签页（工作区相对路径，main.tex 始终固定在首位） */
+  writingTabs: string[];
+  /** 当前激活的写作文件（相对路径，必须属于 writingTabs；图片等二进制也可作为预览标签） */
+  activeWritingFile: string;
+  /** 替换打开的标签列表（自动保证 main.tex 在首位、路径合法去重） */
+  setWritingTabs: (tabs: string[]) => void;
+  /** 设置当前激活的写作文件（不在标签列表中则忽略） */
+  setActiveWritingFile: (path: string) => void;
   
   /** 当前视图中的聊天消息（活跃会话的消息视图；重开会话时整体替换） */
   chatMessages: ChatMessage[];
@@ -189,9 +224,9 @@ interface PaperMindStore {
   /** PDF 引用定位请求（QAPanel 发出，阅读器消费；nonce 用于触发重复定位） */
   pdfLocateRequest: { paperId: string; text: string; nonce: number } | null;
   requestPdfLocate: (paperId: string, text: string) => void;
-  /** 选中文本发起的提问草稿（阅读器→QAPanel 输入框） */
-  qaInputDraft: string;
-  setQaInputDraft: (text: string) => void;
+  /** 阅读器框选提问草稿（阅读器→QAPanel 输入框挂引用芯片；null=无待处理草稿） */
+  qaQuoteDraft: QuoteContext | null;
+  setQaQuoteDraft: (quote: QuoteContext | null) => void;
   /** 全局问答：上下文库开关（AI 依摘要自动选择，固定优先） */
   useContext: boolean;
   setUseContext: (v: boolean) => void;
@@ -300,6 +335,39 @@ interface PaperMindStore {
 
 const INITIAL_LATEX = '';
 
+/** 写作固定入口文件名（与后端 services/latex_build.MAIN_TEX 对应） */
+export const MAIN_TEX_PATH = 'main.tex';
+
+/** 校验工作区相对路径（POSIX，禁止绝对路径、盘符、反斜杠与 .. 越界） */
+function normalizeWritingPath(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const p = raw.trim();
+  if (!p || p.length > 255 || p.includes('\\') || p.includes(':') || p.startsWith('/')) return null;
+  const parts = p.split('/');
+  if (parts.some((seg) => !seg || seg === '.' || seg === '..')) return null;
+  return p;
+}
+
+/** 归一化写作标签列表：去重、过滤非法路径、main.tex 固定首位。
+ *  PDF 不属于写作目录（文献在独立文献库、main.pdf 是编译产物走右侧面板），
+ *  历史快照中残留的 PDF 标签在此清掉。 */
+function normalizeWritingTabs(raw: unknown): string[] {
+  const tabs: string[] = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const p = normalizeWritingPath(item);
+      if (p && !p.toLowerCase().endsWith('.pdf') && !tabs.includes(p)) tabs.push(p);
+    }
+  }
+  return [MAIN_TEX_PATH, ...tabs.filter((p) => p !== MAIN_TEX_PATH)];
+}
+
+/** 归一化激活标签：必须在标签列表中，否则回落到首个（main.tex） */
+function normalizeActiveWritingFile(raw: unknown, tabs: string[]): string {
+  const p = normalizeWritingPath(raw);
+  return p && tabs.includes(p) ? p : tabs[0] ?? MAIN_TEX_PATH;
+}
+
 /** 兼容旧快照中的 context 项（旧字段 description/mcpConfig），归一化到新结构。 */
 function normalizeContext(item: Partial<ContextItem> & { description?: string }): ContextItem {
   return {
@@ -395,9 +463,7 @@ type ViewType = 'home' | 'workspace' | 'research' | 'explore' | 'mindmaps' | 'se
 /** 视图归一化：旧快照可能存有 'search'（独立搜索页已并入 Explore），回退到 explore。 */
 function normalizeView(view: unknown): ViewType {
   if (view === 'search') return 'explore';
-  // 创作模块下线期间，历史快照中的 'workspace' 一律回落到主页，避免恢复出不可用页面
-  if (view === 'workspace') return WRITING_ENABLED ? 'workspace' : 'home';
-  if (view === 'home' || view === 'research' || view === 'explore' || view === 'mindmaps' || view === 'settings') return view;
+  if (view === 'home' || view === 'workspace' || view === 'research' || view === 'explore' || view === 'mindmaps' || view === 'settings') return view;
   // 未知视图统一回落主页：不再默认进入创作页
   return 'home';
 }
@@ -409,6 +475,9 @@ function normalizeView(view: unknown): ViewType {
 const WS_STATE_KEYS: (keyof PaperMindStore)[] = [
   'selectedPaper',
   'latexContent',
+  // 写作模块：打开的标签页与当前激活文件（内容本身以后端文件为真源）
+  'writingTabs',
+  'activeWritingFile',
   'chatMessages',
   'chatConversations',
   'activeConversationId',
@@ -475,6 +544,11 @@ function applyWsState(state: Record<string, unknown>): Partial<PaperMindStore> {
   return {
     selectedPaper: normalizePaper(state.selectedPaper as Partial<Paper> | null | undefined),
     latexContent: typeof state.latexContent === 'string' ? state.latexContent : INITIAL_LATEX,
+    writingTabs: normalizeWritingTabs(state.writingTabs),
+    activeWritingFile: normalizeActiveWritingFile(
+      state.activeWritingFile,
+      normalizeWritingTabs(state.writingTabs),
+    ),
     chatMessages: migratedMessages,
     chatConversations,
     activeConversationId,
@@ -482,8 +556,13 @@ function applyWsState(state: Record<string, unknown>): Partial<PaperMindStore> {
     highlights: Array.isArray(state.highlights) ? state.highlights as Highlight[] : [],
     qaPanelOpen: state.qaPanelOpen !== false,
     qaPanelWidth: clampQaPanelWidth(state.qaPanelWidth, true),
-    exploreSearchWidth: typeof state.exploreSearchWidth === 'number' && state.exploreSearchWidth > 0
-      ? state.exploreSearchWidth : 360,
+    // Explore 右栏宽度（搜索+详情上下分栏后整体收窄）：旧默认值 360 视为遗留值迁移到 320，
+    // 与 clampQaPanelWidth 同套路——仅快照恢复时迁移，setter 不迁移以允许精确停在任意宽度
+    exploreSearchWidth: clampExploreSearchWidth(
+      typeof state.exploreSearchWidth === 'number' && state.exploreSearchWidth > 0
+        ? state.exploreSearchWidth : EXPLORE_SEARCH_DEFAULT_WIDTH,
+      true,
+    ),
     exploreSearchCollapsed: state.exploreSearchCollapsed === true,
     useContext: state.useContext !== false,
     toolEnabled: state.toolEnabled !== false,
@@ -551,6 +630,25 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
   
   latexContent: INITIAL_LATEX,
   setLatexContent: (content) => set({ latexContent: content }),
+  adoptLatexFromServer: (content) => {
+    // 基线先行：订阅式自动保存比对 lastSavedLatex，不会把采纳内容再 PUT 一次
+    lastSavedLatex = content;
+    set({ latexContent: content, latexDirty: false });
+  },
+  latexDirty: false,
+
+  writingTabs: [MAIN_TEX_PATH],
+  activeWritingFile: MAIN_TEX_PATH,
+  setWritingTabs: (tabs) => set((state) => {
+    const writingTabs = normalizeWritingTabs(tabs);
+    // 当前激活标签被关掉/不存在时，自动回落到 main.tex
+    const activeWritingFile = writingTabs.includes(state.activeWritingFile)
+      ? state.activeWritingFile : writingTabs[0];
+    return { writingTabs, activeWritingFile };
+  }),
+  setActiveWritingFile: (path) => set((state) => (
+    state.writingTabs.includes(path) ? { activeWritingFile: path } : {}
+  )),
   
   chatMessages: [],
   chatConversations: [],
@@ -637,8 +735,7 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
   
   // 默认落在主页（工作区管理）：不默认进入创作页
   currentView: 'home',
-  // 创作模块下线期间作为兜底闸门：任何来源的 'workspace' 跳转都拦回主页
-  setCurrentView: (view) => set({ currentView: !WRITING_ENABLED && view === 'workspace' ? 'home' : view }),
+  setCurrentView: (view) => set({ currentView: view }),
 
   qaPanelOpen: true,
   setQaPanelOpen: (open) => set({ qaPanelOpen: open }),
@@ -646,16 +743,16 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
   setQaPanelWidth: (width) => set({ qaPanelWidth: clampQaPanelWidth(width) }),
   qaPanelResizing: false,
   setQaPanelResizing: (resizing) => set({ qaPanelResizing: resizing }),
-  exploreSearchWidth: 360,
-  setExploreSearchWidth: (width) => set({ exploreSearchWidth: Math.max(240, Math.min(560, Math.round(width))) }),
+  exploreSearchWidth: EXPLORE_SEARCH_DEFAULT_WIDTH,
+  setExploreSearchWidth: (width) => set({ exploreSearchWidth: clampExploreSearchWidth(width) }),
   exploreSearchCollapsed: false,
   setExploreSearchCollapsed: (collapsed) => set({ exploreSearchCollapsed: collapsed }),
   pdfLocateRequest: null,
   requestPdfLocate: (paperId, text) => set({
     pdfLocateRequest: { paperId, text, nonce: Date.now() },
   }),
-  qaInputDraft: '',
-  setQaInputDraft: (text) => set({ qaInputDraft: text }),
+  qaQuoteDraft: null,
+  setQaQuoteDraft: (quote) => set({ qaQuoteDraft: quote }),
   useContext: true,
   setUseContext: (v) => set({ useContext: v }),
   toolEnabled: true,
@@ -881,6 +978,10 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
     if (!activeWorkspaceId) return;
     try {
       await saveLatexFile(activeWorkspaceId, latexContent);
+      lastSavedLatex = latexContent;
+      if (usePaperMindStore.getState().latexContent === latexContent) {
+        set({ latexDirty: false });
+      }
     } catch (err) {
       console.warn('写作文件保存失败:', err);
     }
@@ -912,8 +1013,10 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
         activeWorkspaceId: id,
         ...(wsState ? applyWsState(wsState) : {}),
         ...(items ? { contextItems: items } : {}),
-        ...(latex !== null ? { latexContent: latex } : {}),
+        ...(latex !== null ? { latexContent: latex, latexDirty: false } : {}),
       });
+      // 服务端文件为真源：重置自动保存基线，避免把刚载入的内容误判为改动
+      lastSavedLatex = usePaperMindStore.getState().latexContent;
       // 4. 全局记录活跃工作区（重启后据此自动进入）
       try {
         await saveState({ activeWorkspaceId: id }, '');
@@ -1109,7 +1212,8 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
       if (activeWorkspaceId) {
         try {
           const content = await readLatexFile(activeWorkspaceId);
-          set({ latexContent: content });
+          set({ latexContent: content, latexDirty: false });
+          lastSavedLatex = content;
         } catch {
           // 文件不存在或后端不可用：保留快照内容
         }
@@ -1141,10 +1245,19 @@ usePaperMindStore.subscribe(() => {
     const current = usePaperMindStore.getState();
     // 写作内容同步到工作区文件（main.tex）：内容有变化才请求
     if (current.activeWorkspaceId && current.latexContent !== lastSavedLatex) {
-      lastSavedLatex = current.latexContent;
-      saveLatexFile(current.activeWorkspaceId, current.latexContent).catch((err) => {
-        console.warn('写作文件自动保存失败:', err);
-      });
+      const savingContent = current.latexContent;
+      if (!current.latexDirty) usePaperMindStore.setState({ latexDirty: true });
+      lastSavedLatex = savingContent;
+      saveLatexFile(current.activeWorkspaceId, savingContent)
+        .then(() => {
+          // 保存期间又有新改动则保持 dirty，等下一轮自动保存
+          if (usePaperMindStore.getState().latexContent === savingContent) {
+            usePaperMindStore.setState({ latexDirty: false });
+          }
+        })
+        .catch((err) => {
+          console.warn('写作文件自动保存失败:', err);
+        });
     }
     // 全局快照：活跃工作区 + 当前视图
     const globalSnapshot: Record<string, unknown> = {};

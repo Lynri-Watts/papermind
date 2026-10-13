@@ -39,19 +39,19 @@ export default {
     writing: '写作焦点：AI 可读取当前 LaTeX 文档',
     explore: '探索焦点：基于上下文库与外部检索',
   },
-  quick: {
-    heading: '快捷提问：',
-    q1: '总结当前论文的核心贡献',
-    q2: '这篇论文的方法与已有工作有何不同？',
-    q3: '帮我改写上面这段 LaTeX 表达得更学术',
-    q4: '检索相关的最新研究并列出',
-  },
   empty: {
     intro: '三大板块共用一个 AI 助手：阅读论文、检索文献、撰写 LaTeX 都可在此提问。',
   },
   input: {
     placeholder: '阅读、搜索、写作共用一个助手...',
+    placeholderWithQuote: '针对选中内容提问；直接发送则让 AI 讲解这段',
     stop: '停止生成',
+  },
+  quote: {
+    pageShort: '第{{page}}页',
+    remove: '移除引用',
+    jumpHint: '回到 PDF 原文位置',
+    defaultExplain: '请讲解我选中的这段内容',
   },
   toggle: {
     context: '上下文',

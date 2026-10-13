@@ -1,33 +1,15 @@
-import React, { useState, useRef } from 'react';
-import LatexEditor from '../components/LatexEditor';
-import PaperPreview from '../components/PaperPreview';
-import ResizableDivider from '../components/ResizableDivider';
+import React from 'react';
+import WritingWorkspace from '../components/writing/WritingWorkspace';
 
+/**
+ * 创作页：多文件 LaTeX 写作工作区
+ * （左文件树 ｜ 中标签页编辑器 ｜ 右实时预览/编译 PDF，宽度可拖拽）。
+ */
 const Workspace: React.FC = () => {
-  // 预览面板宽度（可拖拽调整：200-560，默认 280 让位给 LaTeX 编辑器）
-  const [rightWidth, setRightWidth] = useState(280);
-  const containerRef = useRef<HTMLDivElement>(null);
-
   return (
-    <div
-      ref={containerRef}
-      className="h-full flex gap-0 overflow-x-auto"
-      style={{ minWidth: '700px' }}
-    >
-      <div className="flex-1 min-w-[300px] overflow-hidden">
-        <LatexEditor />
-      </div>
-
-      {/* 可拖拽分隔条：调宽论文预览 */}
-      <ResizableDivider
-        onDelta={(dx) => setRightWidth(Math.max(200, Math.min(560, rightWidth + dx)))}
-      />
-
-      <div
-        className="flex-shrink-0 overflow-hidden"
-        style={{ width: `${rightWidth}px` }}
-      >
-        <PaperPreview />
+    <div className="h-full overflow-x-auto" style={{ minWidth: '960px' }}>
+      <div className="h-full">
+        <WritingWorkspace />
       </div>
     </div>
   );

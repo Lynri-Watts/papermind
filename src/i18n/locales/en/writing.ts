@@ -1,51 +1,94 @@
-/** Writing module (LaTeX editor and paper preview) copy */
+/** Writing workspace (multi-file LaTeX editor, preview & compile) copy */
 export default {
   header: {
     title: 'LaTeX Editor',
   },
   toolbar: {
-    /** Undo / redo */
     undo: 'Undo',
     redo: 'Redo',
-    /** Inline formatting */
     bold: 'Bold',
     italic: 'Italic',
-    list: 'List',
-    link: 'Link',
-    code: 'Code',
-    math: 'Math',
-    /** Block-level insert shortcuts */
-    section: 'Section',
-    subsection: 'Subsect',
-    equation: 'Eq',
-    /** AI actions */
-    aiEdit: 'AI Edit',
-    acceptAll: 'Accept All ({{count}})',
-    /** Compile and save */
+    link: 'Insert link',
+    image: 'Insert image (\\includegraphics)',
+    section: 'Section \\section',
+    subsection: 'Subsection \\subsection',
+    itemize: 'Bulleted list (itemize)',
+    enumerate: 'Numbered list (enumerate)',
     compile: 'Compile',
     save: 'Save',
   },
   structure: {
-    title: 'Document Structure',
+    title: 'Outline',
     empty: 'No sections found',
   },
-  suggestion: {
-    /** AI suggestion type labels */
-    improvement: 'Improvement',
-    correction: 'Correction',
-    addition: 'Addition',
-    refinement: 'Refinement',
-    fallback: 'Suggestion',
-    /** Compare labels inside the hover tooltip */
-    original: 'Original',
-    suggested: 'Suggested',
-    reject: 'Reject',
-    accept: 'Accept',
+  files: {
+    title: 'Files',
+    empty: 'No files yet. Use + above to create a text file, or upload PDFs and images.',
+    create: 'New text file',
+    createTitle: 'New text file',
+    namePlaceholder: 'File name (without extension)',
+    confirmCreate: 'Create',
+    cancel: 'Cancel',
+    upload: 'Upload files',
+    refresh: 'Refresh file list',
+    retry: 'Retry',
+    close: 'Close tab',
+    unsaved: 'Unsaved',
+    notEditable: 'This is a binary file and cannot be edited in the app',
+    delete: 'Delete file',
+    deleteConfirm: 'Delete "{{name}}"? This cannot be undone.',
+    closeDirtyConfirm: '"{{name}}" has unsaved changes that will be lost. Close anyway?',
+    copyImageRef: 'Copy \\includegraphics reference path',
+    insertRef: 'Copy reference',
+    openNewTab: 'Open in a new browser tab',
+    download: 'Download',
+    refCopied: 'Image reference copied: {{path}}',
+    errEmpty: 'File name cannot be empty',
+    errInvalid: 'Invalid file name: relative paths only; no backslashes, drive letters, leading "/" or ".."',
+    errExt: 'Only .tex/.bib/.md/.txt text files can be created',
+    errExists: 'A file with this name already exists',
+    createFailed: 'Failed to create file',
+    loadFailed: 'Failed to load file',
+    saveFailed: 'Failed to save file',
+    uploadFailed: 'Some files failed to upload',
+    deleteFailed: 'Failed to delete file',
+    copyFailed: 'Copy failed: clipboard access denied by the browser',
   },
-  preview: {
-    title: 'Preview',
-    zoomOut: 'Zoom Out',
-    zoomIn: 'Zoom In',
-    reset: 'Reset',
+  status: {
+    saved: 'Saved',
+    saving: 'Saving…',
+    unsaved: 'Unsaved',
+    compiling: 'Compiling…',
+  },
+  compile: {
+    ok: 'Compilation succeeded',
+    failed: 'Compilation failed',
+    pdfTab: 'Compiled PDF',
+    logTab: 'Build log',
+    pdfEmpty: 'Not compiled yet. Compile runs automatically 1.5s after you stop typing, or use the button below to compile now. Double-click the compiled PDF to jump back to the source.',
+    noLog: 'The build log is empty.',
+    /** Paused after an auto-compile failure */
+    autoPaused: 'Auto-compile is paused. Fix the issue and click Compile to resume; idle auto-compile will be re-enabled afterwards.',
+    resume: 'Compile now & resume auto-compile',
+    /** Double-click PDF inverse search */
+    locateFailed: 'Could not locate the source from the PDF (make sure the document compiled successfully and click on the body text)',
+    locateTimeout: 'Could not open "{{name}}" and complete the jump; please retry',
+    locateUnsupported: 'SyncTeX resolved to "{{name}}", which is not an editable text file',
+  },
+  review: {
+    /** Inline diff hunk control tooltips */
+    acceptHunk: 'Accept this change',
+    rejectHunk: 'Reject and revert this change',
+    /** Per-hunk action failure (WritingWorkspace notice / edit bar fallback) */
+    actionFailed: 'Action failed, please retry',
+    /** Transaction rollback kept files that were modified after creation */
+    rollbackKept: 'These files were modified after creation and were kept: {{names}}',
+    /** Transaction review bar on the answer card */
+    editedHint: 'AI edited this document. Review each change inline in the editor.',
+    writingLive: 'AI is writing…',
+    acceptAll: 'Accept all',
+    undoAll: 'Undo this writing',
+    acceptedAll: 'All changes accepted',
+    undone: 'This writing has been undone',
   },
 } as const;

@@ -3,18 +3,76 @@ import { useTranslation } from 'react-i18next';
 import {
   MessageCircle, Send, BookOpen, RefreshCw, Check, FileText, Plus, X,
   Globe, BarChart3, Table, TrendingUp, FileImage, Sigma,
-  ExternalLink, Sparkles, Search, Settings2, ChevronLeft, ChevronRight, Square,
+  ExternalLink, Sparkles, Search, Settings2, ChevronRight, Square,
   History, Trash2,
 } from 'lucide-react';
 import { queryRAGStream, cancelRagRun, RagStreamHandlers } from '../api';
-import { ChatMessage, ChatMindmapEdit, ContextItem, DataBlock, ReactStep, ToolPaper } from '../types';
-import { usePaperMindStore } from '../store';
+import { ChatMessage, ChatMindmapEdit, ChatWritingEdit, ContextItem, DataBlock, QuoteContext, RagQueryRequest, ReactStep, ToolPaper } from '../types';
+import {
+  usePaperMindStore,
+  QA_PANEL_DEFAULT_WIDTH, QA_PANEL_MIN_WIDTH, QA_PANEL_MAX_WIDTH,
+} from '../store';
+import { useWritingReviewStore } from '../store/writingReview';
+import { requestWritingFlush } from '../lib/writing/bridge';
 import { addPaperContextItem, isPaperInContext } from '../lib/context';
 import { emitMindmapAutoLayout, emitMindmapCommitted } from '../lib/mindmap/bridge';
 import AssistantMessage from '../components/AssistantMessage';
 import AddContextModal from '../components/AddContextModal';
 import ContextItemCard from '../components/ContextItemCard';
 import ResizableDivider from '../components/ResizableDivider';
+
+/**
+ * 框选引用芯片：输入框待发送引用 / 用户消息气泡已随附引用共用。
+ * - panel：输入框上的草稿芯片（可 × 移除，主体可点回原文）
+ * - bubble：用户气泡内已发送引用（仅可点回原文，不可移除）
+ */
+const QuoteChip: React.FC<{
+  title: string;
+  page?: number | null;
+  variant?: 'panel' | 'bubble';
+  onRemove?: () => void;
+  onJump?: () => void;
+}> = ({ title, page, variant = 'panel', onRemove, onJump }) => {
+  const { t } = useTranslation('qa');
+  const interactive = !!onJump;
+  const shellCls = variant === 'bubble'
+    ? 'bg-white/15 border-white/25 text-white/90'
+    : 'bg-accent/10 border-accent/30 text-accent';
+  const mainCls = interactive
+    ? (variant === 'bubble' ? 'hover:bg-white/10' : 'hover:bg-accent/15 cursor-pointer')
+    : 'cursor-default';
+  const closeCls = variant === 'bubble'
+    ? 'hover:bg-white/20 text-white/70'
+    : 'hover:bg-accent/20 text-accent/70';
+  return (
+    <span
+      className={`inline-flex max-w-full items-center gap-1 rounded-lg border py-1 pl-2 pr-1 text-[11px] leading-none ${shellCls}`}
+    >
+      <button
+        type="button"
+        onClick={onJump}
+        disabled={!interactive}
+        title={interactive ? t('quote.jumpHint') : undefined}
+        className={`flex min-w-0 items-center gap-1 rounded px-0.5 py-0.5 transition-colors ${mainCls}`}
+      >
+        <FileText className="h-3 w-3 shrink-0" />
+        <span className="max-w-[200px] truncate">{title}</span>
+        {page != null && <span className="shrink-0 opacity-80">{t('quote.pageShort', { page })}</span>}
+      </button>
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          title={t('quote.remove')}
+          aria-label={t('quote.remove')}
+          className={`rounded p-0.5 transition-colors ${closeCls}`}
+        >
+          <X className="h-3 w-3" />
+        </button>
+      )}
+    </span>
+  );
+};
 
 /**
  * 全局 AI 助手面板：阅读 / 搜索 / 写作三大板块共用同一个问答系统。
@@ -37,10 +95,6 @@ const QAPanel: React.FC = () => {
   const qaPanelWidth = usePaperMindStore((s) => s.qaPanelWidth);
   const setQaPanelWidth = usePaperMindStore((s) => s.setQaPanelWidth);
   const setQaPanelResizing = usePaperMindStore((s) => s.setQaPanelResizing);
-  // 拖拽中的最新宽度：mousemove 监听注册在 mousedown 时刻，回调闭包拿不到
-  // 拖拽期间的新宽度，用 ref 做增量累加（每次移动在当前值上 +dx，不回跳）
-  const dragWidthRef = useRef(qaPanelWidth);
-  dragWidthRef.current = qaPanelWidth;
   // ---- 全局问答控制（持久化） ----
   const useContext = usePaperMindStore((s) => s.useContext);
   const setUseContext = usePaperMindStore((s) => s.setUseContext);
@@ -51,8 +105,8 @@ const QAPanel: React.FC = () => {
   const excludedCtxIds = usePaperMindStore((s) => s.excludedCtxIds);
   const setExcludedCtxIds = usePaperMindStore((s) => s.setExcludedCtxIds);
   // ---- 跨组件通信 ----
-  const qaInputDraft = usePaperMindStore((s) => s.qaInputDraft);
-  const setQaInputDraft = usePaperMindStore((s) => s.setQaInputDraft);
+  const qaQuoteDraft = usePaperMindStore((s) => s.qaQuoteDraft);
+  const setQaQuoteDraft = usePaperMindStore((s) => s.setQaQuoteDraft);
   const requestPdfLocate = usePaperMindStore((s) => s.requestPdfLocate);
   // ---- 当前焦点（板块 + 论文/文档） ----
   const currentView = usePaperMindStore((s) => s.currentView);
@@ -62,7 +116,6 @@ const QAPanel: React.FC = () => {
   const readerTabs = usePaperMindStore((s) => s.readerTabs);
   const activeTabId = usePaperMindStore((s) => s.activeTabId);
   const openReaderTab = usePaperMindStore((s) => s.openReaderTab);
-  const latexContent = usePaperMindStore((s) => s.latexContent);
   // ---- 问答会话 ----
   const chatMessages = usePaperMindStore((s) => s.chatMessages);
   const addChatMessage = usePaperMindStore((s) => s.addChatMessage);
@@ -84,6 +137,12 @@ const QAPanel: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<'qa' | 'context' | 'data'>('qa');
   const [input, setInput] = useState('');
+  /**
+   * 待发送的框选引用（阅读器选区提问挂在输入框上方的芯片）。
+   * 发送后随该条用户消息固化（message.quote）并清空；× 可在发送前移除。
+   */
+  const [pendingQuote, setPendingQuote] = useState<QuoteContext | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const [loading, setLoading] = useState(false);
   const [streamStage, setStreamStage] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -106,6 +165,44 @@ const QAPanel: React.FC = () => {
    */
   const submittingRef = useRef(false);
 
+  // ---------- 打开聊天记录默认定位到底部 ----------
+  // 面板随 qaPanelOpen 条件挂载，QA 标签内容也随 activeTab 条件渲染。
+  // 以下任一情形视为「重新打开聊天记录」，在首批消息布局完成后瞬间贴底：
+  // 面板首次挂载（含 hydrate 填充/面板重新展开）、切换历史会话、
+  // 从 Context/Data 标签切回 QA。
+  /** 消息列表滚动容器 */
+  const messagesScrollerRef = useRef<HTMLDivElement>(null);
+  /** 下一批消息渲染后需要贴底（标志在消息停止变化约一帧后解除） */
+  const pendingScrollToBottomRef = useRef(true);
+  useEffect(() => {
+    if (activeTab === 'qa') pendingScrollToBottomRef.current = true;
+  }, [activeTab, activeConversationId]);
+
+  useEffect(() => {
+    if (!pendingScrollToBottomRef.current || chatMessages.length === 0) return;
+    const el = messagesScrollerRef.current;
+    if (!el) return;
+    const scrollNow = () => { el.scrollTop = el.scrollHeight; };
+    // 双 rAF：等 React 提交后浏览器完成布局（markdown/代码块等列表内容）
+    let raf1 = 0;
+    let raf2 = 0;
+    raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(scrollNow);
+    });
+    // 兜底：公式/字体等可能在首帧后继续改变高度，短延时再贴一次
+    const fallback = window.setTimeout(scrollNow, 350);
+    // 消息停止变化 360ms 后解除：此后用户上翻查看历史不再被拉回
+    const release = window.setTimeout(() => {
+      pendingScrollToBottomRef.current = false;
+    }, 360);
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      window.clearTimeout(fallback);
+      window.clearTimeout(release);
+    };
+  }, [chatMessages, activeTab]);
+
   // 当前焦点论文：仅阅读视图下取激活标签（写作/搜索视图无"当前论文"）
   const paperId = currentView === 'research' ? (activeTabId ?? '') : '';
   const focusPaperTitle = currentView === 'research'
@@ -122,24 +219,19 @@ const QAPanel: React.FC = () => {
     }, 2500);
   }, []);
 
-  // ---------- 阅读器选中文本发起的提问：填充输入框并自动发送 ----------
+  // ---------- 阅读器框选提问：打开面板、挂引用芯片、聚焦输入框（不自动发送） ----------
   useEffect(() => {
-    const text = qaInputDraft.trim();
-    if (!text) return;
-    setQaInputDraft('');
+    const draft = qaQuoteDraft;
+    if (!draft) return;
+    setQaQuoteDraft(null);
     setActiveTab('qa');
     setQaPanelOpen(true);
-    if (submittingRef.current) {
-      // 上一轮问答仍在生成：不静默丢问题，回填输入框供用户随后手动发送
-      setInput(text);
-      return;
-    }
-    setInput(text);
-    setTimeout(() => {
-      handleSubmitWithText(text);
-    }, 50);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [qaInputDraft]);
+    setPendingQuote(draft);
+    setInput('');
+    // 面板刚打开时 textarea 可能尚未挂载，下一帧再聚焦
+    const raf = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => cancelAnimationFrame(raf);
+  }, [qaQuoteDraft, setQaQuoteDraft, setQaPanelOpen]);
 
   // ---------- ReAct 自动运行（AI 自主思考→调用工具→观察，无逐次确认） ----------
   /** 正在运行的 run_id（生成中持有一份，供"停止"按钮取消） */
@@ -155,16 +247,18 @@ const QAPanel: React.FC = () => {
     requestFn: (handlers: RagStreamHandlers) => Promise<void>,
   ) => {
     activeRunIdRef.current = runId;
-    let cancelling = false;
+    const cancelling = false;
     updateChatMessage(assistantId, {
       streaming: true,
       toolCall: { runId, steps: [], cancelling: false },
     });
     setLoading(true);
     setStreamStage(t('stage.connecting'));
+    // 写作侧（WritingWorkspace）据此挂起空闲自动编译，流末下降沿再统一补编
+    useWritingReviewStore.getState().setAiStreaming(true);
 
     let answerText = '';
-    let trail: ReactStep[] = [];
+    const trail: ReactStep[] = [];
     let openIndex = -1; // 当前正在接收 Thought 增量的步骤（-1=无开放步骤）
     let seq = 0;
     // 本次回答的导图事务编辑（mapId→记录），与 SSE 同步实时落消息，供结束后整事务撤销
@@ -173,6 +267,17 @@ const QAPanel: React.FC = () => {
       updateChatMessage(assistantId, {
         mindmapEdits: Array.from(mindmapEditMap.values()),
       });
+    };
+    // 本次回答的论文写作事务（导图与写作在后端共享一个 aitxn，修订表不同互不冲突）。
+    // 首个 diff/created 事件到达时挂到消息上，供回答卡片「全部接受/撤销本次写作」。
+    let writingEdit: ChatWritingEdit | null = null;
+    const attachWritingTxn = (transactionId: string) => {
+      if (writingEdit) return;
+      writingEdit = {
+        transactionId,
+        workspaceId: usePaperMindStore.getState().activeWorkspaceId ?? null,
+      };
+      updateChatMessage(assistantId, { writingEdit });
     };
 
     const isOpen = (i: number) => i >= 0 && i < trail.length;
@@ -314,6 +419,28 @@ const QAPanel: React.FC = () => {
           });
           syncMindmapEdits();
         },
+        // ---------- AI 写作（边写边审）：落盘事件进 writingReview store ----------
+        onDocumentDiff: (ev) => {
+          const wsId = usePaperMindStore.getState().activeWorkspaceId;
+          if (!wsId) return;
+          // 临时候选入 store（CodeEditor 即时内联高亮），WritingWorkspace 随后
+          // 按 syncNonce 拉取磁盘新内容远程灌入，流末/整事务操作后再 hydrate 对账
+          useWritingReviewStore.getState().applyDiff(wsId, ev);
+          attachWritingTxn(ev.transactionId);
+        },
+        onDocumentCreated: (ev) => {
+          const wsId = usePaperMindStore.getState().activeWorkspaceId;
+          if (!wsId) return;
+          useWritingReviewStore.getState().applyCreated(wsId, ev);
+          // 仅建文件（无 diff）的一轮也要出现事务审核条
+          attachWritingTxn(ev.transactionId);
+        },
+        onCompileResult: (ev) => {
+          const wsId = usePaperMindStore.getState().activeWorkspaceId;
+          if (!wsId) return;
+          // 编译面板/PDF 由 WritingWorkspace 订阅 compileByWs 刷新
+          useWritingReviewStore.getState().applyCompile(wsId, ev);
+        },
         onNotice: (message) => {
           // 非阻断提示（如无材料降级通用知识回答）：挂消息上持久化展示，不替换正文
           if (message) updateChatMessage(assistantId, { notice: message });
@@ -352,6 +479,12 @@ const QAPanel: React.FC = () => {
       if (activeRunIdRef.current === runId) activeRunIdRef.current = null;
       setLoading(false);
       setStreamStage(null);
+      // 流结束：解除写作侧自动编译挂起（WritingWorkspace 下降沿按需补编），
+      // 并与后端对账本轮全部写作修订（补齐 SSE 候选缺失的 seq/hash 等字段）
+      const reviewStore = useWritingReviewStore.getState();
+      reviewStore.setAiStreaming(false);
+      const wsId = usePaperMindStore.getState().activeWorkspaceId;
+      if (wsId && writingEdit) void reviewStore.hydrate(wsId);
     }
   }, [updateChatMessage, t]);
 
@@ -406,6 +539,13 @@ const QAPanel: React.FC = () => {
     requestPdfLocate(src.paper_id, locateText);
   }, [openReaderTab, setCurrentView, requestPdfLocate, t]);
 
+  // ---------- 引用芯片：点回阅读器原文定位（输入区草稿 / 历史气泡共用） ----------
+  const handleJumpQuote = useCallback((quote: Pick<QuoteContext, 'paperId' | 'title' | 'text'>) => {
+    openReaderTab(quote.paperId, quote.title || t('label.paper'));
+    setCurrentView('research');
+    requestPdfLocate(quote.paperId, quote.text);
+  }, [openReaderTab, setCurrentView, requestPdfLocate, t]);
+
   // ---------- 显式文本提交（ReAct 自动流式：思考/动作/观察/回答 一体化输出） ----------
   /** 阅读焦点自动入上下文库：仅阅读视图存在当前论文时生效。
    * 幂等（本地 store 已收录则跳过；后端 /context 亦按 ref_id 判重）。
@@ -424,28 +564,59 @@ const QAPanel: React.FC = () => {
     }
   };
 
-  const handleSubmitWithText = async (query: string) => {
-    // 同步防重入：回车键连发、回车+点发送、阅读器选区提问的 setTimeout 都汇聚于此
-    if (!query.trim() || submittingRef.current) return;
+  const handleSubmitWithText = async (rawQuery: string) => {
+    // 同步防重入：回车键连发、回车+点发送都汇聚于此
+    if (submittingRef.current) return;
+    const quote = pendingQuote;
+    // 有引用芯片时允许留空发送：默认意图=讲解选中片段；无芯片则必须有问题文本
+    const query = rawQuery.trim() || (quote ? t('quote.defaultExplain') : '');
+    if (!query) return;
     // 对话历史与工作区绑定：没有活跃工作区时禁止提问，消息不允许无归属
     if (!activeWorkspaceId) return;
     submittingRef.current = true;
     // 不等网络：先给输入框即时反馈（发送按钮随输入为空变灰），消除重复提交窗口
     setInput('');
+    // 引用芯片随本条消息固化后从输入区移除
+    setPendingQuote(null);
     // 提问时收起历史面板，让用户看到流式回答
     setShowHistory(false);
     try {
       await ensureReadingFocusInContext();
-      // 精简历史：仅取之前的 user/assistant 文字（不含全文与出处详情）
-      const history = chatMessages
+      // 精简历史：仅取之前的 user/assistant 文字（不含全文与出处详情）；
+      // user 轮保留精简引用，让后续追问能锚定"他说的那段"出自哪里
+      const history: NonNullable<RagQueryRequest['history']> = chatMessages
         .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content && m.content.trim())
-        .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content.trim().slice(0, 1500) }))
+        .map((m) => {
+          const item: NonNullable<RagQueryRequest['history']>[number] = {
+            role: m.role as 'user' | 'assistant',
+            content: m.content.trim().slice(0, 1500),
+          };
+          if (m.role === 'user' && m.quote) {
+            item.quote = {
+              paperId: m.quote.paperId,
+              title: m.quote.title,
+              page: m.quote.page,
+              text: m.quote.text.slice(0, 500),
+            };
+          }
+          return item;
+        })
         .slice(-6);
       const userMessage: ChatMessage = {
         id: `u${Date.now()}`,
         content: query,
         role: 'user',
         timestamp: new Date().toISOString(),
+        // 固化进会话历史时只留定位/辨识字段：前后文仅当前轮请求需要，
+        // 历史轮次的 quote 只作指代锚点（title/page/text），不持久化 before/after
+        quote: quote ? {
+          paperId: quote.paperId,
+          title: quote.title,
+          authors: quote.authors,
+          year: quote.year,
+          page: quote.page,
+          text: quote.text,
+        } : undefined,
       };
       addChatMessage(userMessage);
       const assistantId = `a${Date.now()}`;
@@ -458,18 +629,28 @@ const QAPanel: React.FC = () => {
         streaming: true,
         toolCall: { runId, steps: [], cancelling: false },
       });
+      // 写作视图提问前：等防抖保存全部落盘（main 600ms + 子文件 600ms），
+      // 保证 AI 的 list_files/read_file/edit_file 读到/改到的是最新磁盘内容
+      if (currentView === 'workspace') {
+        await requestWritingFlush();
+      }
       await runReActAnswer(assistantId, runId, (handlers) =>
         queryRAGStream(
           {
-            paperId: paperId || undefined,
+            // 引用场景以片段所属论文为准（阅读器当前标签通常与其一致）
+            paperId: paperId || quote?.paperId || undefined,
             query,
+            quote: quote ?? undefined,
             useContext,
             enableTool: toolEnabled,
             contextIds: pinnedCtxIds,
             excludeIds: excludedCtxIds,
             history,
-            // 写作视图：携带当前 LaTeX 全文，AI 可经 read_document 工具主动读取（不随提问注入）
-            document: currentView === 'workspace' ? latexContent : '',
+            // 写作视图携带当前 main.tex 快照（发送前已 flush，约等于磁盘内容），
+            // 供后端 focus_parts/材料判断；AI 改稿一律走 read_file/edit_file 工具
+            document: currentView === 'workspace'
+              ? usePaperMindStore.getState().latexContent
+              : '',
             // 上下文库按工作区隔离：RAG 只检索当前工作区的上下文
             workspaceId: usePaperMindStore.getState().activeWorkspaceId ?? undefined,
             runId,
@@ -483,7 +664,7 @@ const QAPanel: React.FC = () => {
   };
 
   const handleSubmit = async () => {
-    if (!input.trim()) return;
+    if (!input.trim() && !pendingQuote) return;
     await handleSubmitWithText(input);
   };
 
@@ -540,6 +721,18 @@ const QAPanel: React.FC = () => {
     updateChatMessage(messageId, {
       mindmapEdits: message.mindmapEdits.map((e) =>
         e.mapId === mapId ? { ...e, ...patch } : e),
+    });
+  };
+
+  /** 回写某条回答的 AI 写作事务状态（全部接受 / 已整事务回滚），随消息持久化 */
+  const handleWritingEditChange = (
+    messageId: string,
+    patch: Partial<ChatWritingEdit>,
+  ) => {
+    const message = chatMessages.find((m) => m.id === messageId);
+    if (!message?.writingEdit) return;
+    updateChatMessage(messageId, {
+      writingEdit: { ...message.writingEdit, ...patch },
     });
   };
 
@@ -711,13 +904,6 @@ const QAPanel: React.FC = () => {
     );
   };
 
-  const quickQuestions = [
-    t('quick.q1'),
-    t('quick.q2'),
-    t('quick.q3'),
-    t('quick.q4'),
-  ];
-
   // ---------- 折叠态：仅保留一个展开按钮 ----------
   if (!qaPanelOpen) {
     return (
@@ -735,15 +921,17 @@ const QAPanel: React.FC = () => {
 
   return (
     <div className="h-full flex">
-      {/* 可拖拽分隔条：调宽 AI 面板（范围 300-640，持久化）。
-          拖拽中置 qaPanelResizing：阅读器暂停 fit-width 重排，松手后一次性应用 */}
+      {/* 可拖拽分隔条：AI 面板贴右缘（向右拖变窄，范围 300-640，持久化，
+          双击恢复默认）。拖拽中置 qaPanelResizing：阅读器暂停 fit-width 重排，
+          松手后一次性应用 */}
       <ResizableDivider
-        onDelta={(dx) => {
-          const next = dragWidthRef.current + dx;
-          dragWidthRef.current = next;
-          setQaPanelWidth(next);
-        }}
+        placement="right"
+        size={qaPanelWidth}
+        min={QA_PANEL_MIN_WIDTH}
+        max={QA_PANEL_MAX_WIDTH}
+        onResize={setQaPanelWidth}
         onDraggingChange={setQaPanelResizing}
+        onDoubleClickReset={() => setQaPanelWidth(QA_PANEL_DEFAULT_WIDTH)}
       />
       <div
         style={{ width: qaPanelWidth }}
@@ -859,23 +1047,6 @@ const QAPanel: React.FC = () => {
       {/* ---------- Q&A ---------- */}
       {activeTab === 'qa' && (
         <>
-          {activeWorkspaceId && (
-            <div className="px-3 py-2 bg-background/50 border-b border-border">
-              <p className="text-[11px] text-textSecondary mb-1.5">{t('quick.heading')}</p>
-              <div className="flex flex-wrap gap-1.5">
-                {quickQuestions.map((question, index) => (
-                  <button
-                    key={index}
-                    onClick={() => setInput(question)}
-                    className="px-2 py-0.5 bg-surface border border-border rounded-md text-[11px] text-textSecondary hover:text-text hover:border-primary transition-colors"
-                  >
-                    {question}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
           <div className="flex-1 flex flex-col min-h-0 relative">
             {activeWorkspaceId ? (
               <>
@@ -895,7 +1066,7 @@ const QAPanel: React.FC = () => {
               </div>
             )}
 
-            <div className="flex-1 overflow-auto p-3">
+            <div ref={messagesScrollerRef} className="flex-1 overflow-auto p-3">
             <div className="space-y-3">
               {chatMessages.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-12 text-textSecondary">
@@ -917,10 +1088,21 @@ const QAPanel: React.FC = () => {
                     onAddToContext={handleAddToolPaperToContext}
                     onOpenPaper={handleOpenToolPaper}
                     onMindmapEditChange={handleMindmapEditChange}
+                    onWritingEditChange={handleWritingEditChange}
                   />
                 ) : (
                   <div key={message.id} className="flex justify-end">
                     <div className="max-w-[85%]">
+                      {message.quote && (
+                        <div className="mb-1 flex justify-end">
+                          <QuoteChip
+                            title={message.quote.title}
+                            page={message.quote.page}
+                            variant="bubble"
+                            onJump={() => handleJumpQuote(message.quote!)}
+                          />
+                        </div>
+                      )}
                       <div className="relative px-4 py-2.5 rounded-xl bg-gradient-to-br from-primary to-primary/80 text-white rounded-br-sm">
                         <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
                         <span className="block text-xs text-textSecondary mt-1 text-right">
@@ -1136,13 +1318,25 @@ const QAPanel: React.FC = () => {
               </div>
             )}
 
+            {pendingQuote && (
+              <div className="mb-2 flex">
+                <QuoteChip
+                  title={pendingQuote.title}
+                  page={pendingQuote.page}
+                  variant="panel"
+                  onRemove={() => setPendingQuote(null)}
+                  onJump={() => handleJumpQuote(pendingQuote)}
+                />
+              </div>
+            )}
             <div className="flex items-end gap-2">
               <div className="flex-1 relative">
                 <textarea
+                  ref={inputRef}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyPress={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSubmit())}
-                  placeholder={t('input.placeholder')}
+                  placeholder={pendingQuote ? t('input.placeholderWithQuote') : t('input.placeholder')}
                   className="w-full px-3 py-2.5 bg-background border border-border rounded-lg text-text placeholder-textSecondary focus:outline-none focus:border-secondary resize-none transition-colors text-sm"
                   rows={2}
                 />
@@ -1158,9 +1352,9 @@ const QAPanel: React.FC = () => {
               ) : (
                 <button
                   onClick={handleSubmit}
-                  disabled={!input.trim()}
+                  disabled={!input.trim() && !pendingQuote}
                   className={`p-3 rounded-lg transition-all ${
-                    input.trim()
+                    input.trim() || pendingQuote
                       ? 'bg-gradient-to-br from-secondary to-secondary/80 text-white hover:shadow-lg hover:shadow-secondary/30'
                       : 'bg-surface border border-border text-textSecondary cursor-not-allowed'
                   }`}

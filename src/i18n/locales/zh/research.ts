@@ -55,7 +55,7 @@ export default {
     /** 上传入口的前置校验提示 */
     needWorkspace: '尚未选择工作区，请先在主页创建或进入一个工作区',
     pick: '点击选择本地文件',
-    supported: '支持 PDF（自动打开阅读）、.tex / .bib（写作）、.txt / .md',
+    supported: '仅支持 PDF（存入该工作区的文献库并自动打开阅读）',
     uploading: '上传中...',
     failed: '上传失败',
     uploaded: '已上传：{{path}}',

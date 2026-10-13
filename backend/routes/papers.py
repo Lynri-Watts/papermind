@@ -14,7 +14,7 @@ from pathlib import Path
 from flask import Blueprint, jsonify, request, send_file, Response, stream_with_context
 
 import storage.db as db
-import storage.workspace as ws
+from storage import library as lib
 from config import PDF_DIR
 from i18n import tr
 from llm.client import LLMClient, LLMNotConfiguredError
@@ -22,10 +22,14 @@ from llm.rag import (
     build_rag_engine,
     finalize_inline_answer,
     InlineQuoteExtractor,
+    SOURCE_FALLBACK_CHARS,
+    _normalize_history,
 )
 from llm.summarize import summarize_text, truncate_summary
 from llm.tools import default_registry
 from llm.tools_mindmap import register_mindmap_tools
+from llm.tools_writing import register_writing_tools
+import settings_store
 from providers import get_provider
 from providers.base import SearchQuery
 from providers.download import (
@@ -242,11 +246,17 @@ def _find_existing_context(item_type: str, workspace_id: str, key_col: str, key:
 
 _TOOL_REGISTRY = default_registry()
 register_mindmap_tools(_TOOL_REGISTRY)
+register_writing_tools(_TOOL_REGISTRY)
 _TOOL_LABEL_KEYS = {
     "paper_search": "api.tool_label.paper_search",
     "read_paper": "api.tool_label.read_paper",
     "read_context": "api.tool_label.read_context",
-    "read_document": "api.tool_label.read_document",
+    "list_files": "api.tool_label.list_files",
+    "read_file": "api.tool_label.read_file",
+    "edit_file": "api.tool_label.edit_file",
+    "create_file": "api.tool_label.create_file",
+    "add_bib_entries": "api.tool_label.add_bib_entries",
+    "compile_document": "api.tool_label.compile_document",
     "list_mindmaps": "api.tool_label.list_mindmaps",
     "create_mindmap": "api.tool_label.create_mindmap",
     "read_mindmap": "api.tool_label.read_mindmap",
@@ -337,7 +347,11 @@ def _unregister_run(run_id: str) -> None:
 
 def _react_loop_prompt(question: str, summaries: list[dict],
                        current: dict | None, document: str | None,
-                       pinned_ids: list[int] | None = None) -> tuple[str, str]:
+                       pinned_ids: list[int] | None = None,
+                       has_history: bool = False,
+                       quote: dict | None = None,
+                       reading_scope: str = "auto",
+                       writing_enabled: bool = False) -> tuple[str, str]:
     """构造 ReAct 工具循环的 system+user（思考引导 + 自动执行 + 可用材料清单）。
 
     ReAct 循环由 LLM 全权编排；工具**自动执行、无需用户确认**。每步要求 LLM
@@ -351,6 +365,16 @@ def _react_loop_prompt(question: str, summaries: list[dict],
 
     ``pinned_ids``：用户"固定"的上下文条目编号，仅在清单里标注出来提示 LLM
     优先读取；系统不代为注入其正文。
+    ``has_history``：本轮消息列表是否在 system 之后、当前 user 之前附带了
+    最近若干轮历史对话（由调用方实际注入，本参数只控制提示说明）。
+    ``quote``：阅读器框选提问的片段（规整后的 dict）。存在时在 user 消息
+    顶部插入「用户操作语境」块（含前后文全文），并在系统规则中豁免对该片段
+    的 read_paper 要求——它已直接进入最终回答材料池。
+    ``reading_scope``：用户在设置中选择的读取粒度偏好（auto/full/passages），
+    仅影响 read_paper/read_context "整篇 vs 关键词局部"的倾向性引导。
+    ``writing_enabled``：当前问答是否挂在写作工作区上；为真才在规则中开放
+    list_files/read_file/edit_file/create_file/add_bib_entries/compile_document
+    六个写作工具的使用说明（全局问答下这些工具不可用，不应被调度）。
     """
     pinned = set(pinned_ids or [])
     candidates: list[dict] = []
@@ -398,15 +422,82 @@ def _react_loop_prompt(question: str, summaries: list[dict],
     focus_parts = []
     if current is not None:
         focus_parts.append("用户当前打开一篇论文（清单首条「当前论文」）")
-    if document:
-        focus_parts.append("用户当前正在编辑 LaTeX 文档（写作场景，可用 read_document 读取）")
+    if document and writing_enabled:
+        focus_parts.append("用户正在写作工作区中编辑 LaTeX 文档（可用 list_files/read_file 查看，edit_file 等工具直接修改）")
     if summaries:
         focus_parts.append("上下文库中还有下列材料")
     focus_desc = "、".join(focus_parts) or "当前无任何可用材料"
 
+    # 用户读取粒度偏好：只调节"整篇 vs 关键词局部"的倾向，不改工具语义。
+    # auto 不追加约束（保持模型自行权衡的历史行为）。
+    if reading_scope == "full":
+        scope_rule = (
+            "- 用户读取粒度偏好=**完整优先（已在设置中选择，愿承担更高 token 与"
+            "耗时开销）**：需要某篇论文/条目的证据时，直接省略 query 一次性读取"
+            "整篇（read_paper / read_context 不传 query）；当问题横跨多个区域"
+            "（摘要、方法、实验/消融、结论等，例如要求多处证据互相印证或对比）时，"
+            "**严禁拆成多个关键词 query 分段拼凑**，一次整篇读取即可拿全，轮次更少、"
+            "证据不遗漏；\n"
+        )
+    elif reading_scope == "passages":
+        scope_rule = (
+            "- 用户读取粒度偏好=**节省开销**：优先带精准 query 只取回命中段落；"
+            "仅当证据确实分散在多个区域、单次 query 覆盖不全时，才换更贴近原文的"
+            "query 补读，或最后省略 query 读整篇；不要为省事直接整篇读取；\n"
+        )
+    else:
+        scope_rule = ""
+
+    # 写作工作区问答才开放写作工具组规则；全局问答下这些工具调用必然失败，
+    # 不注入说明，避免模型在无工作区场景盲目调度
+    if writing_enabled:
+        writing_rule = (
+            "- **LaTeX 写作与改稿任务**（续写/改写/润色/结构调整/插入引用/修复编译）"
+            "使用写作工具组，工作流程：先 list_files 摸清 main.tex 与 \\input 章节/"
+            ".bib 结构 → read_file 带行号读取目标文件（编辑锚点必须逐字取自读取结果，"
+            "严禁凭记忆或猜测构造）→ edit_file 用唯一锚点批量修改（零命中/多命中会"
+            "回传行号，按提示扩大锚点后整批重试，不要重复提交同样的失配锚点）；\n"
+            "- 新建章节用 create_file（add_input=true 自动接线 main.tex）；"
+            "需要引用文献时先 read_paper 拿到内容，再 add_bib_entries 把论文元数据"
+            "写入 .bib 并取回 cite key，最后用 edit_file 在正文插 \\cite{key}；"
+            "**add_bib_entries 不改正文**，不要混用；\n"
+            "- 修改宏包/结构/公式/参考文献后调用 compile_document 真实编译自检："
+            "失败就按 file:line 错误用 edit_file 修复后再编译，直到成功，不要把"
+            "编译失败的稿子留给用户收尾；\n"
+            "- 修改会立即写盘并在编辑器中高亮给用户逐块审核，因此：只改任务要求的"
+            "区域，**绝不重排/删除用户无关内容**；锚点要包含足够上下文但不要整块"
+            "重写大段未改动文字；同一文件的多处修改合并到一次 edit_file 的多动作批次；\n"
+        )
+    else:
+        writing_rule = ""
+
     system = (
         "你是论文研究助手的工具调度器，采用 ReAct（思考→行动→观察）模式工作。\n"
         f"当前情况：{focus_desc}。\n"
+    )
+    if has_history:
+        system += (
+            "本次请求在系统提示之后、用户当前问题之前，附带了最近若干轮**历史"
+            "对话**（user/assistant 纯文本）。用户问题中的指代（如「它」「该方法」"
+            "「上文」「刚才/上一个问题」「重新回答」等）一律先在历史对话中消解，"
+            "上一轮已确认的结论、已读论文与已建导图可以直接继承，**不要声称"
+            "「对话没有保留上文」**；但历史只提供语境，其中提到的论文/网页若本轮"
+            "回答要引用其正文，仍必须在本轮重新调用 read_paper / read_context "
+            "读取（历史文本里没有材料全文）；历史回答中的 [Q…] 等标记是旧引用"
+            "痕迹，不要模仿或输出。\n"
+            "特别区分「可继承的结论」与「不可继承的自述」：历史 assistant 消息中"
+            "若出现「我能读到/读到了/没读到/我看到的范围只有/这部分不在本轮文本"
+            "内」之类说法，那只是你上一轮在**当时的工具结果**下对自身检索范围的"
+            "过程叙述，既不描述本轮环境，也不构成本轮的读取边界——每轮工具状态"
+            "完全重置，论文的任何部分都可用 read_paper（换更贴近原文的 query，"
+            "或省略 query 读整篇）重新读取。上一轮得出的**结论**可以继承，但"
+            "「上一轮读到了哪些章节」的覆盖叙述不能继承：不得据此跳过工具调用，"
+            "不得把它当作「材料只有这些」的证据，也不得把上一轮的范围原话冒充"
+            "本轮事实复读给用户（本轮若确需说明检索局限，必须基于本轮真实的工具"
+            "观察重新表述）；只有**本轮**工具观察明确返回未命中，才算该 query 在"
+            "本轮未命中——上一轮没读到绝不等于论文里没有。\n"
+        )
+    system += (
         "每步先输出一小段**思考**文字（会实时展示给用户）：说明这步的意图与依据。"
         "思考结束后，再根据**任务本身的需要**决定动作。工具彼此平行，没有固定的"
         "调用先后，按下列情形选择：\n"
@@ -420,7 +511,7 @@ def _react_loop_prompt(question: str, summaries: list[dict],
         "query 读整篇）；\n"
         "- 需要读取**网页材料**、或按上下文编号取条目内容时，调用 read_context："
         "context_ids 用清单中 `[#N]` 的编号 N（网页没有论文 id，只能用本工具读取）；\n"
-        "- 写作任务（改写/续写/检查语法/整理结构/把材料插入论文）调用 read_document；\n"
+        + writing_rule +
         "- 当用户希望**梳理、做笔记、构建/更新思维导图**（如「整理成导图」「把这几篇"
         "论文的关系画出来」「在导图里加一个分支」）时，使用导图工具：先 list_mindmaps"
         "（不确定 map_id 时）查看当前作用域；**若还没有导图，必须先调用 "
@@ -439,13 +530,27 @@ def _react_loop_prompt(question: str, summaries: list[dict],
         "- 当用户明确要求生成/整理思维导图时，**必须真正调用导图工具完成建图或改图**，"
         "严禁只用文字（Markdown 列表/缩进/符号图）在回答里画一张「文字版思维导图」"
         "代替实际导图；导图工具执行成功后再回复 READY；\n"
-        "- 材料已足够且无导图等操作诉求时不要再请求工具，思考结束后回复 READY 即可。\n"
+        "- 「未命中」不是「论文里没有」——工具观察是**你自己本轮检索行为的产物**，"
+        "不是用户划定的输入边界：当用户问题明确指向某具体内容（某小节、小标题、"
+        "术语或特定陈述，例如「动机」部分），而带 query 的 read_paper 未取回相关"
+        "段落时，**禁止据此收尾、让最终回答向用户声称「能读到的文本里没有这部分」"
+        "「这不在本轮文本范围内」**；回复 READY 前必须先换更贴近原文措辞的 query "
+        "重试，或省略 query 读取整篇论文后再判断；只有整篇读取后仍无（或已接近"
+        "轮次上限）才可以如实告知「该论文正文中未读到该内容」；\n"
+        + scope_rule
+        + "- 材料已足够且无导图等操作诉求时不要再请求工具，思考结束后回复 READY 即可。\n"
         "硬性规则：\n"
         "- 材料清单只说明**有哪些材料**，其中任何材料的正文都不会自动送到最终"
         "回答里；回答要用到的正文（尤其**用户当前打开的那篇论文**，以及问题直接"
         "相关的上下文条目）必须先用 read_paper / read_context 真正读进来，否则"
         "最终回答没有依据、只能空谈；\n"
-        "- 若问题与用户当前打开的论文有关（提问背景、用词、正在讨论的内容等），"
+        + (
+            "- 例外（框选提问）：用户本次框选的原文片段已在用户消息的「用户操作"
+            "语境」中逐字给出，并已直接进入最终回答材料池——**不要为获取该片段"
+            "本身调用 read_paper**；仅当问题需要该片段之外的论文背景时才读取；\n"
+            if quote else ""
+        )
+        + "- 若问题与用户当前打开的论文有关（提问背景、用词、正在讨论的内容等），"
         "**默认先 read_paper 读取该论文**再判断是否需要扩展；上下文条目同理——"
         "论文条目用 read_paper（标准 id）或 read_context（编号），网页条目只能用 "
         "read_context；清单中标注「用户已固定关注」的条目应优先读取；\n"
@@ -458,36 +563,196 @@ def _react_loop_prompt(question: str, summaries: list[dict],
         "tool 角色返回，据此继续思考下一步；**禁止在本回合直接撰写最终回答正文**"
         "（最终回答由系统在材料齐备后单独生成）。"
     )
-    user = f"用户问题：{question}\n\n当前可用材料：\n{listing}"
+    user_parts: list[str] = []
+    if quote:
+        user_parts.append(_quote_react_block(quote))
+    user_parts.append(f"用户问题：{question}\n\n当前可用材料：\n{listing}")
+    user = "\n\n".join(user_parts)
     return system, user
 
 
+# 材料正文完整度等级：同一归属键下决定"覆盖 / 并集 / 忽略"
+#   abstract（paper_search 候选摘要兜底）< passages（read_* 带 query 的局部
+#   命中段落）< full（省略 query 的整篇/全部内容读取）
+_MATERIAL_SCOPE_RANK = {"abstract": 0, "passages": 1, "full": 2}
+
+
+def _union_passages(existing_text: str, new_text: str) -> str:
+    """合并两份 query 局部读取产物：按空行拆段、按 strip 后原文保序去重。
+
+    段落来自 :func:`textmatch.select_passages`，是同一份全文的确定性切片
+    （先按空行分段、超长段再切句窗），不同 query 命中区域常大面积重叠，
+    同一段落文本逐字相同，故可安全按段去重。
+    """
+    seen: set[str] = set()
+    merged: list[str] = []
+    for chunk in (existing_text, new_text):
+        for para in re.split(r"\n\s*\n", chunk):
+            key = para.strip()
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(key)
+    return "\n\n".join(merged)
+
+
 def _merge_material(materials: list[dict], src: dict) -> None:
-    """把一条材料源并入列表：按归属键去重（同论文只保留后写入的，如全文覆盖摘要）。"""
+    """把一条材料源并入列表，按归属键 + 完整度等级（scope）分级合并。
+
+    分级规则（无显式 ``merge_key`` 的同键材料）：
+
+    - ``full``（整篇读取/当前编辑文档）到达 → 覆盖较弱材料；full 已存在时，
+      后到的 ``passages`` / ``abstract`` 一律**忽略**（全文是超集）；
+    - ``passages`` × ``passages``（多次 query 局部读取）→ **段落集合并去重**，
+      修复旧实现"后者整体覆盖前者"导致先前读到的互补段落静默丢失、流末引用
+      核对只在最后一次命中段上进行而误发失败卡的故障；
+    - ``passages`` 覆盖 ``abstract``；``abstract`` 永不反向覆盖已读正文；
+    - 同级其余情形（``full``/``full``、``abstract``/``abstract``）以后写入为准；
+    - 无 ``scope`` 字段的材料按 ``abstract`` 级对待（对历史调用方宽容）。
+
+    显式 ``merge_key`` 用于必须与同论文正文**并存**的材料（用户框选片段）：
+    它是独立来源，同键只做整体替换，不参与正文分级合并。
+    """
     text = (src.get("text") or "").strip()
     if not text:
         return
     src = {**src, "text": text}
-    key = (
-        src.get("paper_id")
-        or (f"ctx:{src['context_id']}" if src.get("context_id") else None)
-        or src.get("label")
-    )
-    for i, existing in enumerate(materials):
-        ekey = (
-            existing.get("paper_id")
-            or (f"ctx:{existing['context_id']}" if existing.get("context_id") else None)
-            or existing.get("label")
+
+    def _key_of(it: dict):
+        return (
+            it.get("merge_key")
+            or it.get("paper_id")
+            or (f"ctx:{it['context_id']}" if it.get("context_id") else None)
+            or it.get("label")
         )
-        if ekey == key:
+
+    key = _key_of(src)
+    for i, existing in enumerate(materials):
+        if _key_of(existing) != key:
+            continue
+        # 框选片段等显式独立来源：保持独立，不与正文做分级合并
+        if src.get("merge_key") or existing.get("merge_key"):
             materials[i] = src
             return
+        new_rank = _MATERIAL_SCOPE_RANK.get(src.get("scope"), 0)
+        old_rank = _MATERIAL_SCOPE_RANK.get(existing.get("scope"), 0)
+        if new_rank > old_rank:
+            materials[i] = src  # 更完整者覆盖（全文 > 段落 > 摘要）
+            return
+        if new_rank < old_rank:
+            return             # 更弱者不得稀释已读正文
+        if src.get("scope") == "passages":
+            materials[i] = {
+                **existing,
+                "text": _union_passages(existing.get("text") or "", text),
+            }
+            return
+        materials[i] = src  # 同级 full/full、abstract/abstract：后写入为准
+        return
     materials.append(src)
+
+
+# ---------- 阅读器框选提问：引用片段（来源 + 前后文 + 用户操作语境） ----------
+_QUOTE_TEXT_LIMIT = 4000   # 框选原文总长保护（正常选区远小于此）
+_QUOTE_SIDE_LIMIT = 800    # before/after 各侧限长
+_QUOTE_TITLE_LIMIT = 200
+
+
+def _parse_quote(raw) -> dict | None:
+    """校验并规整前端发来的框选引用。
+
+    必填空：``paper_id`` / ``title`` / ``text``；``page`` 仅接受正整数
+    （1 基，bool 被 int 兼容需显式排除）；``before``/``after`` 截限长。
+    任何非法形态返回 None（调用方按普通提问处理，不因此 400）。
+    """
+    if not isinstance(raw, dict):
+        return None
+    paper_id = str(raw.get("paper_id") or "").strip()
+    title = str(raw.get("title") or "").strip()
+    text = str(raw.get("text") or "").strip()
+    if not paper_id or not title or not text:
+        return None
+    page = None
+    page_raw = raw.get("page")
+    if isinstance(page_raw, int) and not isinstance(page_raw, bool) and page_raw > 0:
+        page = page_raw
+    elif isinstance(page_raw, float) and not isinstance(page_raw, bool) \
+            and page_raw.is_integer() and page_raw > 0:
+        page = int(page_raw)
+
+    def _side(value) -> str:
+        return str(value or "").strip()[:_QUOTE_SIDE_LIMIT]
+
+    return {
+        "paper_id": paper_id,
+        "title": title[:_QUOTE_TITLE_LIMIT],
+        "page": page,
+        "text": text[:_QUOTE_TEXT_LIMIT],
+        "before": _side(raw.get("before")),
+        "after": _side(raw.get("after")),
+    }
+
+
+def _quote_excerpt_text(quote: dict) -> str:
+    """框选片段的完整材料文本：前后文 + 明确标注的用户选区（虚拟来源与
+    ReAct 操作语境块共用同一文本，保证模型两处看到的内容一致）。"""
+    page = quote.get("page")
+    loc = f"·第{page}页" if page else ""
+    center = (
+        f"【用户框选的原文开始{loc}】\n{quote['text']}\n【用户框选的原文结束】"
+    )
+    parts = [p for p in (quote.get("before"), center, quote.get("after")) if p]
+    return "\n\n".join(parts)
+
+
+def _quote_react_block(quote: dict) -> str:
+    """ReAct 调度器的「用户操作语境」块：让调度器完全感知用户做了什么。"""
+    page_clause = f"第 {quote['page']} 页" if quote.get("page") else "某一页"
+    return (
+        "==== 用户操作语境（最高优先级）====\n"
+        f"用户正在阅读论文《{quote['title']}》，在 {page_clause} 用鼠标框选了一段"
+        "原文，随后针对这段内容发起提问。下方的「用户问题」是**针对框选片段的"
+        "提问**，不要把框选原文误当成问题本身；若问题没有更具体的诉求（例如只"
+        "要求解释/讲讲），用户的真实意图就是「讲清楚这段在说什么、在论文中起"
+        "什么作用」。\n"
+        "框选片段及其前后文如下（夹在【用户框选的原文开始/结束】标记之间的才"
+        "是用户选中的部分，其余为帮助理解的前后文）：\n"
+        f"{_quote_excerpt_text(quote)}\n"
+        "注意：该片段正文已直接进入最终回答的材料池，用户不需要你再为"
+        "「获得这段内容」调用 read_paper；只有当问题需要该论文更广泛的背景"
+        "（其他章节、整体方法、实验数据等）时，才按需 read_paper 读取。\n"
+        "================================"
+    )
+
+
+def _quote_material(quote: dict) -> dict:
+    """框选片段作为**虚拟来源**进入最终回答材料池。
+
+    paper_id 指向真实论文：来源卡展示、行内引用逐字校验、点击跳回 PDF 全部
+    自动复用既有链路；merge_key 保证它与同论文的 read_paper 全文并存不互覆。
+    """
+    # title 不进 tr 插值（论文标题可能含花括号，str.format 会抛异常）；
+    # 标签统一用 ASCII 括号包裹语别化尾注，两种语言下都自然
+    tail = (
+        tr("api.material_label.user_quote_paged", page=page)
+        if page
+        else tr("api.material_label.user_quote")
+    )
+    slug = re.sub(r"[\W_]+", "", quote["text"])[:24]
+    return {
+        "label": f"{quote['title']} ({tail})",
+        "text": _quote_excerpt_text(quote),
+        # 来源卡点击定位兜底：直接用选区原文（材料 text 以前文开头，截窗会落在前文）
+        "locate_hint": quote["text"][:SOURCE_FALLBACK_CHARS],
+        "context_id": None,
+        "paper_id": quote["paper_id"],
+        "merge_key": f"quote:{quote['paper_id']}:{len(quote['text'])}:{slug}",
+    }
 
 
 def _answer_events(engine, question: str, sources: list[dict],
                    paper_meta: dict, history: list, emit,
-                   tool_findings: list[dict] | None = None):
+                   tool_findings: list[dict] | None = None,
+                   quote: dict | None = None):
     """以材料直注方式流式生成回答（生成器：yield emit 结果）。
 
     ``sources`` 由工具层读到（read_paper / read_context / read_document /
@@ -506,7 +771,7 @@ def _answer_events(engine, question: str, sources: list[dict],
         yield emit("sources", {"sources": []})
         for ev in engine.stream_answer(
             question, [], paper_meta, history,
-            grounded=False, tool_findings=tool_findings,
+            grounded=False, tool_findings=tool_findings, quote=quote,
         ):
             if ev["type"] == "sources":
                 continue  # 空出处已由本函数发出
@@ -534,7 +799,7 @@ def _answer_events(engine, question: str, sources: list[dict],
     try:
         for ev in engine.stream_answer(
             question, sources, paper_meta, history,
-            tool_findings=tool_findings,
+            tool_findings=tool_findings, quote=quote,
         ):
             if ev["type"] == "sources":
                 final_sources = ev["sources"]
@@ -735,7 +1000,7 @@ def paper_pdf(paper_id: str):
     - 磁盘缓存命中 → 直接返回（支持 Range 请求）
     - 未命中 → 从数据源下载并缓存后返回
     """
-    # 本地文献：直接从工作区读取 PDF（不经磁盘缓存，源文件即权威副本）
+    # 本地文献：直接从文献库读取 PDF（不经磁盘缓存，源文件即权威副本）
     if paper_id.startswith("local:"):
         data = local_pdf_bytes(paper_id)
         if not data:
@@ -744,7 +1009,7 @@ def paper_pdf(paper_id: str):
         split = split_local_id(paper_id)
         assert split is not None  # 已确认 local 前缀
         return send_file(
-            ws.resolve(*split),
+            lib.resolve(*split),
             mimetype="application/pdf",
             as_attachment=False,
             conditional=True,  # 启用 Range 支持，PDF.js 分段加载
@@ -816,11 +1081,20 @@ def rag_stream():
     context_ids = body.get("context_ids") or []
     exclude_ids = body.get("exclude_ids") or []
     history = body.get("history") or []
-    workspace_id = _ws_scope(body.get("workspace_id") or "")
+    workspace_id_raw = (body.get("workspace_id") or "").strip()
+    # 两套命名，避免语义错位：
+    # - ws_id：裸 id（'' 或 uuid 短格式），给 storage.workspace / writing 工具用
+    # - workspace_scope：'ws:<id>' 或 ''，给 db.list_context_items / mindmap scope 列
+    #   （它们存的就是 scope 标记，不是裸 id）
+    ws_id = workspace_id_raw
+    workspace_scope = f"ws:{ws_id}" if ws_id else ""
     # 当前正在编辑的文档（LaTeX，写作场景）：仅作为 read_document 工具的读取资源，
     # 不随提问无条件注入，由 LLM 在写作任务中主动请求读取
     document = (body.get("document") or "").strip()
     run_id = (body.get("run_id") or "").strip() or uuid.uuid4().hex
+    # 阅读器框选提问：带来源（论文+页码）与前后文的引用片段；非法形态降级为
+    # 普通提问（None），不阻塞请求
+    quote = _parse_quote(body.get("quote"))
     # paper_id 可选：无论文时仅基于上下文库/当前文档/外部检索作答（如写作、通用问答）
     if not question:
         raise ApiError(tr("api.rag.missing_question"))
@@ -863,13 +1137,17 @@ def rag_stream():
                     "id": it["id"], "title": it["title"], "summary": it["summary"],
                     "type": it.get("type"), "ref_id": it.get("ref_id"),
                 }
-                for it in db.list_context_items(workspace_id=workspace_id)
+                for it in db.list_context_items(workspace_id=workspace_scope)
                 if it["id"] not in exclude_ids and it.get("status") != "failed"
             ] if use_context else []
             # 用户"固定"的上下文条目：仅在清单里标注为优先读取，不代为注入正文
             pinned_ids = [cid for cid in context_ids if cid not in exclude_ids]
 
             materials: list[dict] = []
+            # 框选片段在工具循环之前直接入材料池：即使 enable_tool=False 或
+            # LLM 不读任何工具，最终回答也有该片段作为可引用来源
+            if quote:
+                _merge_material(materials, _quote_material(quote))
             # 本轮已执行工具的回执：最终回答是一次无状态新调用，看不到本循环的
             # thought/observation；不显式带入时，paper_search 已检到几十篇文献，
             # 最终模型却只能回答"我无法联网检索"（实测故障）
@@ -879,22 +1157,33 @@ def rag_stream():
             created_map_ids: list[str] = []
 
             # ---- ReAct 工具循环（AI 自主思考 → 执行工具 → 观察结果） ----
+            # 规整后的历史同时供工具循环与最终回答使用：调度器必须看到上文
+            # （否则"重新回答上个问题"这类指代下它会误判"对话没有保留历史"，
+            # 实测事故：盲目读文档/导图去猜任务，浪费工具轮次）
+            history_msgs = _normalize_history(history)
             if enable_tool and not _request_cancelled(run_id):
-                # 本次问答的 AI 导图编辑事务：同一会话的全部导图写共享一个 ID，
-                # 用户可按"一问一事务"整体撤销（修订表持久化，离会也可撤最近一次）
-                mindmap_txn_id = "mmtx_" + uuid.uuid4().hex[:12]
+                # 本次问答的 AI 编辑事务：同一会话的导图写与文件写共享一个 ID，
+                # 用户可按"一问一事务"整体撤销（修订表持久化，离会也可撤）
+                txn_id = "aitxn_" + uuid.uuid4().hex[:12]
                 mindmap_events: list[dict] = []
+                writing_events: list[dict] = []
                 tool_system, tool_user = _react_loop_prompt(
                     question, summaries, current_candidate, document or None,
-                    pinned_ids=pinned_ids,
+                    pinned_ids=pinned_ids, has_history=bool(history_msgs),
+                    quote=quote, reading_scope=settings_store.reading_scope(),
+                    writing_enabled=bool(ws_id),
                 )
-                messages = [
-                    {"role": "system", "content": tool_system},
-                    {"role": "user", "content": tool_user},
-                ]
+                messages = [{"role": "system", "content": tool_system}]
+                # 历史按时间顺序放在 system 与当前 user 之间（纯 user/assistant
+                # 文本，无 tool_calls，不破坏后续工具消息的 API 合法性）
+                messages.extend(history_msgs)
+                messages.append({"role": "user", "content": tool_user})
                 last_sig: str | None = None
                 turns_used = 0
                 fill_extra_granted = False
+                # 本轮只要发生过文件写，就在 done 中带上事务 id（供回答卡片挂
+                # 「全部接受/撤销本次写作」入口）
+                writing_txn_id: str | None = None
                 while True:
                     cap = _REACT_MAX_TURNS + (
                         _REACT_MINDMAP_FILL_TURNS if fill_extra_granted else 0
@@ -990,14 +1279,18 @@ def rag_stream():
                         "arguments": arguments, "thought": thought,
                     })
                     try:
+                        # scope 约定：'' = 全局（非写作视图下导图/写作工具自行拒答），
+                        # 'ws:<id>' = 当前工作区（db/mindmap/writing 三处统一）。
+                        # 裸 ws_id 传给 storage.workspace；scope 标记传给工具层 context
                         result = _TOOL_REGISTRY.execute(
                             name, arguments,
                             context={
                                 "document": document or None,
-                                # 导图工具：作用域隔离 + 一问一事务 + SSE 事件收集
-                                "scope": workspace_id,
-                                "transaction_id": mindmap_txn_id,
+                                "scope": workspace_scope,
+                                "transaction_id": txn_id,
+                                "run_id": run_id,
                                 "mindmap_events": mindmap_events,
+                                "writing_events": writing_events,
                             },
                         )
                     except Exception as exc:
@@ -1018,6 +1311,21 @@ def rag_stream():
                         else:
                             yield emit("mindmap_diff", mm_event)
                     mindmap_events.clear()
+                    # 写作工具：文件差异（内联审核高亮）/新文件（刷新文件树）/
+                    # 编译结果（编译面板与 PDF 刷新）
+                    writing_txn_seen = False
+                    for w_event in writing_events:
+                        kind = w_event.get("kind")
+                        if kind == "diff":
+                            yield emit("document_diff", w_event)
+                            writing_txn_seen = True
+                        elif kind == "created":
+                            yield emit("document_created", w_event)
+                        elif kind == "compile":
+                            yield emit("compile_result", w_event)
+                    writing_events.clear()
+                    if writing_txn_seen:
+                        writing_txn_id = txn_id
                     data = result.data or {}
                     papers = data.get("papers") or []
                     yield emit("observation", {
@@ -1037,13 +1345,11 @@ def rag_stream():
                                 "text": ft["text"],
                                 "context_id": ft.get("context_id"),
                                 "paper_id": ft.get("id"),
+                                # 工具标注 full/passages；未标注时合并层按最弱级处理
+                                "scope": ft.get("scope"),
                             })
-                    if (data.get("document") or "").strip() and document:
-                        _merge_material(materials, {
-                            "label": tr("api.material_label.document"), "text": document,
-                            "context_id": None, "paper_id": None,
-                        })
-                    # paper_search 返回的候选摘要 → 兜底来源（全文读出后被 merge 覆盖）
+                    # paper_search 返回的候选摘要 → 兜底来源（最弱级：
+                    # 任何 read_paper/read_context 的正文都覆盖它，它不反向覆盖）
                     for p in papers[:5]:
                         abstract = (p.get("abstract") or "").strip()
                         if not abstract:
@@ -1053,6 +1359,7 @@ def rag_stream():
                             "text": abstract,
                             "context_id": None,
                             "paper_id": p.get("id"),
+                            "scope": "abstract",
                         })
                     # 把"assistant 思考+工具调用"与"tool 观察结果"追加进对话，供下一步决策
                     tid = tool.get("call_id") or f"call_{int(time.time() * 1000)}"
@@ -1102,7 +1409,7 @@ def rag_stream():
                 _append_tool_finding(tool_findings, _tool_label("create_mindmap"), content)
             yield from _answer_events(
                 engine, question, materials, paper_meta, history, emit,
-                tool_findings=tool_findings or None,
+                tool_findings=tool_findings or None, quote=quote,
             )
         except ApiError as exc:
             yield emit("error", {"message": exc.message})
