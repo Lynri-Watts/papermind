@@ -649,6 +649,10 @@ export interface WritingCompileEvent {
   ok: boolean;
   errors: WritingCompileError[];
   message: string;
+  /** 实际编译的入口 .tex 相对路径（后端带，老会话 SSE 可能缺省） */
+  entry?: string;
+  /** 成功时的 PDF 相对路径（后端带） */
+  pdf?: string | null;
 }
 
 /** POST /writing/hunks/<id>/reject 响应（文本类还原返回新内容；create 返回 deleted） */

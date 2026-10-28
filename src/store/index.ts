@@ -249,11 +249,6 @@ interface PaperMindStore {
   /** 高级结构化搜索条件（跨重启持久化，配合 /api/search 字段化检索） */
   searchFilters: SearchFilters;
   setSearchFilters: (filters: SearchFilters) => void;
-  /** 本次应用会话是否已执行过「进入 Explore 的首次自动检索」。
-   * 不持久化：仅约束本次会话，保证 StrictMode 双调用副作用、组件重挂载、Fast Refresh
-   * 都不会让启动时的自动检索重复发生（组件内 useRef 做不到这一点）。 */
-  exploreAutoSearched: boolean;
-  markExploreAutoSearched: () => void;
   
   aiSuggestions: AISuggestion[];
   setAISuggestions: (suggestions: AISuggestion[]) => void;
@@ -770,9 +765,6 @@ export const usePaperMindStore = create<PaperMindStore>((set, get) => ({
   setSearchProvider: (provider) => set({ searchProvider: provider }),
   searchFilters: { ...INITIAL_SEARCH_FILTERS },
   setSearchFilters: (filters) => set({ searchFilters: filters }),
-  // 会话级（不持久化）：Explore 的首次自动检索只允许发生一次
-  exploreAutoSearched: false,
-  markExploreAutoSearched: () => set({ exploreAutoSearched: true }),
 
   settings: null,
   setSettings: (snapshot) => set({ settings: snapshot }),

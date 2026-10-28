@@ -307,10 +307,15 @@ def writing_init(ws_id: str):
 
 @workspaces_api.post("/workspaces/<ws_id>/compile")
 def compile_workspace(ws_id: str):
-    """以 main.tex 为入口执行 xelatex 编译（优先 latexmk -xelatex）。"""
+    """编译指定入口 .tex（缺省 main.tex）。
+
+    POST body: ``{entry: "chapters/ch1.tex"}``（可选，相对工作区根的 POSIX 路径）。
+    """
+    body = request.get_json(silent=True) or {}
+    entry = (body.get("entry") or "").strip() or None
     try:
         ws.get_workspace(ws_id)
-        result = latex_build.compile_workspace(ws_id)
+        result = latex_build.compile_workspace(ws_id, entry or latex_build.MAIN_TEX)
     except ws.WorkspaceError as exc:
         raise ApiError(str(exc), 404) from exc
     return jsonify(result), (200 if result["ok"] else 422)
@@ -318,7 +323,7 @@ def compile_workspace(ws_id: str):
 
 @workspaces_api.post("/workspaces/<ws_id>/synctex")
 def synctex_inverse(ws_id: str):
-    """双击编译 PDF 的反向定位：{page,x,y}（PDF 点，左上原点）→ 源码行。"""
+    """双击编译 PDF 的反向定位：{page,x,y,entry?}（PDF 点，左上原点）→ 源码行。"""
     body = request.get_json(silent=True) or {}
     try:
         page = int(body.get("page"))
@@ -328,9 +333,10 @@ def synctex_inverse(ws_id: str):
         raise ApiError(tr("workspace.synctex.bad_params"), 400)
     if page < 1 or not all(math.isfinite(v) and v >= 0 for v in (x, y)):
         raise ApiError(tr("workspace.synctex.bad_params"), 400)
+    entry = (body.get("entry") or "").strip() or latex_build.MAIN_TEX
     try:
         ws.get_workspace(ws_id)
-        loc = latex_build.synctex_inverse(ws_id, page, x, y)
+        loc = latex_build.synctex_inverse(ws_id, page, x, y, entry=entry)
     except ws.WorkspaceError as exc:
         raise ApiError(str(exc), 404) from exc
     except latex_build.SynctexError as exc:

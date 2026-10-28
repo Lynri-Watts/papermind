@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useImperativeHandle, useLayoutEffect, us
 import { useTranslation } from 'react-i18next';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import { ZoomIn, ZoomOut, Maximize, Loader2, FileText, RotateCw, PenLine, Boxes, MessageCircleQuestion } from 'lucide-react';
+import { ZoomIn, ZoomOut, Maximize, Loader2, FileText, RotateCw, PenLine, Boxes, MessageCircleQuestion, Download, ExternalLink } from 'lucide-react';
 import { Highlight } from '../types';
 import { locateInDocument, normalizeText, normOffsetToRunRange, PageRun } from '../utils/pdfLocate';
 import { usePaperMindStore } from '../store';
@@ -1122,6 +1122,25 @@ const PdfViewer = React.forwardRef<PdfViewerHandle, PdfViewerProps>(function Pdf
           >
             <RotateCw className="w-4 h-4" />
           </button>
+          <span className="mx-1 h-4 w-px bg-border/70" />
+          {/* 打开 / 下载：同源 URL 会正确触发下载，跨域则浏览器忽略 download 属性 */}
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="p-1.5 rounded-lg hover:bg-background text-textSecondary transition-colors"
+            title={t('writing:files.openNewTab')}
+          >
+            <ExternalLink className="w-4 h-4" />
+          </a>
+          <a
+            href={url}
+            download
+            className="p-1.5 rounded-lg hover:bg-background text-textSecondary transition-colors"
+            title={t('writing:files.download')}
+          >
+            <Download className="w-4 h-4" />
+          </a>
         </div>
       </div>
 

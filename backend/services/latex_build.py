@@ -29,11 +29,34 @@ from pathlib import Path
 import storage.workspace as ws
 from i18n import tr
 
-# 写作入口与产物的固定文件名
+# 写作入口与产物的固定文件名（默认入口，向后兼容）
 MAIN_TEX = "main.tex"
 MAIN_PDF = "main.pdf"
 MAIN_LOG = "main.log"
 JOB_BASENAME = "main"
+
+
+def _compile_names(entry: str) -> dict:
+    """从编译入口路径派生全套产物/作业名。
+
+    xelatex 始终在工作区根目录（root）运行，entry 是相对 root 的 POSIX 路径
+    （如 ``chapters/ch1.tex``）。TeX 的辅助文件（.aux/.log/.synctex.gz）与
+    最终 PDF 都输出在 root 下，**作业名=入口的文件名（去目录去扩展名）**，
+    路径里的目录段被忽略——这是 TeX 标准行为（cwd 决定输出位置）。
+
+    :return: dict ``{entry, jobname, pdf, log, synctex}``
+    """
+    # 反斜杠统一成正斜杠（Windows 兼容）
+    posix = entry.replace("\\", "/")
+    # 取纯文件名（去目录）、再去扩展名得到 jobname
+    stem = Path(posix).stem or JOB_BASENAME
+    return {
+        "entry": posix,          # 标准化后的相对路径
+        "jobname": stem,         # 如 "ch1"
+        "pdf": f"{stem}.pdf",
+        "log": f"{stem}.log",
+        "synctex": f"{stem}.synctex.gz",
+    }
 
 # 单次 xelatex 超时（秒）：首次运行可能触发 MiKTeX 宏包按需安装，给较宽的预算
 PASS_TIMEOUT = 180
@@ -109,16 +132,18 @@ _LLINE_RE = re.compile(r"^l\.(\d+)\b")
 PARSE_ERROR_LIMIT = 30
 
 
-def parse_log_errors(log: str) -> list[dict]:
+def parse_log_errors(log: str, default_file: str = MAIN_TEX) -> list[dict]:
     """解析 xelatex 日志为结构化错误清单（纯函数，供 AI 与前端面板共用）。
 
     识别两类形态（编译已带 ``-file-line-error``，第一类是主力）：
 
     1. ``./sub/intro.tex:12: Undefined control sequence.`` →
        ``{file:"sub/intro.tex", line:12, kind:"error", text:"..."}``；
-    2. 传统 ``! <消息>`` 行 + 随后 ``l.<n>`` 源码指示行（文件归 main.tex，
+    2. 传统 ``! <消息>`` 行 + 随后 ``l.<n>`` 源码指示行（文件归 default_file，
        实际多为主文件内的命令错误）。
 
+    :param default_file: 孤立 bang（没有 l. 配对的 ``! <消息>``）归属文件，
+        通常是当前编译入口。
     路径统一为相对工作区的 POSIX 风格；去重、按出现顺序、上限
     :data:`PARSE_ERROR_LIMIT` 条。警告（LaTeX Warning）不在此列。
     """
@@ -154,18 +179,18 @@ def parse_log_errors(log: str) -> list[dict]:
         if pending_bang is not None:
             m = _LLINE_RE.match(line.strip())
             if m:
-                _add(MAIN_TEX, int(m.group(1)), pending_bang)
+                _add(default_file, int(m.group(1)), pending_bang)
                 pending_bang = None
         if len(errors) >= PARSE_ERROR_LIMIT:
             break
     # 孤立的 ! 消息（没有 l. 行配对，如缺宏包）也保留
     if pending_bang is not None and len(errors) < PARSE_ERROR_LIMIT:
-        _add(MAIN_TEX, None, pending_bang)
+        _add(default_file, None, pending_bang)
     return errors[:PARSE_ERROR_LIMIT]
 
 
-def _read_log_tail(root) -> str:
-    log_path = root / MAIN_LOG
+def _read_log_tail(root, names: dict) -> str:
+    log_path = root / names["log"]
     if not log_path.is_file():
         return ""
     # 日志按 UTF-8 容错读取（TeX 日志在不同 locale 下可能含非 UTF-8 字节）
@@ -192,7 +217,7 @@ def _run_exe(cmd: list[str], root, env: dict, timeout: int) -> subprocess.Comple
     )
 
 
-def _xelatex_pass(xelatex: str, root, env: dict) -> tuple[bool, str]:
+def _xelatex_pass(xelatex: str, root, env: dict, names: dict) -> tuple[bool, str]:
     """跑一趟 xelatex；返回 (是否成功, 日志文本)。
 
     以退出码为准（nonstopmode 下未定义引用只产生警告、退出码仍为 0）；
@@ -202,9 +227,9 @@ def _xelatex_pass(xelatex: str, root, env: dict) -> tuple[bool, str]:
         xelatex,
         "-interaction=nonstopmode",
         "-file-line-error",
-        # 生成 main.synctex.gz：阅读器双击 PDF 时据此反向定位源码行
+        # 生成 <jobname>.synctex.gz：阅读器双击 PDF 时据此反向定位源码行
         "-synctex=1",
-        MAIN_TEX,
+        names["entry"],
     ]
     if _is_miktex(xelatex):
         # 缺宏包时自动安装，避免 MiKTeX 弹框导致无人值守挂死
@@ -212,14 +237,14 @@ def _xelatex_pass(xelatex: str, root, env: dict) -> tuple[bool, str]:
     try:
         proc = _run_exe(cmd, root, env, PASS_TIMEOUT)
     except subprocess.TimeoutExpired:
-        log = _read_log_tail(root)
+        log = _read_log_tail(root, names)
         return False, log or tr("workspace.compile.pass_timeout", seconds=PASS_TIMEOUT)
     except OSError as exc:
         return False, tr("workspace.compile.launch_failed", err=exc)
-    return proc.returncode == 0, _read_log_tail(root)
+    return proc.returncode == 0, _read_log_tail(root, names)
 
 
-def _run_bibliography(xelatex_exe: str, tex_source: str, root, env: dict) -> bool:
+def _run_bibliography(xelatex_exe: str, tex_source: str, root, env: dict, names: dict) -> bool:
     """根据文档用法跑一趟 bibtex 或 biber；无参考文献需求则跳过。
 
     :return: 是否实际执行了文献处理
@@ -232,14 +257,14 @@ def _run_bibliography(xelatex_exe: str, tex_source: str, root, env: dict) -> boo
             tool = [biber]
             if miktex:
                 tool.insert(1, "--enable-installer")
-            tool.append(JOB_BASENAME)
+            tool.append(names["jobname"])
     elif re.search(r"\\bibliography\{", tex_source):
         bibtex = shutil.which("bibtex")
         if bibtex:
             tool = [bibtex]
             if miktex:
                 tool.insert(1, "--enable-installer")
-            tool.append(JOB_BASENAME)
+            tool.append(names["jobname"])
     if tool is None:
         return False
     try:
@@ -250,10 +275,11 @@ def _run_bibliography(xelatex_exe: str, tex_source: str, root, env: dict) -> boo
     return True
 
 
-def _cleanup_aux(root) -> None:
+def _cleanup_aux(root, names: dict) -> None:
+    jobname = names["jobname"]
     for suffix in AUX_SUFFIXES:
         try:
-            (root / f"{JOB_BASENAME}{suffix}").unlink(missing_ok=True)
+            (root / f"{jobname}{suffix}").unlink(missing_ok=True)
         except OSError:
             pass
     for name in AUX_NAMES:
@@ -261,22 +287,40 @@ def _cleanup_aux(root) -> None:
             (root / name).unlink(missing_ok=True)
         except OSError:
             pass
-    # main.log 单独处理（读取完日志后由调用方决定是否删除）
+    # <jobname>.log 单独处理（读取完日志后由调用方决定是否删除）
     try:
-        (root / MAIN_LOG).unlink(missing_ok=True)
+        (root / names["log"]).unlink(missing_ok=True)
     except OSError:
         pass
 
 
-def compile_workspace(ws_id: str) -> dict:
-    """编译工作区的 main.tex。
+def compile_workspace(ws_id: str, entry: str = MAIN_TEX) -> dict:
+    """编译工作区的指定入口 .tex 文件。
 
-    :return: ``{ok, message, log, pdf}``；``pdf`` 为产物相对路径（成功时）
+    xelatex 的 cwd 固定在工作区根，entry 是相对路径（POSIX）。
+    产物（pdf/log/synctex/aux）统一输出在根目录，作业名=入口的文件名（去目录去扩展名）。
+    如果入口文件不存在且是默认 MAIN_TEX，会自动写入骨架。
+
+    :param entry: 相对工作区根的 .tex 入口路径，缺省 ``main.tex``
+    :return: ``{ok, message, log, pdf, entry, errors}``
     :raises storage.workspace.WorkspaceError: 工作区不存在/路径非法
     """
+    entry = (entry or MAIN_TEX).replace("\\", "/").strip()
+    names = _compile_names(entry)
     root = ws.resolve(ws_id)
-    if not (root / MAIN_TEX).is_file():
-        ensure_main_tex(ws_id)
+
+    if not (root / names["entry"]).is_file():
+        if names["entry"] == MAIN_TEX:
+            ensure_main_tex(ws_id)
+        else:
+            return {
+                "ok": False,
+                "message": tr("workspace.compile.entry_missing", entry=names["entry"]),
+                "log": "",
+                "errors": [],
+                "pdf": None,
+                "entry": names["entry"],
+            }
 
     xelatex = shutil.which("xelatex")
     if not xelatex:
@@ -286,6 +330,7 @@ def compile_workspace(ws_id: str) -> dict:
             "log": "",
             "errors": [],
             "pdf": None,
+            "entry": names["entry"],
         }
 
     env = dict(os.environ)
@@ -294,61 +339,65 @@ def compile_workspace(ws_id: str) -> dict:
     # 让 TeX 日志尽量少折行，便于前端展示错误定位
     env["max_print_line"] = "1000"
 
-    tex_source = (root / MAIN_TEX).read_text(encoding="utf-8", errors="replace")
-    tex_mtime = (root / MAIN_TEX).stat().st_mtime
+    tex_source = (root / names["entry"]).read_text(encoding="utf-8", errors="replace")
+    tex_mtime = (root / names["entry"]).stat().st_mtime
     deadline = TOTAL_TIMEOUT
 
     # 1) 第一趟 xelatex
     t0 = time.monotonic()
-    ok, log = _xelatex_pass(xelatex, root, env)
+    ok, log = _xelatex_pass(xelatex, root, env, names)
     if not ok:
         return {
             "ok": False,
             "message": tr("workspace.compile.failed"),
             "log": log,
-            "errors": parse_log_errors(log),
+            "errors": parse_log_errors(log, default_file=names["entry"]),
             "pdf": None,
+            "entry": names["entry"],
         }
 
     # 2) 参考文献（bibtex/biber）
-    _run_bibliography(xelatex, tex_source, root, env)
+    _run_bibliography(xelatex, tex_source, root, env, names)
 
     # 3) 后续趟数：直到日志不再要求 rerun，或达到上限/总超时
     for _ in range(MAX_PASSES - 1):
         if time.monotonic() - t0 > deadline - PASS_TIMEOUT:
             break
-        ok, log = _xelatex_pass(xelatex, root, env)
+        ok, log = _xelatex_pass(xelatex, root, env, names)
         if not ok:
             return {
                 "ok": False,
                 "message": tr("workspace.compile.failed"),
                 "log": log,
-                "errors": parse_log_errors(log),
+                "errors": parse_log_errors(log, default_file=names["entry"]),
                 "pdf": None,
+                "entry": names["entry"],
             }
         if not any(marker in log for marker in _RERUN_PATTERNS):
             break
 
-    pdf_path = root / MAIN_PDF
+    pdf_path = root / names["pdf"]
     ok = ok and pdf_path.is_file() and pdf_path.stat().st_mtime >= tex_mtime
-    log = _read_log_tail(root)
+    log = _read_log_tail(root, names)
 
     if not ok:
         return {
             "ok": False,
             "message": tr("workspace.compile.failed"),
             "log": log,
-            "errors": parse_log_errors(log),
+            "errors": parse_log_errors(log, default_file=names["entry"]),
             "pdf": None,
+            "entry": names["entry"],
         }
 
-    # 成功：清理 aux/out 等辅助文件（保留 PDF 与 main.synctex.gz）
-    _cleanup_aux(root)
+    # 成功：清理 aux/out 等辅助文件（保留 PDF 与 <jobname>.synctex.gz）
+    _cleanup_aux(root, names)
     return {
         "ok": True,
         "message": tr("workspace.compile.ok"),
         "log": log,
-        "pdf": MAIN_PDF,
+        "pdf": names["pdf"],
+        "entry": names["entry"],
     }
 
 
@@ -374,19 +423,22 @@ def _decode_console(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def synctex_inverse(ws_id: str, page: int, x: float, y: float) -> dict:
+def synctex_inverse(ws_id: str, page: int, x: float, y: float,
+                    entry: str = MAIN_TEX) -> dict:
     """PDF 坐标 → 源码位置（SyncTeX inverse search，Overleaf 同款机制）。
 
     :param page: PDF 页码（1 基）
     :param x/y: PDF 点坐标（72dpi，页面左上角为原点；与 synctex 约定一致）
+    :param entry: 编译入口 .tex 相对路径（决定用哪个 jobname 的 synctex 数据）
     :return: ``{file, line, column}``，file 为相对工作区根的 POSIX 路径，
              line 为 1 基行号，column 为 1 基列号或 None
     :raises SynctexError: 未编译/无 synctex 数据/未安装 synctex/解析失败/路径越界
     :raises storage.workspace.WorkspaceError: 工作区不存在/路径非法
     """
+    names = _compile_names(entry or MAIN_TEX)
     root = ws.resolve(ws_id).resolve()
-    pdf_path = root / MAIN_PDF
-    synctex_data = root / f"{JOB_BASENAME}.synctex.gz"
+    pdf_path = root / names["pdf"]
+    synctex_data = root / names["synctex"]
     if not pdf_path.is_file() or not synctex_data.is_file():
         raise SynctexError(tr("workspace.synctex.no_data"))
 
@@ -396,10 +448,10 @@ def synctex_inverse(ws_id: str, page: int, x: float, y: float) -> dict:
 
     # 坐标规格：page:x:y:file（整数页码 + 定点浮点；数字已在路由层校验，
     # 这里仅做无注入的 list 传参，绝不经过 shell）
-    spec = f"{int(page)}:{float(x):.4f}:{float(y):.4f}:{MAIN_PDF}"
+    spec = f"{int(page)}:{float(x):.4f}:{float(y):.4f}:{names['pdf']}"
     try:
         proc = subprocess.run(
-            [synctex, "edit", "-o", spec, "-x", "", MAIN_TEX],
+            [synctex, "edit", "-o", spec, "-x", "", names["entry"]],
             cwd=str(root),
             shell=False,
             capture_output=True,

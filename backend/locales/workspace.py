@@ -34,6 +34,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "workspace.compile.pass_timeout": "单趟 xelatex 超时（超过 {seconds} 秒），请检查文档是否存在死循环",
         "workspace.compile.failed": "编译失败，请查看日志定位错误",
         "workspace.compile.ok": "编译成功",
+        "workspace.compile.entry_missing": "编译入口 {entry} 不存在",
         # SyncTeX 反向定位（双击 PDF 跳源码）
         "workspace.synctex.bad_params": "SyncTeX 参数不合法：需要 page（≥1 的整数）与 x/y（≥0 的数字）",
         "workspace.synctex.no_data": "缺少 SyncTeX 数据：请先成功编译文档后再双击 PDF",
@@ -72,6 +73,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "workspace.compile.pass_timeout": "A single xelatex pass timed out (exceeded {seconds}s); check for loops in the document",
         "workspace.compile.failed": "Compilation failed; see the log for details",
         "workspace.compile.ok": "Compilation succeeded",
+        "workspace.compile.entry_missing": "Compile entry {entry} was not found",
         # SyncTeX inverse search (double-click PDF to jump to source)
         "workspace.synctex.bad_params": "Invalid SyncTeX parameters: page (positive integer) and x/y (non-negative numbers) are required",
         "workspace.synctex.no_data": "SyncTeX data is missing: compile the document successfully before double-clicking the PDF",

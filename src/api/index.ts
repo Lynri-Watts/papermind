@@ -765,21 +765,27 @@ export const ensureWritingEntry = async (wsId: string): Promise<void> => {
 export interface CompileResult {
   ok: boolean;
   message: string;
-  /** main.log 末尾片段（失败排查用） */
+  /** <jobname>.log 末尾片段（失败排查用） */
   log: string;
-  /** 成功时的 PDF 相对路径（main.pdf） */
+  /** 成功时的 PDF 相对路径（<jobname>.pdf） */
   pdf: string | null;
-  /** 解析出的 file:line 错误清单（parse_log_errors，老后端可能缺省） */
+  /** 解析出的 file:line 错误清单（parse_log_errors） */
   errors?: import('../types').WritingCompileError[];
+  /** 实际编译的入口 .tex 相对路径 */
+  entry?: string;
 }
 
-/** 以 main.tex 为入口执行 xelatex 编译；非 2xx 时同样解析结果体，不直接抛裸 HTTP 错误 */
-export const compileWorkspace = async (wsId: string): Promise<CompileResult> => {
+/** 以指定 .tex 为入口执行 xelatex 编译；非 2xx 时同样解析结果体，不直接抛裸 HTTP 错误 */
+export const compileWorkspace = async (
+  wsId: string,
+  entry?: string,
+): Promise<CompileResult> => {
   let resp: Response;
   try {
     resp = await apiFetch(`${API_BASE}/workspaces/${encodeURIComponent(wsId)}/compile`, {
       method: 'POST',
       headers: { 'Accept-Language': currentLanguage() },
+      body: entry ? JSON.stringify({ entry }) : undefined,
     });
   } catch (err) {
     throw new Error(err instanceof Error ? err.message : String(err));
@@ -822,10 +828,13 @@ export interface SynctexLocation {
 export const synctexInverse = async (
   wsId: string,
   point: { page: number; x: number; y: number },
+  entry?: string,
 ): Promise<SynctexLocation> => {
+  const body: Record<string, unknown> = { ...point };
+  if (entry) body.entry = entry;
   return request<SynctexLocation>(
     `/workspaces/${encodeURIComponent(wsId)}/synctex`,
-    { method: 'POST', body: JSON.stringify(point) },
+    { method: 'POST', body: JSON.stringify(body) },
   );
 };
 

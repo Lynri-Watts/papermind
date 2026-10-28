@@ -36,7 +36,6 @@ const Explore: React.FC = () => {
     searchResults, setSearchResults,
     searchProvider, setSearchProvider,
     searchFilters, setSearchFilters,
-    exploreAutoSearched, markExploreAutoSearched,
     selectedPaper, setSelectedPaper,
     openReaderTab,
     exploreSearchWidth, setExploreSearchWidth,
@@ -143,18 +142,9 @@ const Explore: React.FC = () => {
     }
   }, [searchQuery, searchFilters, hasStructured, setSearchResults, setSearchProvider, t]);
 
-  // 首次进入：恢复上次持久化的搜索条件并自动搜索一次（此后一律显式触发）。
-  // 闸门必须是「执行时实时读取」的 store 值，不能读渲染闭包里的值：
-  // main.tsx 的 StrictMode 会把挂载副作用执行两次（setup→cleanup→setup），
-  // 两次用的都是同一份闭包，闭包里的闸门值恒为初始值，两次都会放行。
-  // 组件内 useRef 同理（ref 会被重建/丢弃）。改为 getState() 实时读取即可去重。
-  useEffect(() => {
-    if (usePaperMindStore.getState().exploreAutoSearched) return;
-    if (!searchQuery.trim() && !hasStructured()) return;
-    usePaperMindStore.getState().markExploreAutoSearched();
-    performSearch();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // 首次进入不再自动搜索（OpenAlex 有请求限流，自动搜索会撞 429）。
+  // 搜索只在用户显式点击搜索按钮或输入框回车时触发；持久化的查询条件仅作为"预填"，
+  // 让用户确认后再提交。
 
   const updateFilter = (key: keyof SearchFilters, value: string) => {
     setSearchFilters({ ...searchFilters, [key]: value });

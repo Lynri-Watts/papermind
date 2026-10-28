@@ -237,6 +237,16 @@ const QAPanel: React.FC = () => {
   /** 正在运行的 run_id（生成中持有一份，供"停止"按钮取消） */
   const activeRunIdRef = useRef<string | null>(null);
 
+  /** 工作区切换自动取消进行中的 ReAct 流：避免 SSE 回调把消息/diff 写入新工作区（串线） */
+  useEffect(() => {
+    return () => {
+      const runId = activeRunIdRef.current;
+      if (!runId) return;
+      activeRunIdRef.current = null;
+      void cancelRagRun(runId).catch(() => undefined);
+    };
+  }, [activeWorkspaceId]);
+
   /**
    * 自动 ReAct 流式问答：把后端 SSE 的 thought/react_action/observation 增量实时
    * 累积为 trail（步骤逐个流式展开），在阶段边界收尾纯思考步骤；结束后折叠为 toolLog。
@@ -247,6 +257,9 @@ const QAPanel: React.FC = () => {
     requestFn: (handlers: RagStreamHandlers) => Promise<void>,
   ) => {
     activeRunIdRef.current = runId;
+    // 启动时捕获 workspaceId —— 工作区切换后 SSE 回调仍会用启动时的 wsId，
+    // 避免把 diff/compile 等写入切换后的其他工作区（串线 bug）
+    const runWsId = usePaperMindStore.getState().activeWorkspaceId;
     const cancelling = false;
     updateChatMessage(assistantId, {
       streaming: true,
@@ -275,7 +288,7 @@ const QAPanel: React.FC = () => {
       if (writingEdit) return;
       writingEdit = {
         transactionId,
-        workspaceId: usePaperMindStore.getState().activeWorkspaceId ?? null,
+        workspaceId: runWsId ?? null,
       };
       updateChatMessage(assistantId, { writingEdit });
     };
@@ -398,7 +411,7 @@ const QAPanel: React.FC = () => {
             mapId: ev.mapId,
             transactionId: ev.transactionId,
             version: ev.version,
-            workspaceId: usePaperMindStore.getState().activeWorkspaceId ?? null,
+            workspaceId: runWsId ?? null,
           });
           syncMindmapEdits();
         },
@@ -406,7 +419,8 @@ const QAPanel: React.FC = () => {
           // AI 新建导图（from_mermaid 一次成图时之后不会再有 diff）：
           // 刷新图库列表并选中新图（与界面手动新建后的状态一致），
           // 同时在回答上挂记录，让「打开导图」入口出现（无编辑事务→不可撤销）
-          const wsId = usePaperMindStore.getState().activeWorkspaceId ?? null;
+          // 用启动时捕获的 runWsId，避免工作区切换后串线
+          const wsId = runWsId ?? null;
           void usePaperMindStore.getState().refreshMindmaps(wsId)
             .then(() => usePaperMindStore.getState().setActiveMindmapId(wsId, ev.mapId));
           const existing = mindmapEditMap.get(ev.mapId);
@@ -421,25 +435,18 @@ const QAPanel: React.FC = () => {
         },
         // ---------- AI 写作（边写边审）：落盘事件进 writingReview store ----------
         onDocumentDiff: (ev) => {
-          const wsId = usePaperMindStore.getState().activeWorkspaceId;
-          if (!wsId) return;
-          // 临时候选入 store（CodeEditor 即时内联高亮），WritingWorkspace 随后
-          // 按 syncNonce 拉取磁盘新内容远程灌入，流末/整事务操作后再 hydrate 对账
-          useWritingReviewStore.getState().applyDiff(wsId, ev);
+          // 用启动时捕获的 runWsId，避免工作区切换后串线写入错误工作区
+          if (runWsId) useWritingReviewStore.getState().applyDiff(runWsId, ev);
           attachWritingTxn(ev.transactionId);
         },
         onDocumentCreated: (ev) => {
-          const wsId = usePaperMindStore.getState().activeWorkspaceId;
-          if (!wsId) return;
-          useWritingReviewStore.getState().applyCreated(wsId, ev);
+          if (runWsId) useWritingReviewStore.getState().applyCreated(runWsId, ev);
           // 仅建文件（无 diff）的一轮也要出现事务审核条
           attachWritingTxn(ev.transactionId);
         },
         onCompileResult: (ev) => {
-          const wsId = usePaperMindStore.getState().activeWorkspaceId;
-          if (!wsId) return;
           // 编译面板/PDF 由 WritingWorkspace 订阅 compileByWs 刷新
-          useWritingReviewStore.getState().applyCompile(wsId, ev);
+          if (runWsId) useWritingReviewStore.getState().applyCompile(runWsId, ev);
         },
         onNotice: (message) => {
           // 非阻断提示（如无材料降级通用知识回答）：挂消息上持久化展示，不替换正文
@@ -483,8 +490,8 @@ const QAPanel: React.FC = () => {
       // 并与后端对账本轮全部写作修订（补齐 SSE 候选缺失的 seq/hash 等字段）
       const reviewStore = useWritingReviewStore.getState();
       reviewStore.setAiStreaming(false);
-      const wsId = usePaperMindStore.getState().activeWorkspaceId;
-      if (wsId && writingEdit) void reviewStore.hydrate(wsId);
+      // 用启动时捕获的 runWsId —— 避免工作区切换后 hydrate 错误的工作区
+      if (runWsId && writingEdit) void reviewStore.hydrate(runWsId);
     }
   }, [updateChatMessage, t]);
 

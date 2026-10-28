@@ -34,7 +34,11 @@ from llm.tools import BaseTool, ToolResult
 from services import mindmap_doc as md
 from services.mindmap_diagram import MINDMAP_TYPE
 from services.mindmap_doc import MindmapError
-from services.mindmap_mmd import doc_from_mermaid_source, doc_to_mermaid
+from services.mindmap_elixir import (
+    parse_markdown_to_elixir, elixir_to_markdown,
+    doc_to_elixir, elixir_to_doc,
+)
+from services.mindmap_mmd import doc_from_mermaid_source  # 仅非 mindmap 图（flowchart 等）兼容
 
 #: 单次 edit_mindmap 动作数上限（防止 LLM 一次提交超大批次）
 MAX_ACTIONS_PER_CALL = 200
@@ -119,7 +123,7 @@ def _read_report(row: dict) -> str:
         f"{header}\n"
         f"{tr('mindmap.ai.structure_hint')}\n"
         f"{_outline(doc)}\n\n"
-        f"== mermaid ==\n{doc_to_mermaid(doc)}"
+        f"== markdown ==\n{elixir_to_markdown(doc_to_elixir(doc))}"
     )
 
 
@@ -259,15 +263,17 @@ class ListMindmapsTool(BaseTool):
 
 # ---------- 工具：create ----------
 class CreateMindmapTool(BaseTool):
-    """新建导图（空白、从 mermaid mindmap 导入，或创建其他类型的只读 mermaid 图）。"""
+    """新建导图（空白、从 Markdown 嵌套列表导入，或创建其他类型的只读 mermaid 图）。"""
 
     name = "create_mindmap"
     description = (
-        "新建一张导图并返回其 map_id。可只给根主题（root_text）创建思维导图；"
-        "也可用 from_mermaid 传入任意类型的 mermaid 代码直接成图：以 \"mindmap\""
-        " 开头的为可结构化编辑的思维导图（创建后用 read_mindmap/edit_mindmap 增删节点）；"
-        "其他类型（flowchart、sequenceDiagram、timeline、classDiagram、stateDiagram-v2、"
-        "erDiagram、journey、gantt、pie、gitGraph 等）保存为只读图表，不支持 edit_mindmap。"
+        "新建一张导图并返回其 map_id。三种方式：\n"
+        "1) 只给 root_text：创建空白思维导图；\n"
+        "2) from_markdown（推荐）：传入 Markdown 嵌套列表直接成图，"
+        "格式为 `- 根节点` 开头、两空格缩进、支持 HTML 注释承载稳定 ID "
+        "（如 `<!-- id:n_xxxxxxxx -->`），论文节点用 `[标题](paper:arxiv:2401.00001)`；\n"
+        "3) from_mermaid（仅用于 flowchart/sequenceDiagram 等非 mindmap 图）："
+        "传入任意类型的 mermaid 代码，保存为只读图表，不支持 edit_mindmap。\n"
         "导图创建在当前工作区（scope=\"global\" 时进全局库）。title 必填。"
     )
     parameters: dict = {
@@ -275,9 +281,13 @@ class CreateMindmapTool(BaseTool):
         "properties": {
             "title": {"type": "string", "description": "导图标题（必填）"},
             "root_text": {"type": "string", "description": "根节点文本（空白创建思维导图时用；缺省取标题）"},
+            "from_markdown": {
+                "type": "string",
+                "description": "可选：Markdown 嵌套列表（`-` 列表符号 + 两空格缩进），直接成可编辑思维导图",
+            },
             "from_mermaid": {
                 "type": "string",
-                "description": "可选：任意类型的 mermaid 代码（首行为图声明，如 mindmap / flowchart TD / sequenceDiagram）",
+                "description": "可选：任意类型的 mermaid 代码（首行为图声明），仅用于 flowchart 等非 mindmap 只读图",
             },
             "scope": {"type": "string", "enum": ["workspace", "global"]},
         },
@@ -288,8 +298,25 @@ class CreateMindmapTool(BaseTool):
     def execute(self, arguments: dict, context: Optional[dict] = None) -> ToolResult:
         scope = _scope(context, arguments)
         title = (arguments.get("title") or "").strip()
+        markdown_text = arguments.get("from_markdown")
         mermaid_text = arguments.get("from_mermaid")
-        if mermaid_text is not None:
+
+        doc: dict
+        diagram_type: str
+        if markdown_text is not None:
+            if not isinstance(markdown_text, str) or not markdown_text.strip():
+                return ToolResult(tr("mindmap.md_empty"))
+            try:
+                doc = parse_markdown(markdown_text)
+            except MindmapError as exc:
+                return ToolResult(tr("mindmap.ai.create_failed", reason=_structure_error(exc)))
+            diagram_type = MINDMAP_TYPE
+            if not title:
+                root = md.find_root(doc["nodes"])
+                title = ((root.get("text") if root else "") or "").strip()
+            if not title:
+                return ToolResult(tr("mindmap.title_required"))
+        elif mermaid_text is not None:
             if not isinstance(mermaid_text, str) or not mermaid_text.strip():
                 return ToolResult(tr("mindmap.mermaid_required"))
             try:
@@ -299,7 +326,6 @@ class CreateMindmapTool(BaseTool):
             if not title and diagram_type == MINDMAP_TYPE:
                 root = md.find_root(doc["nodes"])
                 title = ((root.get("text") if root else "") or "").strip()
-            # 非 mindmap 图无法从结构推导标题：title 必填
             if not title:
                 return ToolResult(tr("mindmap.title_required"))
         else:
@@ -330,11 +356,11 @@ class CreateMindmapTool(BaseTool):
 
 # ---------- 工具：read ----------
 class ReadMindmapTool(BaseTool):
-    """读取导图：ID 结构清单 + mermaid 文本（编辑前必须先读）。"""
+    """读取导图：ID 结构清单 + Markdown 嵌套列表（编辑前必须先读）。"""
 
     name = "read_mindmap"
     description = (
-        "读取一张导图的完整内容。mindmap 类型返回带节点 ID 的缩进树清单和等价 mermaid 文本，"
+        "读取一张导图的完整内容。mindmap 类型返回带节点 ID 的缩进树清单和等价 Markdown 嵌套列表，"
         "edit_mindmap / attach_paper_to_mindmap 需要用到清单中的节点 ID，"
         "因此编辑前必须先调用本工具；操作后工具也会回传最新结构，无需重复读取。"
         "其他 mermaid 图类型（flowchart/sequenceDiagram 等）只返回图类型和原始源码，"

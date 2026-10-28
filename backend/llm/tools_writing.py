@@ -593,30 +593,43 @@ class AddBibEntriesTool(BaseTool):
 class CompileDocumentTool(BaseTool):
     name = "compile_document"
     description = (
-        "在工作区目录中用 xelatex 真实编译 main.tex（多趟 + 自动 bibtex/biber）。"
+        "在工作区目录中用 xelatex 真实编译指定 .tex 入口（多趟 + 自动 bibtex/biber）。"
+        "不指定 path 则编译 main.tex。"
         "成功返回成功提示并刷新 PDF；失败返回结构化错误清单（file:line + 原因）与"
         "日志尾部，你应按行号用 edit_file 修正后重新编译，直到成功。"
         "新增章节、宏包、参考文献或公式环境后建议编译一次自检。"
         "单次编译可能耗时较久，请耐心等待结果，不要并发重复调用。"
         "仅在打开了写作工作区时可用。"
     )
-    parameters: dict = {"type": "object", "properties": {},
-                        "additionalProperties": False}
+    parameters: dict = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "要编译的 .tex 入口相对路径，缺省 main.tex",
+            },
+        },
+        "additionalProperties": False,
+    }
 
     def execute(self, arguments: dict, context: Optional[dict] = None) -> ToolResult:
         ws_id = _ws_id(context)
         if ws_id is None:
             return ToolResult(tr("writing.no_workspace"))
         events = _events(context)
+        entry = (arguments.get("path") or "").strip() or MAIN_TEX
         try:
-            report = compile_workspace(ws_id)
+            report = compile_workspace(ws_id, entry=entry)
         except WorkspaceError as exc:
             return ToolResult(str(exc))
 
-        errors = report.get("errors") or parse_log_errors(report.get("log") or "")
+        errors = report.get("errors") or parse_log_errors(
+            report.get("log") or "", default_file=entry)
         events.append({
             "kind": "compile", "ok": bool(report.get("ok")),
             "errors": errors, "message": report.get("message") or "",
+            "entry": report.get("entry") or entry,
+            "pdf": report.get("pdf"),
         })
         if report.get("ok"):
             return ToolResult(tr("writing.compile_ok", passes="1-3"))

@@ -21,7 +21,12 @@ from routes.papers import ApiError, _ws_scope
 from services import mindmap_doc as md
 from services.mindmap_diagram import MINDMAP_TYPE
 from services.mindmap_doc import MindmapError
-from services.mindmap_mmd import doc_from_mermaid_source, doc_to_mermaid
+from services.mindmap_elixir import (
+    parse_markdown_to_elixir, elixir_to_markdown,
+    doc_to_elixir, elixir_to_doc,
+)
+from services.mindmap_md import parse_markdown, doc_to_markdown  # 向后兼容（create 端点 markdown 参数）
+from services.mindmap_mmd import doc_from_mermaid_source  # 仅非 mindmap 图用
 from services.mindmap_undo import revert_transaction
 
 mindmaps_api = Blueprint("mindmaps", __name__)
@@ -118,11 +123,26 @@ def create_mindmap():
         raise ApiError(tr("mindmap.body_invalid"), 400)
     scope = _scope_from_body(body)
     title = (body.get("title") or "").strip()
+
+    # 源码导入：markdown 嵌套列表（新首选）优先；from_mermaid 兼容旧格式；
+    # flowchart/sequenceDiagram 等非 mindmap mermaid 图继续用 doc_from_mermaid_source。
+    markdown_text = body.get("markdown") or body.get("fromMarkdown")
     mermaid_text = body.get("mermaid") or body.get("fromMermaid")
 
-    has_mermaid = ("mermaid" in body and body.get("mermaid") is not None) or \
-        ("fromMermaid" in body and body.get("fromMermaid") is not None)
-    if has_mermaid:
+    if markdown_text:
+        if not isinstance(markdown_text, str):
+            raise ApiError(tr("mindmap.md_empty"), 400)
+        try:
+            doc = parse_markdown(markdown_text)
+        except MindmapError as exc:
+            _raise_structural(exc)
+        diagram_type = MINDMAP_TYPE
+        if not title:
+            root = md.find_root(doc["nodes"])
+            title = (root.get("text") if root else "").strip()
+        if not title:
+            raise ApiError(tr("mindmap.title_required"), 400)
+    elif mermaid_text:
         if not isinstance(mermaid_text, str):
             raise ApiError(tr("mindmap.mermaid_required"), 400)
         # mindmap 头 → 节点树；其他 mermaid 图（flowchart/sequence/…）→ 原文只读图
@@ -132,10 +152,8 @@ def create_mindmap():
             _raise_structural(exc)
         if not title:
             if diagram_type == MINDMAP_TYPE:
-                # 显式回退规则（非静默）：未给标题时用根文本，仍为空才拒绝
                 root = md.find_root(doc["nodes"])
                 title = (root.get("text") if root else "").strip()
-            # 非 mindmap 图无法从结构推导标题：必须显式提供
         if not title:
             raise ApiError(tr("mindmap.title_required"), 400)
     else:
@@ -282,20 +300,29 @@ def replace_mermaid_source(map_id: str):
     return jsonify({"mindmap": _serialize(saved)})
 
 
-@mindmaps_api.get("/mindmaps/<map_id>/mermaid")
-def export_mermaid(map_id: str):
+@mindmaps_api.get("/mindmaps/<map_id>/export")
+def export_mindmap(map_id: str):
+    """导出导图为 MindElixirData 嵌套树（前端渲染用）+ Markdown（AI 工具/源码面板用）。
+
+    对 mindmap 类型返回 ``{elixir_data: {...}, markdown: "..."}``；
+    其他 mermaid 图类型返回 ``{mermaid: source}``（只读）。
+    """
     scope = _ws_scope(request.args.get("workspace_id"))
     row = _load_scoped(map_id, scope)
     doc = row.get("doc") or {}
     dtype = _diagram_type_of(row, doc)
     if dtype != MINDMAP_TYPE:
-        # 非 mindmap 图：原文就是其 mermaid 表达
         return jsonify({"mermaid": doc.get("source") or ""})
     try:
-        text = doc_to_mermaid(doc)
+        elixir_data = doc_to_elixir(doc)
+        markdown_text = elixir_to_markdown(elixir_data)
     except MindmapError as exc:
         _raise_structural(exc)
-    return jsonify({"mermaid": text})
+    return jsonify({
+        "elixir_data": elixir_data,
+        "markdown": markdown_text,
+        "diagram_type": dtype,
+    })
 
 
 # ---------- AI 事务撤销 ----------

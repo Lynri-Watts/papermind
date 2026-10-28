@@ -55,6 +55,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "mindmap.mmd_indent_outside_root": "缩进位于根节点之外（第 {line} 行）",
         "mindmap.mmd_indent_jump": "缩进层级跳跃，请保持每层缩进一致（第 {line} 行）",
         "mindmap.mmd_no_nodes": "mermaid 中没有任何节点",
+        # —— Markdown 互换 ——
+        "mindmap.md_empty": "Markdown 文本为空",
+        "mindmap.md_multiple_roots": "存在多个根节点（第 {line} 行）",
+        "mindmap.md_indent_jump": "缩进层级跳跃，请保持每层缩进一致（第 {line} 行）",
+        "mindmap.md_indent_char": "缩进不能使用 Tab，只能用空格（第 {line} 行）",
+        "mindmap.md_invalid_shape": "Markdown 注释中形状非法: {shape}（第 {line} 行）",
+        "mindmap.md_no_nodes": "Markdown 中没有任何列表节点",
         # —— 路由层 ——
         "mindmap.internal_error": "思维导图服务内部错误: {err}",
         "mindmap.not_found": "导图不存在",
@@ -136,6 +143,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "mindmap.mmd_indent_outside_root": "Indentation is outside the root node (line {line})",
         "mindmap.mmd_indent_jump": "Indentation level skipped; keep each level consistent (line {line})",
         "mindmap.mmd_no_nodes": "The mermaid text contains no nodes",
+        # —— Markdown interchange ——
+        "mindmap.md_empty": "Markdown text is empty",
+        "mindmap.md_multiple_roots": "Multiple root nodes (line {line})",
+        "mindmap.md_indent_jump": "Indentation level skipped; keep each level consistent (line {line})",
+        "mindmap.md_indent_char": "Indentation must use spaces, not tabs (line {line})",
+        "mindmap.md_invalid_shape": "Invalid shape in Markdown comment: {shape} (line {line})",
+        "mindmap.md_no_nodes": "The Markdown text contains no list nodes",
         # —— Route layer ——
         "mindmap.internal_error": "Mindmap service internal error: {err}",
         "mindmap.not_found": "Mindmap not found",

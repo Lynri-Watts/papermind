@@ -640,11 +640,13 @@ const WritingWorkspace: React.FC = () => {
   const runCompile = useCallback(async (source: 'manual' | 'auto') => {
     compilingRef.current = true;
     setCompile((prev) => ({ ...prev, running: true }));
+    // 入口决策：当前激活 .tex 子文件就编它，否则编 main.tex
+    const entry = activeWritingFile.endsWith('.tex') ? activeWritingFile : MAIN_TEX;
     let result: CompileResult;
     try {
       // 先落盘全部改动（main + 各标签），保证编译的是最新内容
       await flushAll();
-      result = await compileWorkspace(wsId);
+      result = await compileWorkspace(wsId, entry);
     } catch (err) {
       result = {
         ok: false,
@@ -675,7 +677,7 @@ const WritingWorkspace: React.FC = () => {
       pendingRecompileRef.current = false;
       if (!autoPausedRef.current && needsCompileRef.current) scheduleAutoCompile();
     }
-  }, [wsId, t, flushAll, refreshFiles, flashNotice, scheduleAutoCompile]);
+  }, [wsId, activeWritingFile, t, flushAll, refreshFiles, flashNotice, scheduleAutoCompile]);
   // 供稳定的空闲定时器闭包调用最新版本
   runCompileRef.current = runCompile;
 
@@ -692,8 +694,9 @@ const WritingWorkspace: React.FC = () => {
         message: ev.message,
         // SSE 不带整段 log；结构化错误清单已足够，日志面板缺省走 noLog 文案
         log: '',
-        pdf: null,
+        pdf: ev.pdf ?? null,
         errors: ev.errors,
+        entry: ev.entry,
       },
     });
     if (ev.ok) {
@@ -769,7 +772,13 @@ const WritingWorkspace: React.FC = () => {
 
   const handleInverseLocate = useCallback(async (point: InverseLocatePoint) => {
     try {
-      const loc = await synctexInverse(wsId, point);
+      // 从编译结果或当前文件列表取当前显示的 PDF，反推其 .tex 入口给 synctex
+      const buildPdfs = files.filter((f) => f.path.toLowerCase().endsWith('.pdf'));
+      const currentPdf = (compile.result?.ok && compile.result.pdf) || buildPdfs[0]?.path;
+      const pdfEntry = currentPdf?.endsWith('.pdf')
+        ? currentPdf.slice(0, -4) + '.tex'
+        : undefined;
+      const loc = await synctexInverse(wsId, point, pdfEntry);
       if (!isTextFile(loc.file)) {
         flashNotice(t('compile.locateUnsupported', { name: baseName(loc.file) }));
         return;
@@ -780,7 +789,7 @@ const WritingWorkspace: React.FC = () => {
     } catch (err) {
       flashNotice(err instanceof Error ? err.message : t('compile.locateFailed'));
     }
-  }, [wsId, activeWritingFile, openFile, locateInEditor, flashNotice, t]);
+  }, [wsId, files, compile.result, activeWritingFile, openFile, locateInEditor, flashNotice, t]);
 
   // ---------- 大纲 ----------
   const activePath = activeWritingFile;
@@ -817,9 +826,19 @@ const WritingWorkspace: React.FC = () => {
   }, [dirtySet, latexDirty]);
 
   const anySaving = savingSet.size > 0 || compile.running;
-  /** 工作区内已有编译产物（即便本次会话尚未点过编译，也可直接查看） */
-  const hasPdf = files.some((f) => f.path === 'main.pdf');
-  const pdfUrl = `${workspaceFileUrl(wsId, 'main.pdf')}?v=${pdfVersion}`;
+  /** 工作区内所有编译产物 .pdf（即便本次会话尚未点过编译，也可直接查看） */
+  const buildPdfs = useMemo(
+    () => files.filter((f) => f.path.toLowerCase().endsWith('.pdf')),
+    [files],
+  );
+  const hasPdf = buildPdfs.length > 0;
+  /** 当前要显示的 PDF：优先用本次编译结果，否则取第一个产物 */
+  const activePdf = compile.result?.ok && compile.result.pdf
+    ? compile.result.pdf
+    : buildPdfs[0]?.path;
+  const pdfUrl = activePdf
+    ? `${workspaceFileUrl(wsId, activePdf)}?v=${pdfVersion}`
+    : '';
 
   // ---------- 渲染 ----------
   return (
